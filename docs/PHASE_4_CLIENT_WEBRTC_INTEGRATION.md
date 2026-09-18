@@ -16,8 +16,23 @@ Both clients expose `IDLE`, `CONNECTING`, `NEGOTIATING`, `CONNECTED`, `CLOSING`,
 revocation, device revocation, and peer failure close the local peer. No client
 automatically re-authorizes or starts a new session.
 
-This integration intentionally does not implement screen capture, camera
-capture, permissions, consent UI, indicator UI, TURN, chat, usage tracking,
-recording, screenshots, or production deployment. The reserved screen and
-camera transceivers remain track-free until a later explicit sender-consent
-phase.
+This client integration intentionally does not implement screen capture,
+camera capture, permissions, consent UI, indicator UI, chat, usage tracking,
+recording, screenshots, or production deployment. TURN fallback and ICE
+recovery are described below. The reserved screen and camera transceivers
+remain track-free until a later explicit sender-consent phase.
+
+## TURN and recovery
+
+Fastify issues ten-minute coturn credentials at `GET /webrtc/ice-servers` for
+an authenticated browser session or device credential. The response contains
+only ICE-server URLs and ephemeral HMAC credentials; the coturn shared secret
+is server-only and is never persisted or logged. Direct ICE remains preferred,
+while callers may inject `iceTransportPolicy: "relay"` for forced-relay
+validation. `infra/docker-compose.yml` exposes coturn's UDP/TCP 3478, TLS
+5349, and bounded 49160-49200 relay range.
+
+An owner peer may perform one bounded ICE restart after terminal ICE failure
+using the existing owner-offer signaling path. Restarting ICE does not grant
+consent or start capture. Server restart or revocation still invalidates
+in-memory sessions and requires fresh authenticated control-plane state.

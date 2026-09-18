@@ -7,7 +7,12 @@ export type ServerConfig = {
   presenceStaleThresholdSeconds: number;
   sessionTtlSeconds: number;
   webOrigin: string;
-};
+  turnSharedSecret: string;
+  turnUrls: string[];
+  stunUrls: string[];
+  turnRealm: string;
+  turnCredentialTtlSeconds: number;
+}
 
 const nodeEnvironments = new Set<ServerConfig["nodeEnv"]>([
   "development",
@@ -69,6 +74,18 @@ function nodeEnvironment(
 export function loadConfig(
   environment: NodeJS.ProcessEnv = process.env,
 ): ServerConfig {
+  const nodeEnv = nodeEnvironment(environment);
+  const turnSharedSecret = requiredString(
+    environment,
+    "TURN_SHARED_SECRET",
+    nodeEnv === "production" ? undefined : "development-turn-secret",
+  );
+  const turnUrls = requiredString(environment, "TURN_URLS", "turn:localhost:3478")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (turnUrls.length === 0) throw new Error("TURN_URLS must contain at least one URL");
+  const stunUrls = (environment.STUN_URLS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
   return {
     databasePath: requiredString(
       environment,
@@ -76,7 +93,7 @@ export function loadConfig(
       "./data/live-presence.db",
     ),
     host: requiredString(environment, "HOST", "127.0.0.1"),
-    nodeEnv: nodeEnvironment(environment),
+    nodeEnv,
     port: portValue(environment),
     enrollmentCodeTtlSeconds: positiveInteger(
       environment,
@@ -97,6 +114,15 @@ export function loadConfig(
       environment,
       "WEB_ORIGIN",
       "http://localhost:5173",
+    ),
+    turnSharedSecret,
+    turnUrls,
+    stunUrls,
+    turnRealm: requiredString(environment, "TURN_REALM", "localhost"),
+    turnCredentialTtlSeconds: positiveInteger(
+      environment,
+      "TURN_CREDENTIAL_TTL_SECONDS",
+      "600",
     ),
   };
 }

@@ -11,6 +11,11 @@ async function start(): Promise<void> {
     config.enrollmentCodeTtlSeconds,
     config.presenceStaleThresholdSeconds,
     config.webOrigin,
+    config.turnSharedSecret,
+    config.turnUrls,
+    config.stunUrls,
+    config.turnRealm,
+    config.turnCredentialTtlSeconds,
   );
 
   try {

@@ -24,7 +24,7 @@ export interface WebRtcPeerConnection {
   readonly iceConnectionState?: string;
   readonly transceivers: readonly WebRtcTransceiver[];
   addTransceiver(kind: string, init: { direction: "sendonly" | "recvonly" }): WebRtcTransceiver;
-  createOffer(): Promise<WebRtcDescription>;
+  createOffer(options?: { iceRestart?: boolean }): Promise<WebRtcDescription>;
   createAnswer(): Promise<WebRtcDescription>;
   setLocalDescription(description: WebRtcDescription): Promise<void>;
   setRemoteDescription(description: WebRtcDescription): Promise<void>;
@@ -37,7 +37,16 @@ export interface WebRtcPeerConnection {
   oniceconnectionstatechange: (() => void) | null;
 }
 
-export type WebRtcFactory = () => WebRtcPeerConnection;
+export type IceTransportPolicy = "all" | "relay";
+export type WebRtcConfiguration = {
+  iceServers?: readonly {
+    urls: string | readonly string[];
+    username?: string;
+    credential?: string;
+  }[];
+  iceTransportPolicy?: IceTransportPolicy;
+};
+export type WebRtcFactory = (configuration?: WebRtcConfiguration) => WebRtcPeerConnection;
 export type SignalingSender = (message: ClientMessage) => void;
 export type PeerState = "new" | "connecting" | "connected" | "disconnected" | "failed" | "closed";
 
@@ -137,13 +146,17 @@ export class WebRtcPeer {
     this.stateListener?.(this.stateValue);
   }
 
-  async createOffer(): Promise<void> {
+  async createOffer(options?: { iceRestart?: boolean }): Promise<void> {
     if (this.closed) throw new Error("peer is closed");
-    if (this.negotiationState !== "new" || this.role !== "owner") {
+    const restarting = options?.iceRestart === true;
+    if (this.role !== "owner" ||
+      (!restarting && this.negotiationState !== "new") ||
+      (restarting && this.negotiationState !== "answer_applied" && this.negotiationState !== "failed")) {
       throw new Error("peer cannot create an offer in its current state");
     }
     try {
-      const description = await this.connection.createOffer();
+      if (restarting) this.negotiationState = "new";
+      const description = await this.connection.createOffer(options);
       await this.connection.setLocalDescription(description);
       this.negotiationState = "offer_created";
       this.send({ type: "offer", session_id: this.sessionId, sdp: description.sdp ?? "", track_map: trackMapFromTransceivers(this.connection.transceivers) });

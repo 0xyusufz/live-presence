@@ -13,6 +13,8 @@ import { DeviceService } from "./devices/service.js";
 import { registerPresenceRoutes } from "./presence/routes.js";
 import { PresenceService } from "./presence/service.js";
 import { ViewerAuthorizationService } from "./authorization/service.js";
+import { TurnService } from "./turn/service.js";
+import { registerTurnRoutes } from "./turn/routes.js";
 
 export async function buildApp(
   databasePath = ":memory:",
@@ -22,6 +24,11 @@ export async function buildApp(
   enrollmentCodeTtlSeconds = 600,
   presenceStaleThresholdSeconds = 45,
   webOrigin = "http://localhost:5173",
+  turnSharedSecret = "development-turn-secret",
+  turnUrls = ["turn:localhost:3478"],
+  stunUrls = [] as string[],
+  turnRealm = "localhost",
+  turnCredentialTtlSeconds = 600,
 ): Promise<{
   app: FastifyInstance;
   authorization: ViewerAuthorizationService;
@@ -43,6 +50,12 @@ export async function buildApp(
     staleThresholdSeconds: presenceStaleThresholdSeconds,
   });
   const authorization = new ViewerAuthorizationService(database.db);
+  const turn = new TurnService({
+    sharedSecret: turnSharedSecret,
+    urls: turnUrls,
+    stunUrls,
+    ttlSeconds: turnCredentialTtlSeconds,
+  });
   const deviceService = new DeviceService(database.db, {
     enrollmentCodeTtlSeconds,
     onDeviceRevoked: (deviceId) => presenceService.revokeDevice(deviceId),
@@ -66,6 +79,11 @@ export async function buildApp(
       presenceStaleThresholdSeconds,
       sessionTtlSeconds,
       webOrigin,
+      turnSharedSecret,
+      turnUrls,
+      stunUrls,
+      turnRealm,
+      turnCredentialTtlSeconds,
     },
   );
   await registerDeviceRoutes(
@@ -81,6 +99,11 @@ export async function buildApp(
       presenceStaleThresholdSeconds,
       sessionTtlSeconds,
       webOrigin,
+      turnSharedSecret,
+      turnUrls,
+      stunUrls,
+      turnRealm,
+      turnCredentialTtlSeconds,
     },
   );
   await registerPresenceRoutes(
@@ -91,6 +114,7 @@ export async function buildApp(
     authorization,
     webOrigin,
   );
+  await registerTurnRoutes(app, auth, deviceService, turn);
 
   return {
     app,
