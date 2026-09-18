@@ -3,16 +3,21 @@ import { loadConfig } from "./config.js";
 
 async function start(): Promise<void> {
   const config = loadConfig();
-  const app = buildApp();
+  const server = await buildApp(
+    config.databasePath,
+    config.sessionTtlSeconds,
+    config.nodeEnv,
+  );
 
   try {
-    await app.listen({
+    await server.app.listen({
       host: config.host,
       port: config.port,
     });
   } catch (error) {
-    app.log.error(error, "Server failed to start");
-    await app.close();
+    server.app.log.error(error, "Server failed to start");
+    await server.app.close();
+    server.close();
     process.exitCode = 1;
   }
 }
