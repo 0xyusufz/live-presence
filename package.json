@@ -1,0 +1,18 @@
+{
+  "name": "live-presence",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Privacy-first, consent-based live presence and screen-sharing application",
+  "workspaces": [
+    "apps/*",
+    "server",
+    "shared"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check:config": "tsc --noEmit --project tsconfig.json"
+  },
+  "license": "MIT"
+}
