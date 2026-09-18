@@ -1,5 +1,16 @@
 {
   "name": "@live-presence/server",
   "version": "0.1.0",
-  "private": true
+  "private": true,
+  "scripts": {
+    "check": "tsc --noEmit --project tsconfig.json",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.6.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
 }
