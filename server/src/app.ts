@@ -12,6 +12,7 @@ import { registerDeviceRoutes } from "./devices/routes.js";
 import { DeviceService } from "./devices/service.js";
 import { registerPresenceRoutes } from "./presence/routes.js";
 import { PresenceService } from "./presence/service.js";
+import { ViewerAuthorizationService } from "./authorization/service.js";
 
 export async function buildApp(
   databasePath = ":memory:",
@@ -21,7 +22,11 @@ export async function buildApp(
   enrollmentCodeTtlSeconds = 600,
   presenceStaleThresholdSeconds = 45,
   webOrigin = "http://localhost:5173",
-): Promise<{ app: FastifyInstance; close: () => void }> {
+): Promise<{
+  app: FastifyInstance;
+  authorization: ViewerAuthorizationService;
+  close: () => void;
+}> {
   if (nodeEnv === "production" && !delivery) {
     throw new Error("Production login-link delivery is not configured");
   }
@@ -37,9 +42,11 @@ export async function buildApp(
   const presenceService = new PresenceService({
     staleThresholdSeconds: presenceStaleThresholdSeconds,
   });
+  const authorization = new ViewerAuthorizationService(database.db);
   const deviceService = new DeviceService(database.db, {
     enrollmentCodeTtlSeconds,
     onDeviceRevoked: (deviceId) => presenceService.revokeDevice(deviceId),
+    onDeviceFamilyRevoked: (deviceId) => presenceService.revokeDevice(deviceId),
   });
 
   await app.register(cookie);
@@ -81,11 +88,13 @@ export async function buildApp(
     auth,
     deviceService,
     presenceService,
+    authorization,
     webOrigin,
   );
 
   return {
     app,
+    authorization,
     close: database.close,
   };
 }

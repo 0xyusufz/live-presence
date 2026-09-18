@@ -142,6 +142,28 @@ test("refresh rotates credentials and reuse revokes the credential family", () =
   }
 });
 
+test("family reuse notifies only after commit, while normal rotation stays connected", () => {
+  const { auth, database } = services();
+  const revoked: string[] = [];
+  const devices = new DeviceService(database.db, {
+    enrollmentCodeTtlSeconds: 600,
+    onDeviceFamilyRevoked: (deviceId) => revoked.push(deviceId),
+  });
+  try {
+    const userId = createUser(auth);
+    const enrollment = devices.createEnrollmentCode(userId);
+    const first = devices.enrollDevice(enrollment.code, "Laptop", "macOS");
+    const second = devices.refreshDevice(first.refreshToken);
+    assert.deepEqual(revoked, []);
+
+    assert.throws(() => devices.refreshDevice(first.refreshToken), DeviceAuthError);
+    assert.deepEqual(revoked, [first.deviceId]);
+    assert.throws(() => devices.authenticateDevice(second.refreshToken), DeviceAuthError);
+  } finally {
+    database.close();
+  }
+});
+
 test("device identity and credentials persist after database reload", () => {
   const path = join(
     tmpdir(),

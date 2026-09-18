@@ -65,6 +65,14 @@ export class PresenceService {
     this.records.delete(connectionId);
   }
 
+  public getDevicePresence(deviceId: string): PresenceRecord | undefined {
+    this.removeStale();
+    for (const record of this.records.values()) {
+      if (record.deviceId === deviceId) return { ...record };
+    }
+    return undefined;
+  }
+
   public revokeDevice(deviceId: string): void {
     for (const [connectionId, record] of this.records) {
       if (record.deviceId === deviceId) {

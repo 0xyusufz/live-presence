@@ -26,6 +26,7 @@ export type DeviceServiceOptions = {
   enrollmentCodeTtlSeconds: number;
   now?: () => number;
   onDeviceRevoked?: (deviceId: string) => void;
+  onDeviceFamilyRevoked?: (deviceId: string) => void;
   randomToken?: () => string;
 };
 
@@ -160,7 +161,7 @@ export class DeviceService {
           .set({ revokedAt: now })
           .where(eq(deviceCredentials.familyId, credential.credential.familyId))
           .run();
-        return null;
+        return { revokedDeviceId: credential.device.id };
       }
 
       const updated = transaction
@@ -180,7 +181,7 @@ export class DeviceService {
           .set({ revokedAt: now })
           .where(eq(deviceCredentials.familyId, credential.credential.familyId))
           .run();
-        return null;
+        return { revokedDeviceId: credential.device.id };
       }
 
       const nextRefreshToken = this.randomToken();
@@ -206,7 +207,13 @@ export class DeviceService {
       };
     });
 
-    if (!refreshed) {
+    if (
+      "revokedDeviceId" in refreshed &&
+      typeof refreshed.revokedDeviceId === "string"
+    ) {
+      const onFamilyRevoked =
+        this.options.onDeviceFamilyRevoked ?? this.options.onDeviceRevoked;
+      onFamilyRevoked?.(refreshed.revokedDeviceId);
       throw new DeviceAuthError("Invalid device credential");
     }
 

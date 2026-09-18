@@ -23,6 +23,13 @@ function waitForOpen(socket: WebSocket): Promise<void> {
   });
 }
 
+function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    socket.once("message", (raw) => resolve(JSON.parse(raw.toString()) as Record<string, unknown>));
+    socket.once("error", reject);
+  });
+}
+
 async function createDevice(
   server: Awaited<ReturnType<typeof buildApp>>,
 ): Promise<{ deviceId: string; refreshToken: string; cookie: string }> {
@@ -205,6 +212,7 @@ test("device revocation closes active websocket presence", async () => {
       url: `/devices/${device.deviceId}`,
       headers: { cookie: device.cookie },
     });
+
     assert.equal(revoked.statusCode, 204);
     assert.equal(await closed, 1008);
 
@@ -224,6 +232,101 @@ test("device revocation closes active websocket presence", async () => {
     assert.equal(await waitForClose(reconnect), 1008);
   } finally {
     socket.close();
+    await server.app.close();
+    server.close();
+  }
+});
+
+test("signaling enforces offer/answer direction and routes valid messages", async () => {
+  const server = await buildApp(":memory:", 3600, "test", undefined, 600, 45);
+  const device = await createDevice(server);
+  const viewerLogin = await server.app.inject({
+    method: "POST",
+    url: "/auth/request-login",
+    payload: { email: `viewer-${Date.now()}@example.com` },
+  });
+  const viewerToken = viewerLogin.json<{ developmentToken: string }>().developmentToken;
+  const viewerVerification = await server.app.inject({
+    method: "POST",
+    url: "/auth/verify-login",
+    payload: { token: viewerToken },
+  });
+  const viewerCookie = cookieValue(viewerVerification.headers["set-cookie"]);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const viewerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: viewerCookie },
+  });
+  server.authorization.grant(
+    ownerSession.json<{ user: { id: string } }>().user.id,
+    viewerSession.json<{ user: { id: string } }>().user.id,
+  );
+  await server.app.listen({ host: "127.0.0.1", port: 0 });
+  const address = server.app.server.address();
+  assert.ok(address && typeof address !== "string");
+  const wsUrl = `ws://127.0.0.1:${address.port}/ws`;
+  const owner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+  const viewer = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+
+  try {
+    await Promise.all([waitForOpen(owner), waitForOpen(viewer)]);
+    owner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    viewer.send(JSON.stringify({
+      type: "auth",
+      token: viewerCookie.split("=", 2)[1]!,
+    }));
+    await Promise.all([nextMessage(owner), nextMessage(viewer)]);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
+    const created = await nextMessage(viewer);
+    const sessionId = created.session_id as string;
+    await nextMessage(owner);
+
+    owner.send(JSON.stringify({ type: "offer", session_id: sessionId, sdp: "v=0" }));
+    assert.equal((await nextMessage(viewer)).type, "offer");
+    viewer.send(JSON.stringify({ type: "offer", session_id: sessionId, sdp: "v=0" }));
+    assert.equal((await nextMessage(viewer)).code, "WRONG_ROLE");
+    viewer.send(JSON.stringify({ type: "answer", session_id: sessionId, sdp: "v=0" }));
+    assert.equal((await nextMessage(owner)).type, "answer");
+    owner.send(JSON.stringify({ type: "answer", session_id: sessionId, sdp: "v=0" }));
+    assert.equal((await nextMessage(owner)).code, "WRONG_ROLE");
+    owner.send(JSON.stringify({
+      type: "ice_candidate",
+      session_id: sessionId,
+      candidate: { candidate: "owner" },
+    }));
+    assert.equal((await nextMessage(viewer)).type, "ice_candidate");
+    viewer.send(JSON.stringify({
+      type: "ice_candidate",
+      session_id: sessionId,
+      candidate: { candidate: "viewer" },
+    }));
+    assert.equal((await nextMessage(owner)).type, "ice_candidate");
+
+    const rotated = await server.app.inject({
+      method: "POST",
+      url: "/devices/refresh",
+      payload: { refreshToken: device.refreshToken },
+    });
+    assert.equal(rotated.statusCode, 200);
+    assert.equal(owner.readyState, WebSocket.OPEN);
+    const ownerClosed = waitForClose(owner);
+    const viewerLeft = nextMessage(viewer);
+    const reused = await server.app.inject({
+      method: "POST",
+      url: "/devices/refresh",
+      payload: { refreshToken: device.refreshToken },
+    });
+    assert.equal(reused.statusCode, 401);
+    assert.equal((await viewerLeft).type, "viewer_left");
+    assert.equal(await ownerClosed, 1008);
+  } finally {
+    owner.close();
+    viewer.close();
     await server.app.close();
     server.close();
   }
