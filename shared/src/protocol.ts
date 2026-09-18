@@ -42,6 +42,10 @@ function string(value: unknown, max: number): value is string {
 function validSession(value: unknown): value is string {
   return typeof value === "string" && SESSION_ID.test(value);
 }
+function exactKeys(item: Record<string, unknown>, keys: readonly string[]): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(item).every((key) => allowed.has(key)) && keys.every((key) => key in item);
+}
 export function validTrackMap(value: unknown): value is TrackMap {
   if (value === undefined) return true;
   if (!Array.isArray(value) || value.length !== 2) return false;
@@ -88,5 +92,60 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
         (item.decision === "allow" || item.decision === "deny")
         ? { type: "share_request_decision", session_id: item.session_id, request_id: item.request_id, decision: item.decision } : null;
     default: return null;
+  }
+}
+
+export function parseServerMessage(value: unknown): ServerMessage | null {
+    const item = record(value);
+    if (!item || typeof item.type !== "string") return null;
+    const session = item.session_id;
+    switch (item.type) {
+      case "authenticated":
+        return exactKeys(item, item.device_id === undefined ? ["type", "role"] : ["type", "role", "device_id"]) &&
+          (item.role === "owner" || item.role === "viewer") &&
+          (item.device_id === undefined || string(item.device_id, 128))
+          ? { type: "authenticated", role: item.role, ...(item.device_id === undefined ? {} : { device_id: item.device_id }) }
+          : null;
+      case "session_created":
+        return exactKeys(item, ["type", "session_id", "device_id"]) &&
+          validSession(session) && string(item.device_id, 128) && DEVICE_ID.test(item.device_id)
+          ? { type: "session_created", session_id: session, device_id: item.device_id } : null;
+      case "viewer_joined":
+        return exactKeys(item, ["type", "session_id", "viewer_user_id"]) &&
+          validSession(session) && string(item.viewer_user_id, 128)
+          ? { type: "viewer_joined", session_id: session, viewer_user_id: item.viewer_user_id } : null;
+      case "viewer_left":
+        return exactKeys(item, ["type", "session_id", "viewer_user_id", "reason"]) &&
+          validSession(session) && string(item.viewer_user_id, 128) && string(item.reason, 128)
+          ? { type: "viewer_left", session_id: session, viewer_user_id: item.viewer_user_id, reason: item.reason } : null;
+      case "share_request":
+        return exactKeys(item, ["type", "session_id", "request_id", "kind", "viewer_user_id"]) &&
+          validSession(session) && string(item.request_id, 128) && ID.test(item.request_id) &&
+          (item.kind === "screen" || item.kind === "camera") && string(item.viewer_user_id, 128)
+          ? { type: "share_request", session_id: session, request_id: item.request_id, kind: item.kind, viewer_user_id: item.viewer_user_id } : null;
+      case "share_request_cancel":
+        return exactKeys(item, ["type", "session_id", "request_id"]) &&
+          validSession(session) && string(item.request_id, 128) && ID.test(item.request_id)
+          ? { type: "share_request_cancel", session_id: session, request_id: item.request_id } : null;
+      case "share_request_state":
+        return exactKeys(item, ["type", "session_id", "request_id", "kind", "state"]) &&
+          validSession(session) && string(item.request_id, 128) && ID.test(item.request_id) &&
+          (item.kind === "screen" || item.kind === "camera") &&
+          (item.state === "ALLOWED" || item.state === "DENIED" || item.state === "CANCELLED")
+          ? { type: "share_request_state", session_id: session, request_id: item.request_id, kind: item.kind, state: item.state } : null;
+      case "error":
+        return exactKeys(item, ["type", "code"]) && string(item.code, 128) ? { type: "error", code: item.code } : null;
+      case "offer":
+      case "answer":
+        return exactKeys(item, item.track_map === undefined ? ["type", "session_id", "sdp"] : ["type", "session_id", "sdp", "track_map"]) &&
+          validSession(session) && string(item.sdp, MAX_SDP) && validTrackMap(item.track_map)
+          ? { type: item.type, session_id: session, sdp: item.sdp, ...(item.track_map === undefined ? {} : { track_map: item.track_map }) } : null;
+      case "ice_candidate":
+        return exactKeys(item, ["type", "session_id", "candidate"]) &&
+          validSession(session) && record(item.candidate) !== null &&
+          JSON.stringify(item.candidate).length <= MAX_CANDIDATE
+          ? { type: "ice_candidate", session_id: session, candidate: item.candidate } : null;
+      default:
+        return null;
   }
 }

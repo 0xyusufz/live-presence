@@ -32,6 +32,7 @@ export interface WebRtcPeerConnection {
   close(): void;
   onicecandidate: ((event: { candidate: unknown | null }) => void) | null;
   onerror?: (() => void) | null;
+  ontrack?: ((event: { track: WebRtcTrack }) => void) | null;
   onconnectionstatechange: (() => void) | null;
   oniceconnectionstatechange: (() => void) | null;
 }
@@ -85,6 +86,8 @@ export class WebRtcPeer {
   private flushingCandidates = false;
   private readonly queuedCandidates: unknown[] = [];
   private closed = false;
+  private stateListener: ((state: PeerState) => void) | undefined;
+  private remoteTrackListener: ((track: WebRtcTrack) => void) | undefined;
 
   constructor(
     role: "owner" | "viewer",
@@ -102,6 +105,7 @@ export class WebRtcPeer {
       }
     };
     this.connection.onerror = () => this.close();
+    this.connection.ontrack = (event) => this.remoteTrackListener?.(event.track);
     this.connection.onconnectionstatechange = () => this.updateState(this.connection.connectionState);
     this.connection.oniceconnectionstatechange = () => this.updateState(this.connection.iceConnectionState);
     const direction = role === "owner" ? "sendonly" : "recvonly";
@@ -112,6 +116,15 @@ export class WebRtcPeer {
 
   get state(): PeerState { return this.stateValue; }
 
+  setStateListener(listener: ((state: PeerState) => void) | undefined): void {
+    this.stateListener = listener;
+    listener?.(this.stateValue);
+  }
+
+  setRemoteTrackListener(listener: ((track: WebRtcTrack) => void) | undefined): void {
+    this.remoteTrackListener = listener;
+  }
+
   private updateState(value: string | undefined): void {
     if (this.closed) return;
     if (value === "connected" || value === "completed") this.stateValue = "connected";
@@ -121,6 +134,7 @@ export class WebRtcPeer {
     }
     else if (value === "disconnected" || value === "closed") this.stateValue = "disconnected";
     else if (value === "connecting" || value === "checking") this.stateValue = "connecting";
+    this.stateListener?.(this.stateValue);
   }
 
   async createOffer(): Promise<void> {
@@ -228,9 +242,11 @@ export class WebRtcPeer {
     if (this.closed) return;
     this.closed = true;
     this.stateValue = "closed";
+    this.stateListener?.(this.stateValue);
     this.queuedCandidates.length = 0;
     this.connection.onicecandidate = null;
     this.connection.onerror = null;
+    this.connection.ontrack = null;
     this.connection.onconnectionstatechange = null;
     this.connection.oniceconnectionstatechange = null;
     this.connection.close();
