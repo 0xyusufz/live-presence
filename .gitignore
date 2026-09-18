@@ -1,0 +1,40 @@
+node_modules/
+dist/
+build/
+out/
+.cache/
+.parcel-cache/
+coverage/
+*.tsbuildinfo
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+
+# Logs and package-manager files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Electron and platform artifacts
+release/
+*.dmg
+*.exe
+*.msi
+*.app
+*.asar
+.DS_Store
+Thumbs.db
+
+# IDE and OS metadata
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# Docker overrides and local volumes
+docker-compose.override.yml
+*.volume/
