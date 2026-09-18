@@ -17,9 +17,15 @@ export type EnrolledDevice = {
   refreshToken: string;
 };
 
+export type AuthenticatedDevice = {
+  deviceId: string;
+  userId: string;
+};
+
 export type DeviceServiceOptions = {
   enrollmentCodeTtlSeconds: number;
   now?: () => number;
+  onDeviceRevoked?: (deviceId: string) => void;
   randomToken?: () => string;
 };
 
@@ -207,6 +213,35 @@ export class DeviceService {
     return refreshed;
   }
 
+  public authenticateDevice(refreshTokenInput: string): AuthenticatedDevice {
+    if (!validText(refreshTokenInput, 512)) {
+      throw new DeviceAuthError("Invalid device credential");
+    }
+
+    const credential = this.db
+      .select({
+        credential: deviceCredentials,
+        device: devices,
+      })
+      .from(deviceCredentials)
+      .innerJoin(devices, eq(deviceCredentials.deviceId, devices.id))
+      .where(eq(deviceCredentials.refreshTokenHash, hashSecret(refreshTokenInput)))
+      .get();
+
+    if (
+      !credential ||
+      credential.credential.revokedAt !== null ||
+      credential.device.revokedAt !== null
+    ) {
+      throw new DeviceAuthError("Invalid device credential");
+    }
+
+    return {
+      deviceId: credential.device.id,
+      userId: credential.device.userId,
+    };
+  }
+
   public revokeDevice(userId: string, deviceId: string): void {
     this.db.transaction((transaction) => {
       const device = transaction
@@ -231,5 +266,6 @@ export class DeviceService {
         .where(eq(deviceCredentials.deviceId, device.id))
         .run();
     });
+    this.options.onDeviceRevoked?.(deviceId);
   }
 }

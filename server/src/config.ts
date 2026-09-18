@@ -3,7 +3,10 @@ export type ServerConfig = {
   host: string;
   nodeEnv: "development" | "test" | "production";
   port: number;
+  enrollmentCodeTtlSeconds: number;
+  presenceStaleThresholdSeconds: number;
   sessionTtlSeconds: number;
+  webOrigin: string;
 };
 
 const nodeEnvironments = new Set<ServerConfig["nodeEnv"]>([
@@ -75,10 +78,25 @@ export function loadConfig(
     host: requiredString(environment, "HOST", "127.0.0.1"),
     nodeEnv: nodeEnvironment(environment),
     port: portValue(environment),
+    enrollmentCodeTtlSeconds: positiveInteger(
+      environment,
+      "ENROLLMENT_CODE_TTL_SECONDS",
+      "600",
+    ),
+    presenceStaleThresholdSeconds: positiveInteger(
+      environment,
+      "PRESENCE_STALE_THRESHOLD_SECONDS",
+      "45",
+    ),
     sessionTtlSeconds: positiveInteger(
       environment,
       "SESSION_TTL_SECONDS",
       String(30 * 24 * 60 * 60),
+    ),
+    webOrigin: requiredString(
+      environment,
+      "WEB_ORIGIN",
+      "http://localhost:5173",
     ),
   };
 }

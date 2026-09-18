@@ -16,7 +16,10 @@ test("loadConfig accepts valid environment values", () => {
     host: "127.0.0.1",
     nodeEnv: "test",
     port: 4317,
+    enrollmentCodeTtlSeconds: 600,
+    presenceStaleThresholdSeconds: 45,
     sessionTtlSeconds: 3600,
+    webOrigin: "http://localhost:5173",
   });
 });
 
@@ -32,6 +35,14 @@ test("loadConfig rejects invalid environment values", () => {
   assert.throws(
     () => loadConfig({ SESSION_TTL_SECONDS: "0" }),
     /SESSION_TTL_SECONDS must be a positive integer/,
+  );
+  assert.throws(
+    () => loadConfig({ ENROLLMENT_CODE_TTL_SECONDS: "0" }),
+    /ENROLLMENT_CODE_TTL_SECONDS must be a positive integer/,
+  );
+  assert.throws(
+    () => loadConfig({ PRESENCE_STALE_THRESHOLD_SECONDS: "0" }),
+    /PRESENCE_STALE_THRESHOLD_SECONDS must be a positive integer/,
   );
   assert.throws(
     () => loadConfig({ HOST: " " }),

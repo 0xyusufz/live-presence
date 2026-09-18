@@ -7,6 +7,10 @@ async function start(): Promise<void> {
     config.databasePath,
     config.sessionTtlSeconds,
     config.nodeEnv,
+    undefined,
+    config.enrollmentCodeTtlSeconds,
+    config.presenceStaleThresholdSeconds,
+    config.webOrigin,
   );
 
   try {
