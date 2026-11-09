@@ -11,13 +11,13 @@ graph LR
     D["Desktop app<br/>Electron<br/>Win / macOS"] -.->|"WSS: auth, presence,<br/>signaling, requests, chat"| S
     V["Browser viewer"] -.->|"HTTPS + WSS"| S
     S["Node + Fastify<br/>one process<br/>REST + WS + SQLite"]
-    S -->|"mint TURN creds"| T["coturn"]
+    S -->|"fetch temporary ICE servers"| CF["Cloudflare Realtime TURN"]
     D ==>|"WebRTC media,<br/>P2P, encrypted"| V
-    D -.->|"relay if P2P fails"| T
-    T -.-> V
+    D -.->|"relay when direct path is unavailable"| CF
+    CF -.-> V
     style D fill:#2d5016,color:#fff
     style S fill:#1a3a5c,color:#fff
-    style T fill:#5c1a1a,color:#fff
+    style CF fill:#5c1a1a,color:#fff
 ```
 
 Two planes, kept separate on purpose:
@@ -330,18 +330,18 @@ must be checked through WebRTC statistics.
 
 ---
 
-## 6. TURN (coturn)
+## 6. TURN (Cloudflare Realtime + optional coturn)
 
 ```
 Internet
   │
-  ├─ 443/tcp  (HTTPS+WSS) ──> Caddy ──> Fastify
-  │
-  ├─ 3478/udp + 3478/tcp  ──> coturn   (NOT behind Caddy — see below)
-  ├─ 5349/tcp (TLS, turns:) ──> coturn
-  ├─ relay UDP range (e.g. 49160–49200) ──> coturn
-  │
-  └─ UDP (ephemeral range) ──> WebRTC P2P, directly between peers
+  ├─ 443/tcp (HTTPS+WSS) ──> Caddy ──> Fastify
+  ├─ HTTPS API request ──> Fastify ──> Cloudflare Realtime TURN
+  │                         (temporary ICE-server credentials)
+  ├─ WebRTC direct path ──> peer-to-peer media
+  └─ WebRTC relay path ──> Cloudflare Realtime TURN ──> peer
+
+Optional self-hosted coturn deployment uses its own public TURN/TLS and relay ports.
 ```
 
 **Do not put coturn behind Caddy.** TURN needs raw UDP relay across a configured port range and its own TLS on 5349 for `turns:`; an HTTP reverse proxy adds nothing and actively can't forward that traffic correctly. Give coturn its own public ports.
@@ -394,9 +394,9 @@ connectivity and its deployment acceptance criteria remain outstanding.
 
 **Forced-relay test is mandatory, not optional.** Run the full flow with `iceTransportPolicy: "relay"` on both ends (§15, item 8) during Phase 4. It's the only way to find out your TURN config is wrong before a user on a hostile network does.
 
-Cloudflare Realtime is used by the current Phase 4 implementation as a
-temporary credential provider for integration validation. It is not an SFU
-and does not replace the documented self-hosted coturn deployment target.
+Cloudflare Realtime TURN is the active provider used by the current
+application implementation and integration tests. It is a TURN relay service,
+not an SFU. Self-hosted coturn is an optional alternative deployment path.
 
 ---
 
@@ -649,7 +649,7 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 
 | What | Server knows/stores? |
 |---|---|
-| Screen/camera content | **The application server never terminates or stores it.** Peer-to-peer whenever possible; when TURN is required, coturn relays encrypted WebRTC traffic without decrypting it — it can observe endpoint/network metadata (IP addresses, byte counts) but does not possess the keys needed to decrypt the screen/camera plaintext |
+| Screen/camera content | **The application server never terminates or stores it.** Peer-to-peer whenever possible; when TURN is required, the selected TURN provider relays encrypted WebRTC traffic without decrypting it — it can observe endpoint/network metadata (IP addresses, byte counts) but does not possess the keys needed to decrypt the screen/camera plaintext |
 | Who watched whom, when | **No** — this table doesn't exist (§8); the currently-watching state is memory-only and vanishes when the viewer leaves |
 | Chat messages | Relayed and briefly buffered in memory; **never persisted** (§9) |
 | Screen/camera requests | Pending state in memory only; no record that a request was ever made, allowed or denied |
@@ -677,14 +677,14 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 | Session ID guessing | High-entropy IDs (§9) |
 | Stolen auth token | Short-lived, revocable server-side session (`sessions` table); rotation + reuse-detection for device tokens |
 | WebSocket hijacking | Validate `Origin` on handshake (WS isn't covered by CORS); require auth as first frame with a deadline |
-| TURN credential abuse | Ephemeral HMAC creds, 10-min TTL, per-user coturn quotas |
+| TURN credential abuse | Active Cloudflare path: authenticated server-side credential generation and temporary ICE credentials. Optional coturn path: ephemeral HMAC credentials and configured coturn quotas |
 | Replayed session tokens | Single-use tokens; short access-token TTL |
 | **Malicious viewer** | The viewer has a **limited, explicitly defined control-plane channel**: chat text, screen-share request, camera-share request, request cancel, session create/leave. That is the complete list of viewer-originated intents. The viewer **cannot** start capture, run commands, control mouse or keyboard, reach the filesystem or a terminal, or bypass sender approval — capture requires an explicit sender click through the trusted IPC path (§5). Every viewer message is server-authorized against `viewer_permissions`, and chat and requests are rate-limited (§7, §9) |
 | Viewer request spam / prompt fatigue | One pending request per kind, 30s cooldown after Deny, ~2 min request TTL, all server-enforced before the sender is ever prompted |
 | Chat abuse (flooding, oversize payloads, injected markup) | Size cap, rate limit, plain-text rendering on both ends |
 | Compromised/hostile server trying to start capture | Structurally blocked: no network message reaches the share state machine's arm path (§5). A hostile server can deny service or lie about presence; it cannot turn on a camera |
 | Malicious desktop client | Can only affect its own owner's account; server never trusts client-asserted authorization |
-| Server compromise | The application server never terminates or stores screen/camera media — nothing to leak from it directly. coturn, when used, relays encrypted media it cannot decrypt, so compromising it exposes connection metadata, not screen/camera content. No chat, watch or usage history exists to leak either. Response plan: rotate the coturn shared secret and force re-enrollment |
+| Server compromise | The application server never terminates or stores screen/camera media — nothing to leak from it directly. a TURN relay, whether Cloudflare or optional coturn, relays encrypted media it cannot decrypt, so compromising it exposes connection metadata, not screen/camera content. No chat, watch or usage history exists to leak either. Response plan: rotate the coturn shared secret (or rotate/revoke the Cloudflare API credentials for the active provider) and force re-enrollment |
 | Logs leaking sensitive info | Explicit allowlist logging (not a denylist), 7-day retention |
 
 **Sharing must be obvious to the sender:** always-on-top, frameless indicator window whose lifetime is *the same object* as the capture handles (§3) — not a toggle that could be hidden.
@@ -704,20 +704,15 @@ services:
 
 - **Domain:** buy one small/cheap domain from day one — needed for TURN's `realm`, cookie stability, and email deliverability (magic-link sending domain verification).
 - **HTTPS/WSS:** Caddy handles TLS automatically; the browser viewer requires a secure context for `getUserMedia`/media APIs and blocks mixed `ws://` from an `https://` page outright.
-- **Firewall:** open 443/tcp (Caddy), 3478/udp + 3478/tcp and 5349/tcp (coturn), plus coturn's configured relay UDP range (§6) — and set `external-ip` correctly if the VPS is behind cloud NAT.
+- **Firewall:** open 443/tcp (Caddy) for the active Cloudflare-backed application. Only if deploying optional self-hosted coturn, also open 3478/udp + 3478/tcp, 5349/tcp and the configured coturn relay UDP range; configure `external-ip` correctly behind cloud NAT (§6).
 - **Secrets:** `.env`, never committed — coturn shared secret, SMTP creds, cookie signing key.
 - **Backup:** nightly `sqlite3 .backup`, gzip, push somewhere off-box (even scp to another machine). The DB is a few hundred KB.
 - **Logs:** `journalctl`/Docker logs, 7-day retention, allowlist fields only (§11).
 - **Health:** `GET /healthz` → `{status:"ok", version}`.
 
-**Recommended host:** a low-cost VPS (~€4–5/mo, Hetzner-class) with:
+**Recommended host:** a low-cost VPS with persistent, attachable storage for SQLite and backups, a stable address for the application domain, and predictable bandwidth/egress pricing.
 
-- a stable public IP (coturn's `external-ip` and the domain's DNS both depend on it not changing);
-- persistent, attachable storage (the SQLite file and its backups live on disk between deploys);
-- raw UDP support (coturn's relay range and WebRTC's own UDP candidates need it — some PaaS platforms restrict or don't support this);
-- predictable bandwidth/egress pricing (TURN relay traffic is metered, and surprise egress costs are the main risk of choosing a host for its price alone).
-
-For a self-hosted open-source project you're telling others to deploy, verify these four properties explicitly rather than assuming any given provider's free or entry tier has them — terms, allocations and included bandwidth vary by provider and change over time.
+Cloudflare Realtime TURN is external to the VPS. If you choose to deploy optional self-hosted coturn, the VPS must additionally support a stable public IP, raw UDP, and the configured relay port range. Set coturn's `external-ip` correctly when the VPS is behind cloud NAT.
 
 ---
 
@@ -860,18 +855,18 @@ No automated Windows/macOS UI testing infrastructure for MVP — not worth build
 - **DB:** SQLite (better-sqlite3 + Drizzle), six tables
 - **Media:** WebRTC, P2P, 1 viewer, 2 reserved transceivers (screen + camera)
 - **Control plane:** WebSocket — presence, signaling, viewer requests, transient chat
-- **TURN:** self-hosted coturn deployment target; current Phase 4 implementation also supports authenticated temporary ICE-server credentials from Cloudflare Realtime
+- **TURN:** Cloudflare Realtime temporary ICE servers (active application provider); optional self-hosted coturn deployment path
 - **Proxy/TLS:** Caddy
 - **Deploy:** Docker Compose on one VPS
 - **Auth:** magic-link (users) + enrollment code & rotating refresh tokens (devices)
 
 ## MVP SCOPE
 
-Windows + macOS desktop sender · browser viewer (any modern browser) · sign in · online/offline presence · today's aggregate active-usage figure with an owner privacy toggle · start/stop screen+camera sharing as independent tracks · **sharing runs indefinitely until the sender stops it**, with a one-time 60-minute awareness notice · sleep/wake temporarily interrupts sharing and automatically resumes only the already-approved active sharing session with `Connected / Sharing resumed`, while crash/relaunch returns to IDLE and requires a fresh click · pre-authorized viewer access via `viewer_permissions` (revocable by either side) · viewer screen/camera **requests** with explicit sender Allow/Deny · viewer-watching indicator on the sender · two-way transient text chat available whenever an authorized viewer is connected, regardless of whether screen/camera sharing is active · short viewer-disconnect grace period · unmissable sharing indicator · self-hosted on one VPS.
+Windows + macOS desktop sender · browser viewer (any modern browser) · sign in · online/offline presence · today's aggregate active-usage figure with an owner privacy toggle · start/stop screen+camera sharing as independent tracks · **sharing runs indefinitely until the sender stops it**, with a one-time 60-minute awareness notice · sleep/wake temporarily interrupts sharing and automatically resumes only the already-approved active sharing session with `Connected / Sharing resumed`, while crash/relaunch returns to IDLE and requires a fresh click · pre-authorized viewer access via `viewer_permissions` (revocable by either side) · viewer screen/camera **requests** with explicit sender Allow/Deny · viewer-watching indicator on the sender · two-way transient text chat available whenever an authorized viewer is connected, regardless of whether screen/camera sharing is active · short viewer-disconnect grace period · unmissable sharing indicator · application self-hosted on one VPS, with Cloudflare Realtime as the active external TURN provider and optional self-hosted coturn.
 
 ## NOT IN MVP
 
-Android/iOS apps · multiple concurrent viewers/SFU · recording or media storage of any kind · screenshots · share-session history table · viewer-watch history · permanent chat history · detailed usage history or surveillance analytics · application/window/URL/keystroke tracking · remote mouse/keyboard · remote terminal · remote file access · file transfer · group chat · reactions · typing indicators · read receipts · self-service pairing-code flow for *adding* new authorized viewers (pre-authorized `viewer_permissions` only) · Redis/Kafka/queues/Kubernetes/microservices · managed TURN/SFU providers · enterprise RBAC · analytics · Windows code signing, macOS notarization, and auto-update — kept outside the core MVP implementation entirely, see below.
+Android/iOS apps · multiple concurrent viewers/SFU · recording or media storage of any kind · screenshots · share-session history table · viewer-watch history · permanent chat history · detailed usage history or surveillance analytics · application/window/URL/keystroke tracking · remote mouse/keyboard · remote terminal · remote file access · file transfer · group chat · reactions · typing indicators · read receipts · self-service pairing-code flow for *adding* new authorized viewers (pre-authorized `viewer_permissions` only) · Redis/Kafka/queues/Kubernetes/microservices · managed SFU providers · enterprise RBAC · analytics · Windows code signing, macOS notarization, and auto-update — kept outside the core MVP implementation entirely, see below.
 
 **Packaging note (optional release requirement, not core architecture):** unsigned builds work fine for MVP — Windows shows a SmartScreen "unknown publisher" warning, macOS requires the person to `xattr -dr com.apple.quarantine` the app to bypass Gatekeeper. Code signing ($200–400/yr Windows OV cert) and macOS notarization ($99/yr Apple Developer Program) only matter once you're distributing to people who aren't you.
 
@@ -887,7 +882,7 @@ See §14 — Phases 0 through 7 get you a working MVP, Phase 8 completes the fea
 4. **Feature creep specifically toward surveillance.** Chat, usage time and requests each have an obvious next step (history, per-app breakdown, standing approval) that would quietly turn this into monitoring software. The schema in §8 is the defense; keep it empty of those tables.
 5. **TURN misconfiguration** (`external-ip` wrong behind cloud NAT, relay range not opened) — produces "works for me, fails for some users" bugs that take a full day to find if untested. Test the forced-relay path (§15, item 8) in Phase 4, not at the end.
 6. **Electron secure-context gotcha** — camera/screen APIs silently fail in a packaged build if the `app://` privileged scheme isn't registered before `app.whenReady()`. NEEDS PROTOTYPE early, not discovered during a demo.
-7. **Leaked TURN credential → bandwidth bill** — mitigated by short TTL + coturn quotas (§6), but only if you actually set the quotas.
+7. **Leaked TURN credential → bandwidth bill** — the active Cloudflare path uses temporary credentials and provider-side controls; optional coturn requires short-lived HMAC credentials and configured quotas (§6).
 8. **In-memory presence/session/request/chat state means every deploy drops everyone** — acceptable, but only if reconnect logic (§10) is built in Phase 4 and clients reset request UI on reconnect rather than showing stale pending state.
 9. **Indefinite sessions put more weight on the indicator and resume boundary.** With no expiry, the indicator window, the explicit approval boundary for new viewer requests, and the distinction between automatic sleep/wake resume for an already-approved active session versus the IDLE reset after crash/relaunch are the whole safety net. A bug that lets the indicator hide while capture runs, or that lets wake resume a new request without approval, is now a serious defect, not a cosmetic one — which is exactly why its lifetime is bound to the capture handles (§3).
 10. **Hosting-platform mismatch** — if you ever move off the recommended VPS, verify the new host actually supports raw UDP + a static IP for coturn and has predictable egress pricing (§12); many PaaS platforms don't meet all four, and terms/allocations vary by provider and change over time.
