@@ -16,6 +16,11 @@ docker compose --env-file .env -f infra/docker-compose.yml up -d coturn
 ```
 
 Open UDP/TCP 3478, TCP 5349, and UDP relay ports 49160-49200 in the VPS
-firewall. Never expose the shared secret to either client.
+firewall only when the optional coturn service is deployed. The current
+Fastify application does not generate coturn HMAC credentials or route its
+active Cloudflare ICE-server requests through coturn. Never expose the shared
+secret to either client.
 
-Reserved for the single-VPS Docker Compose deployment using Caddy and coturn. Production deployment configuration is intentionally not part of the initial foundation.
+Reserved for the single-VPS Docker Compose deployment using Caddy and the
+optional coturn service. Production deployment configuration is intentionally
+not part of the initial foundation.

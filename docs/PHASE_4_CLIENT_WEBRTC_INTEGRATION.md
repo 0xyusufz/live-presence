@@ -35,8 +35,10 @@ credentials, which are validated before they are returned with `cache-control:
 no-store` and `referrer-policy: no-referrer`.
 
 The default credential TTL is 24 hours and is configurable with
-`TURN_CREDENTIAL_TTL_SECONDS`; choose a value covering the expected session
-duration. Normal peer connections use `iceTransportPolicy: "all"` so host,
+`TURN_CREDENTIAL_TTL_SECONDS`. That value is sent to Cloudflare on each
+credential-generation request; the server does not cache responses, and the
+`expiresAt` metadata returned by the endpoint is informational to callers.
+Normal peer connections use `iceTransportPolicy: "all"` so host,
 server-reflexive, and Cloudflare relay candidates can be gathered and ICE can
 select the best viable pair. A selected direct pair keeps media peer-to-peer;
 the presence of relay candidates during gathering does not mean that media
@@ -53,7 +55,8 @@ validation. The default STUN server is `stun:stun.l.google.com:19302`;
 deployments may override it with comma-separated `STUN_URLS` values.
 
 The existing `infra/docker-compose.yml` coturn service remains a separate
-self-hosted deployment option and is not used by the Cloudflare provider.
+optional self-hosted deployment option. Fastify does not currently generate
+coturn HMAC credentials or use that service for the active Cloudflare path.
 
 Control-plane reconnect uses fresh authentication, presence refresh, and
 jittered exponential backoff from 1 second to a 30-second cap. The retry

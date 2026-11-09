@@ -11,10 +11,10 @@ graph LR
     D["Desktop app<br/>Electron<br/>Win / macOS"] -.->|"WSS: auth, presence,<br/>signaling, requests, chat"| S
     V["Browser viewer"] -.->|"HTTPS + WSS"| S
     S["Node + Fastify<br/>one process<br/>REST + WS + SQLite"]
-    S -->|"fetch temporary ICE servers"| CF["Cloudflare Realtime TURN"]
+    S -->|"fetch temporary ICE servers"| CF["Cloudflare Realtime API"]
     D ==>|"WebRTC media,<br/>P2P, encrypted"| V
-    D -.->|"relay when direct path is unavailable"| CF
-    CF -.-> V
+    D -.->|"relay if selected"| T["Cloudflare TURN relay"]
+    T -.-> V
     style D fill:#2d5016,color:#fff
     style S fill:#1a3a5c,color:#fff
     style CF fill:#5c1a1a,color:#fff
@@ -281,7 +281,7 @@ sequenceDiagram
     alt direct path works
         D-->>V: media, peer-to-peer
     else blocked (NAT/firewall)
-        D-->>T[coturn]: relay
+        D-->>T[Cloudflare TURN]: relay
         T-->>V: relayed media
     end
 ```
@@ -330,7 +330,7 @@ must be checked through WebRTC statistics.
 
 ---
 
-## 6. TURN (Cloudflare Realtime + optional coturn)
+## 6. TURN providers and optional coturn deployment
 
 ```
 Internet
@@ -364,39 +364,47 @@ no-multicast-peers
 
 `external-ip` is the field that quietly breaks everything when wrong behind cloud NAT: candidates are advertised with an unreachable address and connections fail only for the users who actually need the relay. Keep the relay range open in the firewall and matched between `turnserver.conf` and the VPS security group.
 
-**Credentials — do this correctly, it's the one place a misconfiguration costs money:** never static creds. The self-hosted coturn deployment uses `use-auth-secret` mode:
+**Credentials — do this correctly, it's the one place a misconfiguration costs money:** never static creds. The optional self-hosted coturn deployment uses `use-auth-secret` mode:
 
 ```
 username = "<unix_expiry>:<user_id>"
 password = base64(HMAC-SHA1(shared_secret, username))
 ```
 
-10-minute TTL, minted by the API only for authenticated users. Set coturn's `user-quota`, `total-quota`, `max-bps` — this bounds the damage if a credential leaks regardless.
+The current Fastify application does **not** mint these coturn HMAC
+credentials. The format above is the coturn REST-auth convention that an
+optional deployment would need to provision separately; it is not the active
+Cloudflare credential flow and its example does not establish an application
+TTL. Set coturn's `user-quota`, `total-quota`, `max-bps`, and
+`no-multicast-peers` when that optional service is deployed.
 
 The active MVP provider is Cloudflare Realtime. The Phase 4 server calls its
 authenticated `generate-ice-servers` endpoint to issue temporary STUN/TURN
 configuration; the permanent Cloudflare API token and key ID remain
-server-side, and responses are validated and marked `no-store`. Cloudflare's
+server-side, and responses are validated and marked `no-store`. The configured
+credential TTL defaults to 24 hours and is sent to Cloudflare on each provider
+request; the server does not cache ICE-server responses. Cloudflare's
 provider-side credential, quota, and bandwidth controls apply to this path;
-the application does not expose a permanent provider secret or configure
-coturn quotas for Cloudflare.
+the application does not expose a permanent provider secret or apply coturn
+quotas to Cloudflare.
 
 Self-hosted coturn remains an optional, separate deployment path in the
-documented one-VPS Docker Compose architecture. It uses temporary HMAC
-credentials derived from `TURN_SHARED_SECRET`, scoped by `TURN_REALM`, with
-`user-quota`, `total-quota`, `max-bps`, `no-multicast-peers`, and the bounded
-relay port range applied by the Compose service. These coturn-specific quotas
-and controls do not apply to the active Cloudflare provider. The current
-automated relay evidence is for Cloudflare; the normal automated path uses
+documented one-VPS Docker Compose architecture. It expects temporary HMAC
+credentials derived from `TURN_SHARED_SECRET` and scoped by `TURN_REALM`; the
+current application does not issue them. `user-quota`, `total-quota`,
+`max-bps`, `no-multicast-peers`, and the bounded relay port range are applied
+by the Compose service. These coturn-specific quotas and controls do not apply
+to the active Cloudflare provider. The current automated relay evidence is for
+Cloudflare; the normal automated path uses
 `iceTransportPolicy: "all"` and verifies the selected candidate pair, while a
 forced-relay test uses `iceTransportPolicy: "relay"`. Live self-hosted coturn
 connectivity and its deployment acceptance criteria remain outstanding.
 
 **Forced-relay test is mandatory, not optional.** Run the full flow with `iceTransportPolicy: "relay"` on both ends (§15, item 8) during Phase 4. It's the only way to find out your TURN config is wrong before a user on a hostile network does.
 
-Cloudflare Realtime TURN is the active provider used by the current
-application implementation and integration tests. It is a TURN relay service,
-not an SFU. Self-hosted coturn is an optional alternative deployment path.
+Cloudflare Realtime is the current application provider, not an SFU. The
+optional coturn deployment remains available for self-hosting and its live
+relay validation is still outstanding.
 
 ---
 
@@ -649,7 +657,7 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 
 | What | Server knows/stores? |
 |---|---|
-| Screen/camera content | **The application server never terminates or stores it.** Peer-to-peer whenever possible; when TURN is required, the selected TURN provider relays encrypted WebRTC traffic without decrypting it — it can observe endpoint/network metadata (IP addresses, byte counts) but does not possess the keys needed to decrypt the screen/camera plaintext |
+| Screen/camera content | **The application server never terminates or stores it.** Peer-to-peer whenever possible; when TURN is required, Cloudflare TURN or optional coturn relays encrypted DTLS-SRTP media without decrypting it. The selected TURN operator can observe endpoint/network metadata (IP addresses, timing, and traffic volume) but does not possess the keys needed to decrypt screen/camera content |
 | Who watched whom, when | **No** — this table doesn't exist (§8); the currently-watching state is memory-only and vanishes when the viewer leaves |
 | Chat messages | Relayed and briefly buffered in memory; **never persisted** (§9) |
 | Screen/camera requests | Pending state in memory only; no record that a request was ever made, allowed or denied |
@@ -669,7 +677,7 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 
 **And the sender can always Stop.** The Stop control is present on the indicator window, which by construction is visible whenever capture is live.
 
-**What TURN exposes:** the application server does not terminate or store screen/camera media. When TURN is required, coturn relays encrypted WebRTC traffic between the two endpoints and can observe endpoint/network metadata — IP addresses of both relay endpoints, connection timing, byte counts — to the coturn operator (that's you). It does not possess the keys needed to decrypt the screen/camera plaintext, which stays DTLS-SRTP encrypted straight through the relay.
+**What TURN exposes:** the application server does not terminate or store screen/camera media. When TURN is required, Cloudflare TURN or optional coturn relays encrypted WebRTC traffic between the two endpoints and can observe endpoint/network metadata — IP addresses of both relay endpoints, connection timing, byte counts — to the selected TURN operator. It does not possess the keys needed to decrypt the screen/camera plaintext, which stays DTLS-SRTP encrypted straight through the relay.
 
 | Threat | Mitigation |
 |---|---|
@@ -677,14 +685,14 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 | Session ID guessing | High-entropy IDs (§9) |
 | Stolen auth token | Short-lived, revocable server-side session (`sessions` table); rotation + reuse-detection for device tokens |
 | WebSocket hijacking | Validate `Origin` on handshake (WS isn't covered by CORS); require auth as first frame with a deadline |
-| TURN credential abuse | Active Cloudflare path: authenticated server-side credential generation and temporary ICE credentials. Optional coturn path: ephemeral HMAC credentials and configured coturn quotas |
+| TURN credential abuse | Cloudflare temporary credentials use the configured provider TTL and server-side API credentials; optional coturn uses its shared HMAC secret plus the Compose quotas and bounded relay range |
 | Replayed session tokens | Single-use tokens; short access-token TTL |
 | **Malicious viewer** | The viewer has a **limited, explicitly defined control-plane channel**: chat text, screen-share request, camera-share request, request cancel, session create/leave. That is the complete list of viewer-originated intents. The viewer **cannot** start capture, run commands, control mouse or keyboard, reach the filesystem or a terminal, or bypass sender approval — capture requires an explicit sender click through the trusted IPC path (§5). Every viewer message is server-authorized against `viewer_permissions`, and chat and requests are rate-limited (§7, §9) |
 | Viewer request spam / prompt fatigue | One pending request per kind, 30s cooldown after Deny, ~2 min request TTL, all server-enforced before the sender is ever prompted |
 | Chat abuse (flooding, oversize payloads, injected markup) | Size cap, rate limit, plain-text rendering on both ends |
 | Compromised/hostile server trying to start capture | Structurally blocked: no network message reaches the share state machine's arm path (§5). A hostile server can deny service or lie about presence; it cannot turn on a camera |
 | Malicious desktop client | Can only affect its own owner's account; server never trusts client-asserted authorization |
-| Server compromise | The application server never terminates or stores screen/camera media — nothing to leak from it directly. a TURN relay, whether Cloudflare or optional coturn, relays encrypted media it cannot decrypt, so compromising it exposes connection metadata, not screen/camera content. No chat, watch or usage history exists to leak either. Response plan: rotate the coturn shared secret (or rotate/revoke the Cloudflare API credentials for the active provider) and force re-enrollment |
+| Server compromise | The application server never terminates or stores screen/camera media — nothing to leak from it directly. Cloudflare TURN or optional coturn relays encrypted media it cannot decrypt, so compromising the application or relay path exposes connection metadata, not screen/camera content. No chat, watch or usage history exists to leak either. Response plan: rotate the relevant Cloudflare provider credentials or optional coturn shared secret |
 | Logs leaking sensitive info | Explicit allowlist logging (not a denylist), 7-day retention |
 
 **Sharing must be obvious to the sender:** always-on-top, frameless indicator window whose lifetime is *the same object* as the capture handles (§3) — not a toggle that could be hidden.
@@ -699,13 +707,13 @@ One VPS, Docker Compose:
 services:
   caddy:   # :443, auto Let's Encrypt, routes /api,/ws -> app; serves static viewer page
   app:     # Fastify: REST + WS + SQLite volume
-  coturn:  # 3478/udp+tcp, 5349/tls, relay UDP range — own public ports, not behind caddy
+  coturn:  # optional: 3478/udp+tcp, 5349/tls, relay UDP range — not behind caddy
 ```
 
 - **Domain:** buy one small/cheap domain from day one — needed for TURN's `realm`, cookie stability, and email deliverability (magic-link sending domain verification).
 - **HTTPS/WSS:** Caddy handles TLS automatically; the browser viewer requires a secure context for `getUserMedia`/media APIs and blocks mixed `ws://` from an `https://` page outright.
-- **Firewall:** open 443/tcp (Caddy) for the active Cloudflare-backed application. Only if deploying optional self-hosted coturn, also open 3478/udp + 3478/tcp, 5349/tcp and the configured coturn relay UDP range; configure `external-ip` correctly behind cloud NAT (§6).
-- **Secrets:** `.env`, never committed — coturn shared secret, SMTP creds, cookie signing key.
+- **Firewall:** open 443/tcp (Caddy). Open 3478/udp + 3478/tcp, 5349/tcp, and coturn's configured relay UDP range (§6) only when the optional self-hosted coturn service is deployed; set `external-ip` correctly if the VPS is behind cloud NAT.
+- **Secrets:** `.env`, never committed — Cloudflare provider credentials for the active application, or the optional coturn shared secret, plus SMTP creds and the cookie signing key.
 - **Backup:** nightly `sqlite3 .backup`, gzip, push somewhere off-box (even scp to another machine). The DB is a few hundred KB.
 - **Logs:** `journalctl`/Docker logs, 7-day retention, allowlist fields only (§11).
 - **Health:** `GET /healthz` → `{status:"ok", version}`.
@@ -739,7 +747,7 @@ Cloudflare Realtime TURN is external to the VPS. If you choose to deploy optiona
 /infra
   docker-compose.yml
   Caddyfile
-  coturn/turnserver.conf
+  docker-compose.yml   # optional coturn service configuration
 /docs
   ARCHITECTURE.md    # this document
 ```
@@ -756,7 +764,7 @@ TypeScript everywhere except `/infra` config files. `/shared/protocol` is import
 | **1** | Magic-link auth, `sessions` table | Log in from a real email; revoking a session logs the browser out immediately |
 | **2** | Device enrollment, refresh rotation, Electron security baseline (§3) | Desktop app enrolls, survives restart, dies on revoke |
 | **3** | Presence over WS | Closing the app shows Offline in the viewer within seconds |
-| **4** | Signaling + coturn + reconnection | Two peers connect directly **and** relay-only (force with `iceTransportPolicy:"relay"`); survive a server restart; live coturn deployment validation remains outstanding |
+| **4** | Signaling + TURN + reconnection | Two peers connect directly **and** relay-only (force with `iceTransportPolicy:"relay"`); survive a server restart; live optional coturn deployment validation remains outstanding |
 | **5** | Desktop capture + viewer UI, two reserved transceivers | Windows→browser and macOS→browser, screen+camera, working Stop, unmissable indicator |
 | **6** | Consent layer: viewer requests, Allow/Deny, partial states, watching indicator | A denied request starts nothing; an allowed camera request adds a track to a live screen session with no renegotiation |
 | **7** | Two-way chat + sender notification/side panel | **MVP.** Messages both ways, notification opens the panel, nothing persists |
@@ -855,7 +863,7 @@ No automated Windows/macOS UI testing infrastructure for MVP — not worth build
 - **DB:** SQLite (better-sqlite3 + Drizzle), six tables
 - **Media:** WebRTC, P2P, 1 viewer, 2 reserved transceivers (screen + camera)
 - **Control plane:** WebSocket — presence, signaling, viewer requests, transient chat
-- **TURN:** Cloudflare Realtime temporary ICE servers (active application provider); optional self-hosted coturn deployment path
+- **TURN:** Cloudflare Realtime temporary ICE servers for the active application; optional self-hosted coturn deployment remains documented
 - **Proxy/TLS:** Caddy
 - **Deploy:** Docker Compose on one VPS
 - **Auth:** magic-link (users) + enrollment code & rotating refresh tokens (devices)
@@ -866,7 +874,7 @@ Windows + macOS desktop sender · browser viewer (any modern browser) · sign in
 
 ## NOT IN MVP
 
-Android/iOS apps · multiple concurrent viewers/SFU · recording or media storage of any kind · screenshots · share-session history table · viewer-watch history · permanent chat history · detailed usage history or surveillance analytics · application/window/URL/keystroke tracking · remote mouse/keyboard · remote terminal · remote file access · file transfer · group chat · reactions · typing indicators · read receipts · self-service pairing-code flow for *adding* new authorized viewers (pre-authorized `viewer_permissions` only) · Redis/Kafka/queues/Kubernetes/microservices · managed SFU providers · enterprise RBAC · analytics · Windows code signing, macOS notarization, and auto-update — kept outside the core MVP implementation entirely, see below.
+Android/iOS apps · multiple concurrent viewers/SFU · recording or media storage of any kind · screenshots · share-session history table · viewer-watch history · permanent chat history · detailed usage history or surveillance analytics · application/window/URL/keystroke tracking · remote mouse/keyboard · remote terminal · remote file access · file transfer · group chat · reactions · typing indicators · read receipts · self-service pairing-code flow for *adding* new authorized viewers (pre-authorized `viewer_permissions` only) · Redis/Kafka/queues/Kubernetes/microservices · additional managed TURN/SFU providers beyond the active Cloudflare Realtime path · enterprise RBAC · analytics · Windows code signing, macOS notarization, and auto-update — kept outside the core MVP implementation entirely, see below.
 
 **Packaging note (optional release requirement, not core architecture):** unsigned builds work fine for MVP — Windows shows a SmartScreen "unknown publisher" warning, macOS requires the person to `xattr -dr com.apple.quarantine` the app to bypass Gatekeeper. Code signing ($200–400/yr Windows OV cert) and macOS notarization ($99/yr Apple Developer Program) only matter once you're distributing to people who aren't you.
 
@@ -882,7 +890,7 @@ See §14 — Phases 0 through 7 get you a working MVP, Phase 8 completes the fea
 4. **Feature creep specifically toward surveillance.** Chat, usage time and requests each have an obvious next step (history, per-app breakdown, standing approval) that would quietly turn this into monitoring software. The schema in §8 is the defense; keep it empty of those tables.
 5. **TURN misconfiguration** (`external-ip` wrong behind cloud NAT, relay range not opened) — produces "works for me, fails for some users" bugs that take a full day to find if untested. Test the forced-relay path (§15, item 8) in Phase 4, not at the end.
 6. **Electron secure-context gotcha** — camera/screen APIs silently fail in a packaged build if the `app://` privileged scheme isn't registered before `app.whenReady()`. NEEDS PROTOTYPE early, not discovered during a demo.
-7. **Leaked TURN credential → bandwidth bill** — the active Cloudflare path uses temporary credentials and provider-side controls; optional coturn requires short-lived HMAC credentials and configured quotas (§6).
+7. **Leaked TURN credential → bandwidth bill** — the active Cloudflare path depends on provider-side credential and bandwidth controls; the optional coturn path is additionally mitigated by its shared-secret protection, bounded TTLs chosen by its credential issuer, and Compose quotas (§6).
 8. **In-memory presence/session/request/chat state means every deploy drops everyone** — acceptable, but only if reconnect logic (§10) is built in Phase 4 and clients reset request UI on reconnect rather than showing stale pending state.
 9. **Indefinite sessions put more weight on the indicator and resume boundary.** With no expiry, the indicator window, the explicit approval boundary for new viewer requests, and the distinction between automatic sleep/wake resume for an already-approved active session versus the IDLE reset after crash/relaunch are the whole safety net. A bug that lets the indicator hide while capture runs, or that lets wake resume a new request without approval, is now a serious defect, not a cosmetic one — which is exactly why its lifetime is bound to the capture handles (§3).
 10. **Hosting-platform mismatch** — if you ever move off the recommended VPS, verify the new host actually supports raw UDP + a static IP for coturn and has predictable egress pricing (§12); many PaaS platforms don't meet all four, and terms/allocations vary by provider and change over time.
