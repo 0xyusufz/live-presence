@@ -42,7 +42,7 @@ Chat and viewer requests ride the **control plane, not WebRTC**. They're a few h
 | Signaling | **`ws` library**, hand-rolled routing | ~150 lines. Socket.IO's rooms/reconnection abstractions fight an explicit presence state machine more than they help. | You write reconnect logic yourself — but you need custom reconnect logic anyway (see §10). |
 | DB | **SQLite** (better-sqlite3 + Drizzle) | Zero ops, file-based, trivial to back up (`cp`). At this scale, faster than networked Postgres. | Couples you to a persistent disk — fine on one VPS. |
 | Media | **WebRTC, P2P, 1 viewer** | Zero media cost when direct; lowest latency. | 2+ viewers needs an SFU — **NOT NEEDED FOR MVP**. |
-| TURN | **Self-hosted coturn** | Full control, ephemeral credentials, your own quotas. | You operate one more process — it's one Docker container. |
+| TURN | **Cloudflare Realtime temporary ICE servers** for the active MVP; self-hosted coturn remains an optional deployment path | No permanent TURN credentials reach clients; direct ICE avoids relay bandwidth when possible. | Cloudflare is an external provider; live self-hosted coturn validation remains a deployment task. |
 | Reverse proxy | **Caddy** | Automatic HTTPS via Let's Encrypt, one-file config. | None worth mentioning. |
 | Deployment | **One VPS + Docker Compose** | Everything in one place, backs up as one thing, migrates as one thing. | No redundancy — acceptable for two users. |
 
@@ -201,7 +201,7 @@ graph LR
       WSH --> SR["Session map<br/>(memory)"]
       WSH --> RQ["Pending requests<br/>+ deny cooldowns<br/>(memory)"]
       WSH --> CB["Chat buffers<br/>(memory, transient)"]
-      R --> TC["TURN cred minter<br/>HMAC-SHA1"]
+      R --> TC["TURN credential provider<br/>temporary ICE servers"]
     end
 ```
 
@@ -307,7 +307,18 @@ Whenever the live set changes mid-session, the sender emits `sharing_updated {sc
 
 **STUN:** configurable via environment variable — default to a public STUN server, but let the deployer point it anywhere. Keep the implementation simple: STUN carries no media and needs no credentials, so this is a one-line config value, not a subsystem.
 
-**TURN — when it's actually used:** whenever direct ICE connectivity fails to find a peer-to-peer path — typically symmetric NAT, CGNAT, or a network that blocks UDP outright (corporate/campus firewalls). How often this happens depends entirely on the specific networks involved, so don't design around a fixed percentage. **You cannot ship without a TURN fallback regardless** — without one, any connection that can't hole-punch simply fails with no diagnosable cause.
+**ICE policy and TURN — when it is actually used:** normal connections use
+`iceTransportPolicy: "all"` with host, STUN server-reflexive, and temporary
+Cloudflare TURN relay candidates. ICE normally prefers a viable direct
+host/server-reflexive pair, so media stays peer-to-peer when the network allows
+it. TURN is used only when direct ICE connectivity cannot establish a viable
+path — typically with symmetric NAT, CGNAT, or a network that blocks UDP
+outright (corporate/campus firewalls). How often that happens depends entirely
+on the networks involved, so don't design around a fixed percentage. **You
+cannot ship without a TURN fallback regardless** — without one, any connection
+that can't hole-punch simply fails with no diagnosable cause. A configured
+relay candidate is not proof that media used TURN; the selected candidate pair
+must be checked through WebRTC statistics.
 
 **Network change (Wi-Fi → hotspot, VPN toggle):** sender calls `createOffer({iceRestart: true})` on `iceConnectionState === "failed"` or `"disconnected"` past ~8s. Re-gathers candidates, typically recovers in 3–8s, **no re-permission prompt**.
 
@@ -353,7 +364,7 @@ no-multicast-peers
 
 `external-ip` is the field that quietly breaks everything when wrong behind cloud NAT: candidates are advertised with an unreachable address and connections fail only for the users who actually need the relay. Keep the relay range open in the firewall and matched between `turnserver.conf` and the VPS security group.
 
-**Credentials — do this correctly, it's the one place a misconfiguration costs money:** never static creds. Use coturn's `use-auth-secret` mode:
+**Credentials — do this correctly, it's the one place a misconfiguration costs money:** never static creds. The self-hosted coturn deployment uses `use-auth-secret` mode:
 
 ```
 username = "<unix_expiry>:<user_id>"
@@ -362,9 +373,30 @@ password = base64(HMAC-SHA1(shared_secret, username))
 
 10-minute TTL, minted by the API only for authenticated users. Set coturn's `user-quota`, `total-quota`, `max-bps` — this bounds the damage if a credential leaks regardless.
 
+The active MVP provider is Cloudflare Realtime. The Phase 4 server calls its
+authenticated `generate-ice-servers` endpoint to issue temporary STUN/TURN
+configuration; the permanent Cloudflare API token and key ID remain
+server-side, and responses are validated and marked `no-store`. Cloudflare's
+provider-side credential, quota, and bandwidth controls apply to this path;
+the application does not expose a permanent provider secret or configure
+coturn quotas for Cloudflare.
+
+Self-hosted coturn remains an optional, separate deployment path in the
+documented one-VPS Docker Compose architecture. It uses temporary HMAC
+credentials derived from `TURN_SHARED_SECRET`, scoped by `TURN_REALM`, with
+`user-quota`, `total-quota`, `max-bps`, `no-multicast-peers`, and the bounded
+relay port range applied by the Compose service. These coturn-specific quotas
+and controls do not apply to the active Cloudflare provider. The current
+automated relay evidence is for Cloudflare; the normal automated path uses
+`iceTransportPolicy: "all"` and verifies the selected candidate pair, while a
+forced-relay test uses `iceTransportPolicy: "relay"`. Live self-hosted coturn
+connectivity and its deployment acceptance criteria remain outstanding.
+
 **Forced-relay test is mandatory, not optional.** Run the full flow with `iceTransportPolicy: "relay"` on both ends (§15, item 8) during Phase 4. It's the only way to find out your TURN config is wrong before a user on a hostile network does.
 
-**NOT NEEDED FOR MVP:** Cloudflare Realtime/SFU, managed TURN providers. Self-hosted coturn on the same VPS is enough at this scale; keep a managed TURN provider in your back pocket as a fallback if you ever outgrow the VPS's egress allowance.
+Cloudflare Realtime is used by the current Phase 4 implementation as a
+temporary credential provider for integration validation. It is not an SFU
+and does not replace the documented self-hosted coturn deployment target.
 
 ---
 
@@ -706,7 +738,7 @@ For a self-hosted open-source project you're telling others to deploy, verify th
     /ws              # signaling handler, presence registry, request state,
                      #   chat relay (all in-memory)
     /db              # SQLite schema + migrations (Drizzle)
-    /turn            # HMAC credential minting
+    /turn            # temporary ICE-server credential provider
 /shared
   /protocol          # message/type definitions, shared by server + desktop + viewer
 /infra
@@ -729,7 +761,7 @@ TypeScript everywhere except `/infra` config files. `/shared/protocol` is import
 | **1** | Magic-link auth, `sessions` table | Log in from a real email; revoking a session logs the browser out immediately |
 | **2** | Device enrollment, refresh rotation, Electron security baseline (§3) | Desktop app enrolls, survives restart, dies on revoke |
 | **3** | Presence over WS | Closing the app shows Offline in the viewer within seconds |
-| **4** | Signaling + coturn + reconnection | Two peers connect directly **and** relay-only (force with `iceTransportPolicy:"relay"`); survive a server restart |
+| **4** | Signaling + coturn + reconnection | Two peers connect directly **and** relay-only (force with `iceTransportPolicy:"relay"`); survive a server restart; live coturn deployment validation remains outstanding |
 | **5** | Desktop capture + viewer UI, two reserved transceivers | Windows→browser and macOS→browser, screen+camera, working Stop, unmissable indicator |
 | **6** | Consent layer: viewer requests, Allow/Deny, partial states, watching indicator | A denied request starts nothing; an allowed camera request adds a track to a live screen session with no renegotiation |
 | **7** | Two-way chat + sender notification/side panel | **MVP.** Messages both ways, notification opens the panel, nothing persists |
@@ -738,6 +770,48 @@ TypeScript everywhere except `/infra` config files. `/shared/protocol` is import
 | **10** | Packaging | Installable `.exe`/`.dmg` on clean machines |
 
 Phases 0–7 are the real MVP; 8 completes the feature set and 9–10 are hardening and packaging before a public release.
+
+### Phase 4 implementation status
+
+The shared signaling and WebRTC recovery implementation is present and
+deterministically tested. The real Chromium harness also verifies the
+authenticated owner/viewer flow, one active viewer per owner device, generated
+session IDs, owner-offerer/viewer-answerer negotiation, two reserved video
+transceivers, synthetic media reception, selected relay candidate diagnostics,
+explicit cleanup, viewer reconnect, server restart recovery, and forced-relay
+initial negotiation failure. The client additionally bounds initial ICE
+negotiation at 30 seconds, reports terminal failure, closes the peer and
+signaling resources, and rejects late callbacks.
+
+**Implemented and tested:** authenticated WebSocket signaling; owner/viewer
+role enforcement; fresh authorization before session creation; one active
+viewer session per owner device; direct-preferred Chromium WebRTC; forced relay
+through the authenticated temporary ICE-server response; selected candidate
+pairs and DTLS checks; all-policy relay selection when direct candidates are
+made unavailable by the deterministic harness; jittered WebSocket reconnect
+with fresh authentication;
+server restart invalidation and re-session; bounded ICE recovery; initial ICE
+timeout; terminal cleanup; and stale socket, peer, timer, and listener
+protection.
+
+**Implemented but not fully integration-tested:** a live post-connection
+direct-to-relay network failover using Chromium's real network interfaces; the
+self-hosted coturn configuration and relay path on the documented VPS
+deployment; Electron desktop integration; and cross-platform Windows/macOS
+runtime behavior. The automated browser harness uses synthetic canvas tracks
+and does not exercise
+screen or camera capture.
+
+**Manual or production validation still pending:** live self-hosted coturn
+relay validation with the Docker Compose deployment; real Windows and macOS
+desktop/browser runs; sleep/wake resume behavior and its
+`Connected / Sharing resumed` notification; crash/relaunch reset; and the
+capture/consent flows in later phases.
+
+Phase 4 is therefore **not marked complete against the original acceptance
+criterion yet**: direct and forced-relay behavior, reconnection, and server
+restart are verified with Chromium and the current temporary TURN provider,
+but the original coturn deployment acceptance still requires live validation.
 
 ---
 
@@ -759,7 +833,7 @@ Phases 0–7 are the real MVP; 8 completes the feature set and 9–10 are harden
 5. Viewer closes tab mid-session
 6. Sender network drop + reconnect
 7. Wi-Fi → mobile hotspot mid-share
-8. Forced TURN relay path (`iceTransportPolicy:"relay"`)
+8. Forced TURN relay path (`iceTransportPolicy:"relay"`) using the deployed self-hosted coturn service
 9. macOS: deny screen permission, then grant it after relaunch
 10. Screen-capture source window closed mid-share
 11. **Sharing passes 60 minutes:** notice appears exactly once, sharing keeps running, no renewal prompt, no stop. Leave it running well past 60 minutes to confirm nothing expires
@@ -786,7 +860,7 @@ No automated Windows/macOS UI testing infrastructure for MVP — not worth build
 - **DB:** SQLite (better-sqlite3 + Drizzle), six tables
 - **Media:** WebRTC, P2P, 1 viewer, 2 reserved transceivers (screen + camera)
 - **Control plane:** WebSocket — presence, signaling, viewer requests, transient chat
-- **TURN:** self-hosted coturn, ephemeral HMAC credentials
+- **TURN:** self-hosted coturn deployment target; current Phase 4 implementation also supports authenticated temporary ICE-server credentials from Cloudflare Realtime
 - **Proxy/TLS:** Caddy
 - **Deploy:** Docker Compose on one VPS
 - **Auth:** magic-link (users) + enrollment code & rotating refresh tokens (devices)

@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { AuthService } from "../auth/service.js";
 import type { DeviceService } from "../devices/service.js";
 import { DeviceAuthError } from "../devices/service.js";
-import { TurnService } from "./service.js";
+import { TurnProviderError, TurnService } from "./service.js";
 
 function noStore(reply: FastifyReply): void {
   reply.header("cache-control", "no-store");
@@ -34,6 +34,13 @@ export async function registerTurnRoutes(
       }
     }
     if (!userId) return reply.code(401).send({ error: "not authenticated" });
-    return reply.send(turn.issue(userId));
+    try {
+      return reply.send(await turn.issue());
+    } catch (error) {
+      if (error instanceof TurnProviderError) {
+        return reply.code(503).send({ error: "TURN service unavailable" });
+      }
+      throw error;
+    }
   });
 }

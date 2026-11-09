@@ -11,10 +11,9 @@ async function start(): Promise<void> {
     config.enrollmentCodeTtlSeconds,
     config.presenceStaleThresholdSeconds,
     config.webOrigin,
-    config.turnSharedSecret,
-    config.turnUrls,
+    config.cloudflareTurnKeyId,
+    config.cloudflareTurnApiToken,
     config.stunUrls,
-    config.turnRealm,
     config.turnCredentialTtlSeconds,
   );
 

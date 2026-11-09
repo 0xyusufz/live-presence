@@ -1,8 +1,6 @@
 services:
   coturn:
     image: coturn/coturn:4.6
-    volumes:
-      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
     restart: unless-stopped
     command:
       - --listening-port=3478

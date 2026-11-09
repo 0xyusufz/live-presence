@@ -8,11 +8,28 @@
     "server",
     "shared"
   ],
+  "overrides": {
+    "fast-uri": "4.2.3",
+    "ajv": {
+      "fast-uri": "3.1.9"
+    }
+  },
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "check:config": "tsc --noEmit --project tsconfig.json"
+    "check:config": "tsc --noEmit --project tsconfig.json",
+    "check": "npm run check:config && npm --workspace server run check",
+    "test:webrtc:integration": "tsx integration/webrtc.integration.test.ts",
+    "test:webrtc:integration:direct": "tsx integration/webrtc.integration.test.ts --mode=direct",
+    "test:webrtc:integration:relay": "tsx integration/webrtc.integration.test.ts --mode=relay",
+    "test:webrtc:integration:fallback": "tsx integration/webrtc.integration.test.ts --mode=fallback",
+    "test:webrtc:integration:restart": "tsx integration/webrtc.integration.test.ts --mode=restart",
+    "test:webrtc:integration:failure": "tsx integration/webrtc.integration.test.ts --mode=failure"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "playwright": "^1.65.0"
+  }
 }

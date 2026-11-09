@@ -24,11 +24,11 @@ export async function buildApp(
   enrollmentCodeTtlSeconds = 600,
   presenceStaleThresholdSeconds = 45,
   webOrigin = "http://localhost:5173",
-  turnSharedSecret = "development-turn-secret",
-  turnUrls = ["turn:localhost:3478"],
+  cloudflareTurnKeyId = "development-turn-key-id",
+  cloudflareTurnApiToken = "development-turn-api-token",
   stunUrls = [] as string[],
-  turnRealm = "localhost",
-  turnCredentialTtlSeconds = 600,
+  turnCredentialTtlSeconds = 86_400,
+  turnFetch?: typeof fetch,
 ): Promise<{
   app: FastifyInstance;
   authorization: ViewerAuthorizationService;
@@ -51,10 +51,10 @@ export async function buildApp(
   });
   const authorization = new ViewerAuthorizationService(database.db);
   const turn = new TurnService({
-    sharedSecret: turnSharedSecret,
-    urls: turnUrls,
-    stunUrls,
+    keyId: cloudflareTurnKeyId,
+    apiToken: cloudflareTurnApiToken,
     ttlSeconds: turnCredentialTtlSeconds,
+    fetch: turnFetch,
   });
   const deviceService = new DeviceService(database.db, {
     enrollmentCodeTtlSeconds,
@@ -79,10 +79,9 @@ export async function buildApp(
       presenceStaleThresholdSeconds,
       sessionTtlSeconds,
       webOrigin,
-      turnSharedSecret,
-      turnUrls,
+      cloudflareTurnKeyId,
+      cloudflareTurnApiToken,
       stunUrls,
-      turnRealm,
       turnCredentialTtlSeconds,
     },
   );
@@ -99,10 +98,9 @@ export async function buildApp(
       presenceStaleThresholdSeconds,
       sessionTtlSeconds,
       webOrigin,
-      turnSharedSecret,
-      turnUrls,
+      cloudflareTurnKeyId,
+      cloudflareTurnApiToken,
       stunUrls,
-      turnRealm,
       turnCredentialTtlSeconds,
     },
   );

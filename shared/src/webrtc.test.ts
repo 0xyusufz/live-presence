@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { WebRtcPeer, type WebRtcPeerConnection, type WebRtcTransceiver } from "./webrtc.js";
-import { validTrackMap } from "./protocol.js";
+import {
+  WebRtcPeer,
+  type WebRtcConfiguration,
+  type WebRtcPeerConnection,
+  type WebRtcTransceiver,
+} from "./webrtc.js";
+import { validTrackMap, type TrackMap } from "./protocol.js";
 
 class MockConnection implements WebRtcPeerConnection {
   transceivers: WebRtcTransceiver[] = [];
@@ -15,6 +20,8 @@ class MockConnection implements WebRtcPeerConnection {
   local: unknown;
   candidates: unknown[] = [];
   replaceCalls: Array<{ index: number; track: unknown }> = [];
+  offerCalls = 0;
+  failOfferCount = 0;
   failAddIce = false;
   addTransceiver(_kind: string, init: { direction: "sendonly" | "recvonly" }): WebRtcTransceiver {
     const index = this.transceivers.length;
@@ -26,7 +33,14 @@ class MockConnection implements WebRtcPeerConnection {
     this.transceivers.push(tx);
     return tx;
   }
-  async createOffer() { return { type: "offer" as const, sdp: "offer" }; }
+  async createOffer() {
+    this.offerCalls += 1;
+    if (this.failOfferCount > 0) {
+      this.failOfferCount -= 1;
+      throw new Error("offer failed");
+    }
+    return { type: "offer" as const, sdp: "offer" };
+  }
   async createAnswer() { return { type: "answer" as const, sdp: "answer" }; }
   async setLocalDescription(value: unknown) { this.local = value; }
   async setRemoteDescription(value: unknown) { this.remote = value; }
@@ -34,6 +48,7 @@ class MockConnection implements WebRtcPeerConnection {
     if (this.failAddIce) throw new Error("candidate failed");
     this.candidates.push(value);
   }
+  setConfiguration(_configuration: WebRtcConfiguration): void {}
   close() { this.closed = true; }
 }
 
@@ -166,4 +181,56 @@ test("viewer rejects a valid-shaped track map with incorrect negotiated mids", a
     () => peer.acceptOffer("offer", [{ mid: "1", kind: "screen" }, { mid: "0", kind: "camera" }]),
     /does not match/,
   );
+});
+
+test("owner and viewer complete a bounded ICE restart after initial negotiation", async () => {
+  const ownerMessages: unknown[] = [];
+  const viewerMessages: unknown[] = [];
+  const ownerConnection = new MockConnection();
+  const viewerConnection = new MockConnection();
+  const owner = new WebRtcPeer("owner", "session", () => ownerConnection, (message) => ownerMessages.push(message));
+  const viewer = new WebRtcPeer("viewer", "session", () => viewerConnection, (message) => viewerMessages.push(message));
+
+  await owner.createOffer();
+  await viewer.acceptOffer("offer", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }]);
+  await owner.acceptAnswer("answer");
+  ownerConnection.connectionState = "disconnected";
+  ownerConnection.onconnectionstatechange?.();
+  viewerConnection.connectionState = "disconnected";
+  viewerConnection.onconnectionstatechange?.();
+
+  await owner.createOffer({ iceRestart: true });
+  const restartOffer = ownerMessages.at(-1) as { sdp: string; track_map: [{ mid: string; kind: "screen" }, { mid: string; kind: "camera" }] };
+  await viewer.acceptOffer(restartOffer.sdp, restartOffer.track_map);
+  const restartAnswer = viewerMessages.at(-1) as { sdp: string };
+  await owner.acceptAnswer(restartAnswer.sdp);
+  assert.equal(owner.state, "disconnected");
+  await assert.rejects(() => viewer.acceptOffer("duplicate", restartOffer.track_map), /current state/);
+});
+
+test("owner can make a second restart after the first offer is abandoned", async () => {
+  const connection = new MockConnection();
+  const owner = new WebRtcPeer("owner", "session", () => connection, () => undefined);
+  await owner.createOffer();
+  await owner.acceptAnswer("answer");
+  connection.connectionState = "failed";
+  connection.onconnectionstatechange?.();
+  await owner.createOffer({ iceRestart: true });
+  assert.equal(connection.offerCalls, 2);
+  await assert.rejects(() => owner.createOffer({ iceRestart: true }), /current state/);
+  owner.markRestartOfferFailed();
+  await owner.createOffer({ iceRestart: true });
+  assert.equal(connection.offerCalls, 3);
+});
+
+test("viewer accepts restart only after recovery and rejects it while answering", async () => {
+  const connection = new MockConnection();
+  const viewer = new WebRtcPeer("viewer", "session", () => connection, () => undefined);
+  const trackMap: TrackMap = [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }];
+  await viewer.acceptOffer("offer", trackMap);
+  await assert.rejects(() => viewer.acceptOffer("restart", trackMap), /current state/);
+  connection.connectionState = "failed";
+  connection.onconnectionstatechange?.();
+  await viewer.acceptOffer("restart", trackMap);
+  await assert.rejects(() => viewer.acceptOffer("duplicate", trackMap), /current state/);
 });

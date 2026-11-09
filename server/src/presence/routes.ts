@@ -253,7 +253,7 @@ export async function registerPresenceRoutes(
       const connection = connections.get(socket);
       if (connection) {
         for (const [id, session] of sessions) {
-          if (session.owner.socket === socket || session.viewer.socket === socket) endSession(id, "closed");
+          if (session.owner.socket === socket || session.viewer.socket === socket) endSession(id, "disconnected");
         }
         connections.delete(socket);
       }

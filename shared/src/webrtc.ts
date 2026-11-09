@@ -24,6 +24,7 @@ export interface WebRtcPeerConnection {
   readonly iceConnectionState?: string;
   readonly transceivers: readonly WebRtcTransceiver[];
   addTransceiver(kind: string, init: { direction: "sendonly" | "recvonly" }): WebRtcTransceiver;
+  setConfiguration(configuration: WebRtcConfiguration): void;
   createOffer(options?: { iceRestart?: boolean }): Promise<WebRtcDescription>;
   createAnswer(): Promise<WebRtcDescription>;
   setLocalDescription(description: WebRtcDescription): Promise<void>;
@@ -59,6 +60,10 @@ type NegotiationState =
   | "offer_applied"
   | "answer_created"
   | "answer_applied"
+  | "restart_offer_created"
+  | "restart_offer_applied"
+  | "restart_answer_created"
+  | "restart_answer_applied"
   | "failed";
 
 function validIceCandidate(value: unknown): boolean {
@@ -125,6 +130,19 @@ export class WebRtcPeer {
 
   get state(): PeerState { return this.stateValue; }
 
+  get restartOfferPending(): boolean {
+    return this.negotiationState === "restart_offer_created";
+  }
+
+  setConfiguration(configuration: WebRtcConfiguration): void {
+    if (this.closed) throw new Error("peer is closed");
+    this.connection.setConfiguration(configuration);
+  }
+
+  markRestartOfferFailed(): void {
+    if (this.restartOfferPending) this.negotiationState = "failed";
+  }
+
   setStateListener(listener: ((state: PeerState) => void) | undefined): void {
     this.stateListener = listener;
     listener?.(this.stateValue);
@@ -141,7 +159,10 @@ export class WebRtcPeer {
       this.stateValue = "failed";
       this.negotiationState = "failed";
     }
-    else if (value === "disconnected" || value === "closed") this.stateValue = "disconnected";
+    else if (value === "disconnected" || value === "closed") {
+      this.stateValue = "disconnected";
+      this.negotiationState = "failed";
+    }
     else if (value === "connecting" || value === "checking") this.stateValue = "connecting";
     this.stateListener?.(this.stateValue);
   }
@@ -151,14 +172,18 @@ export class WebRtcPeer {
     const restarting = options?.iceRestart === true;
     if (this.role !== "owner" ||
       (!restarting && this.negotiationState !== "new") ||
-      (restarting && this.negotiationState !== "answer_applied" && this.negotiationState !== "failed")) {
+      (restarting && ![
+        "answer_applied",
+        "restart_answer_applied",
+        "failed",
+      ].includes(this.negotiationState))) {
       throw new Error("peer cannot create an offer in its current state");
     }
     try {
-      if (restarting) this.negotiationState = "new";
+      if (restarting) this.negotiationState = "restart_offer_created";
       const description = await this.connection.createOffer(options);
       await this.connection.setLocalDescription(description);
-      this.negotiationState = "offer_created";
+      if (!restarting) this.negotiationState = "offer_created";
       this.send({ type: "offer", session_id: this.sessionId, sdp: description.sdp ?? "", track_map: trackMapFromTransceivers(this.connection.transceivers) });
     } catch (error) {
       this.negotiationState = "failed";
@@ -168,7 +193,9 @@ export class WebRtcPeer {
 
   async acceptOffer(sdp: string, trackMap: TrackMap): Promise<void> {
     if (this.closed) throw new Error("peer is closed");
-    if (this.role !== "viewer" || this.negotiationState !== "new") {
+    const restarting = this.negotiationState === "failed" ||
+      this.negotiationState === "restart_answer_applied";
+    if (this.role !== "viewer" || (!restarting && this.negotiationState !== "new")) {
       throw new Error("peer cannot accept an offer in its current state");
     }
     if (!validTrackMap(trackMap)) throw new Error("invalid track map");
@@ -180,10 +207,10 @@ export class WebRtcPeer {
       if (negotiatedMap.some((entry, index) => entry.mid !== trackMap[index].mid || entry.kind !== trackMap[index].kind)) {
         throw new Error("track map does not match negotiated transceivers");
       }
-      this.negotiationState = "offer_applied";
+      this.negotiationState = restarting ? "restart_offer_applied" : "offer_applied";
       const description = await this.connection.createAnswer();
       await this.connection.setLocalDescription(description);
-      this.negotiationState = "answer_created";
+      this.negotiationState = restarting ? "restart_answer_created" : "answer_created";
       this.send({ type: "answer", session_id: this.sessionId, sdp: description.sdp ?? "", track_map: negotiatedMap });
     } catch (error) {
       this.negotiationState = "failed";
@@ -193,14 +220,16 @@ export class WebRtcPeer {
 
   async acceptAnswer(sdp: string): Promise<void> {
     if (this.closed) throw new Error("peer is closed");
-    if (this.role !== "owner" || this.negotiationState !== "offer_created") {
+    const restarting = this.negotiationState === "restart_offer_created";
+    if (this.role !== "owner" ||
+      (!restarting && this.negotiationState !== "offer_created")) {
       throw new Error("peer cannot accept an answer in its current state");
     }
     try {
       await this.connection.setRemoteDescription({ type: "answer", sdp });
       this.remoteDescriptionSet = true;
       await this.flushQueuedCandidates();
-      this.negotiationState = "answer_applied";
+      this.negotiationState = restarting ? "restart_answer_applied" : "answer_applied";
     } catch (error) {
       this.negotiationState = "failed";
       throw error;

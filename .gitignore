@@ -6,6 +6,7 @@ out/
 .parcel-cache/
 coverage/
 *.tsbuildinfo
+server/data/
 
 # Environment and local configuration
 .env

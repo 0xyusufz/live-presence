@@ -7,12 +7,11 @@ export type ServerConfig = {
   presenceStaleThresholdSeconds: number;
   sessionTtlSeconds: number;
   webOrigin: string;
-  turnSharedSecret: string;
-  turnUrls: string[];
+  cloudflareTurnKeyId: string;
+  cloudflareTurnApiToken: string;
   stunUrls: string[];
-  turnRealm: string;
   turnCredentialTtlSeconds: number;
-}
+};
 
 const nodeEnvironments = new Set<ServerConfig["nodeEnv"]>([
   "development",
@@ -67,25 +66,51 @@ function nodeEnvironment(
   if (!nodeEnvironments.has(value as ServerConfig["nodeEnv"])) {
     throw new Error("NODE_ENV must be development, test, or production");
   }
-
   return value as ServerConfig["nodeEnv"];
+}
+
+const DEFAULT_STUN_URLS = ["stun:stun.l.google.com:19302"];
+
+function iceUrls(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+  fallback: string[],
+  allowedSchemes: readonly string[],
+): string[] {
+  const values = (environment[name] ?? fallback.join(","))
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (values.length === 0) throw new Error(`${name} must contain at least one URL`);
+  for (const value of values) {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      throw new Error(`${name} contains an invalid URL`);
+    }
+    if (!allowedSchemes.includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error(`${name} contains an invalid URL`);
+    }
+  }
+  return values;
 }
 
 export function loadConfig(
   environment: NodeJS.ProcessEnv = process.env,
 ): ServerConfig {
   const nodeEnv = nodeEnvironment(environment);
-  const turnSharedSecret = requiredString(
+  const stunUrls = iceUrls(environment, "STUN_URLS", DEFAULT_STUN_URLS, ["stun:", "stuns:"]);
+  const cloudflareTurnKeyId = requiredString(
     environment,
-    "TURN_SHARED_SECRET",
-    nodeEnv === "production" ? undefined : "development-turn-secret",
+    "CLOUDFLARE_TURN_KEY_ID",
+    nodeEnv === "production" ? undefined : "development-turn-key-id",
   );
-  const turnUrls = requiredString(environment, "TURN_URLS", "turn:localhost:3478")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-  if (turnUrls.length === 0) throw new Error("TURN_URLS must contain at least one URL");
-  const stunUrls = (environment.STUN_URLS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+  const cloudflareTurnApiToken = requiredString(
+    environment,
+    "CLOUDFLARE_TURN_API_TOKEN",
+    nodeEnv === "production" ? undefined : "development-turn-api-token",
+  );
   return {
     databasePath: requiredString(
       environment,
@@ -115,14 +140,13 @@ export function loadConfig(
       "WEB_ORIGIN",
       "http://localhost:5173",
     ),
-    turnSharedSecret,
-    turnUrls,
+    cloudflareTurnKeyId,
+    cloudflareTurnApiToken,
     stunUrls,
-    turnRealm: requiredString(environment, "TURN_REALM", "localhost"),
     turnCredentialTtlSeconds: positiveInteger(
       environment,
       "TURN_CREDENTIAL_TTL_SECONDS",
-      "600",
+      "86400",
     ),
   };
 }

@@ -27,11 +27,47 @@ export interface SignalingSocket {
   close(): void;
   onopen: (() => void) | null;
   onmessage: ((event: { data: unknown }) => void) | null;
-  onclose: (() => void) | null;
+  onclose: ((event?: { code?: number }) => void) | null;
   onerror: (() => void) | null;
 }
 
 export type SignalingSocketFactory = () => SignalingSocket;
+export type ClientScheduler = {
+  now: () => number;
+  random: () => number;
+  setTimeout: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  clearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
+};
+
+export const INITIAL_NEGOTIATION_TIMEOUT_MS = 30_000;
+
+const defaultScheduler: ClientScheduler = {
+  now: () => Date.now(),
+  random: () => Math.random(),
+  setTimeout: (callback, delayMs) => {
+    const timer = setTimeout(callback, delayMs) as ReturnType<typeof setTimeout> & {
+      unref?: () => void;
+    };
+    timer.unref?.();
+    return timer;
+  },
+  clearTimeout: (timer) => clearTimeout(timer),
+};
+
+export type ReconnectOptions = {
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  stableResetMs?: number;
+  scheduler?: Partial<ClientScheduler>;
+};
+
+function scheduler(options?: ReconnectOptions): ClientScheduler {
+  return {
+    ...defaultScheduler,
+    ...options?.scheduler,
+  };
+}
 
 function socketMessage(event: { data: unknown }): ServerMessage | null {
   if (typeof event.data !== "string") return null;
@@ -51,36 +87,81 @@ export abstract class WebRtcClient {
   protected sessionId: string | undefined;
   private lifecycleValue: ClientLifecycleState = "IDLE";
   protected closing = false;
+  protected terminal = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private stableTimer: ReturnType<typeof setTimeout> | undefined;
+  private reconnectAttempts = 0;
+  private initialNegotiationTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly reconnectOptions: Required<Omit<ReconnectOptions, "scheduler">>;
+  protected readonly clientScheduler: ClientScheduler;
   onRemoteTrack: ((track: WebRtcTrack) => void) | undefined;
   onShareRequest: ((request: Extract<ServerMessage, { type: "share_request" }>) => void) | undefined;
 
-  protected constructor(socketFactory: SignalingSocketFactory, peerFactory: WebRtcFactory) {
+  protected constructor(
+    socketFactory: SignalingSocketFactory,
+    peerFactory: WebRtcFactory,
+    reconnectOptions?: ReconnectOptions,
+  ) {
     this.socketFactory = socketFactory;
     this.peerFactory = peerFactory;
+    this.clientScheduler = scheduler(reconnectOptions);
+    this.reconnectOptions = {
+      maxAttempts: reconnectOptions?.maxAttempts ?? Number.POSITIVE_INFINITY,
+      baseDelayMs: reconnectOptions?.baseDelayMs ?? 1_000,
+      maxDelayMs: reconnectOptions?.maxDelayMs ?? 30_000,
+      stableResetMs: reconnectOptions?.stableResetMs ?? 60_000,
+    };
   }
 
   get lifecycle(): ClientLifecycleState { return this.lifecycleValue; }
 
   protected setLifecycle(value: ClientLifecycleState): void {
+    if (this.terminal && !["FAILED", "CLOSING", "CLOSED"].includes(value)) return;
+    if (this.closing && !["CLOSING", "CLOSED"].includes(value)) return;
     this.lifecycleValue = value;
   }
 
-  protected connect(token: string): void {
+  protected connect(
+    token: string,
+    messageHandler: (message: ServerMessage, socket: SignalingSocket) => void | Promise<void> =
+      (message, socket) => this.handleMessage(message, socket),
+  ): void {
+    if (this.closing || this.terminal || this.socket) return;
     this.setLifecycle("CONNECTING");
     const socket = this.socketFactory();
     this.socket = socket;
-    socket.onopen = () => this.send({ type: "auth", token });
+    socket.onopen = () => {
+      if (this.socket !== socket || this.terminal || this.closing) return;
+      this.send({ type: "auth", token });
+    };
     socket.onmessage = (event) => {
+      if (this.socket !== socket || this.terminal || this.closing) return;
       const message = socketMessage(event);
-      if (message) void this.handleMessage(message).catch(() => this.fail());
+      if (message) {
+        void Promise.resolve(messageHandler(message, socket)).catch(() => {
+          if (this.socket === socket && !this.terminal && !this.closing) this.fail();
+        });
+      }
       else this.fail();
     };
-    socket.onerror = () => this.fail();
-    socket.onclose = () => {
+    socket.onerror = () => {
+      if (this.socket !== socket) return;
+      this.fail();
+      socket.close();
+    };
+    socket.onclose = (event) => {
+      if (this.socket !== socket) return;
+      this.socket = undefined;
       this.closePeer();
+      this.clearStableTimer();
       if (!this.closing) {
-        this.setLifecycle("CLOSED");
-        this.onControlPlaneClosed();
+        if (event?.code === 1008) {
+          this.markTerminal();
+          this.setLifecycle("FAILED");
+        } else if (!this.terminal) {
+          this.setLifecycle("CLOSED");
+          this.onControlPlaneClosed();
+        }
       }
     };
   }
@@ -97,18 +178,37 @@ export abstract class WebRtcClient {
     peer.setRemoteTrackListener((track) => this.onRemoteTrack?.(track));
     this.peer = peer;
     this.sessionId = sessionId;
+    this.initialNegotiationTimer = this.clientScheduler.setTimeout(() => {
+      this.initialNegotiationTimer = undefined;
+      if (this.peer !== peer || this.lifecycleValue !== "NEGOTIATING") return;
+      this.markTerminal();
+      this.onInitialNegotiationTimeout();
+      this.fail();
+      this.socket?.close();
+    }, INITIAL_NEGOTIATION_TIMEOUT_MS);
     return peer;
   }
 
   protected onPeerState(state: PeerState): void {
-    if (state === "connected") this.setLifecycle("CONNECTED");
+    if (this.terminal || this.closing) return;
+    if (state === "connected") {
+      this.clearInitialNegotiationTimer();
+      this.setLifecycle("CONNECTED");
+    }
     else if (state === "failed") this.fail();
     else if (state === "connecting") this.setLifecycle("NEGOTIATING");
   }
 
-  protected async handleMessage(message: ServerMessage): Promise<void> {
+  protected async handleMessage(message: ServerMessage, sourceSocket?: SignalingSocket): Promise<void> {
+    if (this.terminal || this.closing) return;
     if (message.type === "authenticated") {
-      this.onAuthenticated();
+      await this.onAuthenticated(sourceSocket);
+      if (
+        this.terminal ||
+        this.closing ||
+        (sourceSocket && this.socket !== sourceSocket)
+      ) return;
+      this.startStableTimer();
       return;
     }
 
@@ -119,37 +219,106 @@ export abstract class WebRtcClient {
         await this.peer.acceptOffer(message.sdp, message.track_map);
       } else if (message.type === "answer") {
         await this.peer.acceptAnswer(message.sdp);
+        this.onAnswerApplied();
       } else if (message.type === "ice_candidate") {
         await this.peer.addIceCandidate(message.candidate);
       }
     } else if (message.type === "viewer_left" && message.session_id === this.sessionId) {
       this.closePeer();
       this.setLifecycle("CLOSED");
+      this.onSessionEnded(message.reason);
     } else if (message.type === "share_request" && message.session_id === this.sessionId) {
       this.onShareRequest?.(message);
     } else if (message.type === "error") {
+      if (this.onServerError(message.code)) return;
+      this.markTerminal();
       this.fail();
+      this.socket?.close();
     }
   }
 
-  protected onAuthenticated(): void {}
+  protected onAuthenticated(_sourceSocket?: SignalingSocket): void {}
+
+  protected onAnswerApplied(): void {}
 
   protected onControlPlaneClosed(): void {}
 
+  protected onSessionEnded(_reason: string): void {}
+
+  protected onInitialNegotiationTimeout(): void {}
+
+  protected onServerError(_code: string): boolean {
+    return false;
+  }
+
+  protected scheduleReconnect(callback: () => void): void {
+    if (this.closing || this.terminal || this.reconnectTimer || this.reconnectAttempts >= this.reconnectOptions.maxAttempts) return;
+    const exponential = Math.min(
+      this.reconnectOptions.maxDelayMs,
+      this.reconnectOptions.baseDelayMs * 2 ** this.reconnectAttempts,
+    );
+    const jittered = exponential * (0.5 + this.clientScheduler.random());
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = this.clientScheduler.setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (!this.closing && !this.terminal) callback();
+    }, jittered);
+  }
+
+  protected cancelReconnect(): void {
+    if (this.reconnectTimer !== undefined) this.clientScheduler.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+  }
+
+  protected markTerminal(): void {
+    if (this.terminal) return;
+    this.cancelReconnect();
+    this.clearStableTimer();
+    this.terminal = true;
+  }
+
+  private startStableTimer(): void {
+    if (this.terminal || this.closing) return;
+    this.clearStableTimer();
+    this.stableTimer = this.clientScheduler.setTimeout(() => {
+      this.stableTimer = undefined;
+      this.reconnectAttempts = 0;
+    }, this.reconnectOptions.stableResetMs);
+  }
+
+  private clearStableTimer(): void {
+    if (this.stableTimer !== undefined) this.clientScheduler.clearTimeout(this.stableTimer);
+    this.stableTimer = undefined;
+  }
+
+  private clearInitialNegotiationTimer(): void {
+    if (this.initialNegotiationTimer !== undefined) {
+      this.clientScheduler.clearTimeout(this.initialNegotiationTimer);
+    }
+    this.initialNegotiationTimer = undefined;
+  }
+
   protected closePeer(): void {
+    this.clearInitialNegotiationTimer();
     this.peer?.close();
     this.peer = undefined;
     this.sessionId = undefined;
   }
 
   protected fail(): void {
+    if (this.terminal && this.lifecycleValue === "FAILED") {
+      this.closePeer();
+      return;
+    }
     this.setLifecycle("FAILED");
     this.closePeer();
   }
 
   close(): void {
-    if (this.closing) return;
+    if (this.closing && this.lifecycleValue === "CLOSED") return;
     this.closing = true;
+    this.cancelReconnect();
+    this.clearStableTimer();
     this.setLifecycle("CLOSING");
     if (this.sessionId) {
       try { this.send({ type: "leave_session", session_id: this.sessionId }); } catch { /* socket already closed */ }
@@ -171,76 +340,181 @@ export type DesktopClientOptions = {
   peerFactory: WebRtcFactory;
   loadRefreshCredential: () => Promise<string | null>;
   loadIceServers?: (credential: string) => Promise<WebRtcConfiguration>;
-  reconnect?: { maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number };
+  reconnect?: ReconnectOptions;
+  refreshPresence?: () => Promise<void>;
+  onTerminalError?: (error: Error) => void;
 };
 
 export class DesktopWebRtcClient extends WebRtcClient {
   public constructor(options: DesktopClientOptions) {
-    super(options.socketFactory, options.peerFactory);
+    super(options.socketFactory, options.peerFactory, options.reconnect);
     this.loadRefreshCredential = options.loadRefreshCredential;
     this.loadIceServers = options.loadIceServers;
-    this.reconnectOptions = {
-      maxAttempts: options.reconnect?.maxAttempts ?? 3,
-      baseDelayMs: options.reconnect?.baseDelayMs ?? 250,
-      maxDelayMs: options.reconnect?.maxDelayMs ?? 4_000,
-    };
+    this.refreshPresence = options.refreshPresence;
+    this.onTerminalError = options.onTerminalError;
   }
 
   private readonly loadRefreshCredential: () => Promise<string | null>;
   private readonly loadIceServers?: (credential: string) => Promise<WebRtcConfiguration>;
   private iceConfiguration: WebRtcConfiguration | undefined;
-  private reconnectAttempts = 0;
-  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-  private readonly reconnectOptions: Required<NonNullable<DesktopClientOptions["reconnect"]>>;
-
-  async start(): Promise<void> {
-    const credential = await this.loadRefreshCredential();
-    if (!credential) {
-      this.setLifecycle("FAILED");
-      throw new Error("device credential unavailable");
-    }
-    this.connect(credential);
-    this.iceConfiguration = this.loadIceServers ? await this.loadIceServers(credential) : undefined;
-    this.socket!.onmessage = (event) => {
-      const message = socketMessage(event);
-      if (!message) return this.fail();
-      if (message.type === "viewer_joined") {
-        if (this.peer || this.sessionId) return this.fail();
-        this.setLifecycle("NEGOTIATING");
-        const peer = this.createPeer("owner", message.session_id, this.iceConfiguration);
-        void peer.createOffer().catch(() => this.fail());
-      }
-      if (message.type === "authenticated") this.reconnectAttempts = 0;
-      void this.handleMessage(message).catch(() => this.fail());
-    };
-  }
+  private readonly refreshPresence?: () => Promise<void>;
+  private readonly onTerminalError?: (error: Error) => void;
+  private restartResponseTimer: ReturnType<typeof setTimeout> | undefined;
+  private startInFlight: Promise<void> | undefined;
 
   protected override onPeerState(state: PeerState): void {
-    if (state === "failed" && this.peer && this.reconnectAttempts < 1) {
-      this.reconnectAttempts += 1;
-      void this.peer.createOffer({ iceRestart: true }).catch(() => this.fail());
+    if (this.terminal || this.closing) return;
+    if (
+      this.lifecycle === "NEGOTIATING" &&
+      (state === "disconnected" || state === "failed")
+    ) {
+      if (state === "failed") this.markTerminal();
+      super.onPeerState(state);
+      return;
+    }
+    if (state === "connected") {
+      this.iceRestartAttempts = 0;
+      if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
+      this.iceRecoveryTimer = undefined;
+      this.clearRestartResponseTimer();
+      super.onPeerState(state);
+      return;
+    }
+    if (state === "disconnected") {
+      this.scheduleIceRecovery();
+      return;
+    }
+    if (state === "failed") {
+      this.scheduleIceRecovery(true);
       return;
     }
     super.onPeerState(state);
   }
 
   protected override onControlPlaneClosed(): void {
-    if (this.closing || this.reconnectAttempts >= this.reconnectOptions.maxAttempts) return;
-    const delay = Math.min(
-      this.reconnectOptions.maxDelayMs,
-      this.reconnectOptions.baseDelayMs * 2 ** this.reconnectAttempts,
+    this.scheduleReconnect(() => void this.start(true).catch(() => this.onControlPlaneClosed()));
+  }
+
+  protected override onInitialNegotiationTimeout(): void {
+    this.onTerminalError?.(
+      new Error(`initial ICE negotiation timed out after ${INITIAL_NEGOTIATION_TIMEOUT_MS / 1000} seconds`),
     );
-    this.reconnectAttempts += 1;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined;
-      void this.start().catch(() => this.onControlPlaneClosed());
+  }
+
+  protected override async onAuthenticated(): Promise<void> {
+    await this.refreshPresence?.();
+  }
+
+  private iceRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private iceRestartAttempts = 0;
+
+  private scheduleIceRecovery(immediate = false): void {
+    if (!this.peer || this.iceRecoveryTimer !== undefined) return;
+    if (this.peer.restartOfferPending) this.peer.markRestartOfferFailed();
+    this.clearRestartResponseTimer();
+    if (this.iceRestartAttempts >= 2) {
+      this.failIceRecovery();
+      return;
+    }
+    const delay = immediate ? 0 : 8_000;
+    this.iceRecoveryTimer = this.clientScheduler.setTimeout(() => {
+      this.iceRecoveryTimer = undefined;
+      const peer = this.peer;
+      if (!peer || this.terminal || this.closing) return;
+      this.iceRestartAttempts += 1;
+      void this.refreshIceConfiguration(peer).then(() => {
+        if (this.peer !== peer || this.terminal || this.closing) return;
+        return peer.createOffer({ iceRestart: true });
+      }).then(() => {
+        if (this.peer !== peer || this.terminal || this.closing) return;
+        this.restartResponseTimer = this.clientScheduler.setTimeout(() => {
+          this.restartResponseTimer = undefined;
+          if (this.peer !== peer || this.terminal || this.closing) return;
+          peer.markRestartOfferFailed();
+          this.scheduleIceRecovery(true);
+        }, 8_000);
+      }).catch(() => {
+        if (this.peer !== peer || this.terminal || this.closing) return;
+        if (this.iceRestartAttempts >= 2) this.failIceRecovery();
+        else this.scheduleIceRecovery(true);
+      });
     }, delay);
   }
 
+  private async refreshIceConfiguration(peer: WebRtcPeer): Promise<void> {
+    if (!this.loadIceServers) return;
+    const credential = await this.loadRefreshCredential();
+    if (!credential) throw new Error("device credential unavailable");
+    const configuration = await this.loadIceServers(credential);
+    if (this.peer !== peer || this.terminal || this.closing) return;
+    peer.setConfiguration(configuration);
+    this.iceConfiguration = configuration;
+  }
+
+  private clearRestartResponseTimer(): void {
+    if (this.restartResponseTimer !== undefined) this.clientScheduler.clearTimeout(this.restartResponseTimer);
+    this.restartResponseTimer = undefined;
+  }
+
+  protected override onAnswerApplied(): void {
+    this.clearRestartResponseTimer();
+  }
+
+  private failIceRecovery(): void {
+    if (this.terminal || this.closing) return;
+    this.markTerminal();
+    const relayStatus = this.iceConfiguration?.iceTransportPolicy === "relay"
+      ? "relay-only"
+      : "direct-or-relay";
+    this.onTerminalError?.(
+      new Error(`ICE restart failed twice; relay status: ${relayStatus}`),
+    );
+    super.fail();
+  }
+
+  protected override closePeer(): void {
+    if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
+    this.iceRecoveryTimer = undefined;
+    this.clearRestartResponseTimer();
+    this.iceRestartAttempts = 0;
+    super.closePeer();
+  }
+
   override close(): void {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = undefined;
     super.close();
+  }
+
+  async start(reconnecting = false): Promise<void> {
+    if (this.startInFlight) return this.startInFlight;
+    this.startInFlight = this.startInternal(reconnecting);
+    try {
+      await this.startInFlight;
+    } finally {
+      this.startInFlight = undefined;
+    }
+  }
+
+  private async startInternal(reconnecting: boolean): Promise<void> {
+    if (!reconnecting) this.closing = false;
+    if (this.socket) return;
+    const credential = await this.loadRefreshCredential();
+    if (this.closing || this.terminal) return;
+    if (!credential) {
+      this.markTerminal();
+      this.setLifecycle("FAILED");
+      throw new Error("device credential unavailable");
+    }
+    this.iceConfiguration = this.loadIceServers ? await this.loadIceServers(credential) : undefined;
+    if (this.closing || this.terminal) return;
+    this.connect(credential, (message, socket) => {
+      if (message.type === "viewer_joined") {
+        if (this.peer || this.sessionId) return this.fail();
+        this.setLifecycle("NEGOTIATING");
+        const peer = this.createPeer("owner", message.session_id, this.iceConfiguration);
+        void peer.createOffer().catch(() => this.fail());
+      }
+      return this.handleMessage(message, socket);
+    });
   }
 
   decideShareRequest(requestId: string, decision: "allow" | "deny"): void {
@@ -259,70 +533,81 @@ export type ViewerClientOptions = {
   browserSessionToken: string;
   deviceId: string;
   loadIceServers?: () => Promise<WebRtcConfiguration>;
-  reconnect?: { maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number };
+  reconnect?: ReconnectOptions;
+  refreshPresence?: () => Promise<void>;
 };
 
 export class ViewerWebRtcClient extends WebRtcClient {
   private readonly browserSessionToken: string;
   private readonly deviceId: string;
   private readonly loadIceServers?: () => Promise<WebRtcConfiguration>;
+  private readonly refreshPresence?: () => Promise<void>;
   private iceConfiguration: WebRtcConfiguration | undefined;
-  private reconnectAttempts = 0;
-  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-  private readonly reconnectOptions: Required<NonNullable<ViewerClientOptions["reconnect"]>>;
+  private reconnecting = false;
+  private hasEstablishedSession = false;
+  private authorizationRetryCount = 0;
 
   public constructor(options: ViewerClientOptions) {
-    super(options.socketFactory, options.peerFactory);
+    super(options.socketFactory, options.peerFactory, options.reconnect);
     this.browserSessionToken = options.browserSessionToken;
     this.deviceId = options.deviceId;
     this.loadIceServers = options.loadIceServers;
-    this.reconnectOptions = {
-      maxAttempts: options.reconnect?.maxAttempts ?? 3,
-      baseDelayMs: options.reconnect?.baseDelayMs ?? 250,
-      maxDelayMs: options.reconnect?.maxDelayMs ?? 4_000,
-    };
+    this.refreshPresence = options.refreshPresence;
   }
 
-  start(): void {
-    this.connect(this.browserSessionToken);
-    this.socket!.onmessage = (event) => {
-      const message = socketMessage(event);
-      if (!message) return this.fail();
-      if (message.type === "authenticated") {
-        this.send({ type: "create_session", device_id: this.deviceId });
-      } else if (message.type === "session_created") {
+  start(reconnecting = false): void {
+    if (!reconnecting) this.closing = false;
+    if (this.socket) return;
+    this.reconnecting = reconnecting;
+    this.connect(this.browserSessionToken, (message, socket) => {
+      if (message.type === "session_created") {
         if (this.peer || this.sessionId) return this.fail();
+        this.reconnecting = false;
+        this.hasEstablishedSession = true;
+        this.authorizationRetryCount = 0;
         this.setLifecycle("NEGOTIATING");
-        void this.loadIceServers?.().then((configuration) => {
-          this.iceConfiguration = configuration;
-          this.createPeer("viewer", message.session_id, configuration);
-        }).catch(() => this.fail());
-        if (!this.loadIceServers) this.createPeer("viewer", message.session_id, this.iceConfiguration);
+        this.createPeer("viewer", message.session_id, this.iceConfiguration);
       }
-      void this.handleMessage(message).catch(() => this.fail());
-    };
+      return this.handleMessage(message, socket);
+    });
   }
 
-  protected override onAuthenticated(): void {
-    this.reconnectAttempts = 0;
+  protected override async onAuthenticated(sourceSocket?: SignalingSocket): Promise<void> {
+    await this.refreshPresence?.();
+    if (this.terminal || this.closing || (sourceSocket && this.socket !== sourceSocket)) return;
+    this.iceConfiguration = await this.loadIceServers?.();
+    if (this.terminal || this.closing || (sourceSocket && this.socket !== sourceSocket)) return;
+    this.send({ type: "create_session", device_id: this.deviceId });
   }
 
   protected override onControlPlaneClosed(): void {
-    if (this.closing || this.reconnectAttempts >= this.reconnectOptions.maxAttempts) return;
-    const delay = Math.min(
-      this.reconnectOptions.maxDelayMs,
-      this.reconnectOptions.baseDelayMs * 2 ** this.reconnectAttempts,
-    );
-    this.reconnectAttempts += 1;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined;
-      this.start();
-    }, delay);
+    this.scheduleReconnect(() => this.start(true));
+  }
+
+  protected override onServerError(code: string): boolean {
+    if (
+      (this.reconnecting || this.hasEstablishedSession) &&
+      code === "NOT_AUTHORIZED" &&
+      this.authorizationRetryCount < 1
+    ) {
+      this.authorizationRetryCount += 1;
+      this.socket?.close();
+      return true;
+    }
+    return false;
+  }
+
+  protected override onSessionEnded(reason: string): void {
+    if (reason === "authorization_revoked" || reason === "closed") {
+      this.markTerminal();
+      return;
+    }
+    this.scheduleReconnect(() => {
+      if (this.socket?.readyState === 1) this.send({ type: "create_session", device_id: this.deviceId });
+    });
   }
 
   override close(): void {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = undefined;
     super.close();
   }
 

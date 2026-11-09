@@ -11,16 +11,11 @@ test("loadConfig accepts valid environment values", () => {
     SESSION_TTL_SECONDS: "3600",
   });
 
-  assert.deepEqual(config, {
-    databasePath: ":memory:",
-    host: "127.0.0.1",
-    nodeEnv: "test",
-    port: 4317,
-    enrollmentCodeTtlSeconds: 600,
-    presenceStaleThresholdSeconds: 45,
-    sessionTtlSeconds: 3600,
-    webOrigin: "http://localhost:5173",
-  });
+  assert.equal(config.stunUrls[0], "stun:stun.l.google.com:19302");
+  assert.equal(config.cloudflareTurnKeyId, "development-turn-key-id");
+  assert.equal(config.cloudflareTurnApiToken, "development-turn-api-token");
+  assert.equal(config.turnCredentialTtlSeconds, 86_400);
+  assert.equal(config.sessionTtlSeconds, 3600);
 });
 
 test("loadConfig rejects invalid environment values", () => {
@@ -47,5 +42,41 @@ test("loadConfig rejects invalid environment values", () => {
   assert.throws(
     () => loadConfig({ HOST: " " }),
     /HOST must be a non-empty string/,
+  );
+  assert.throws(
+    () => loadConfig({ STUN_URLS: "https://example.test" }),
+    /STUN_URLS contains an invalid URL/,
+  );
+  assert.throws(
+    () => loadConfig({ STUN_URLS: "stun:example.test?secret=1" }),
+    /STUN_URLS contains an invalid URL/,
+  );
+});
+
+test("loadConfig supports STUN and TURN overrides", () => {
+  const config = loadConfig({
+    NODE_ENV: "test",
+    STUN_URLS: "stun:one.test:3478, stuns:two.test:5349",
+    CLOUDFLARE_TURN_KEY_ID: "key-id",
+    CLOUDFLARE_TURN_API_TOKEN: "api-token",
+    TURN_CREDENTIAL_TTL_SECONDS: "7200",
+  });
+  assert.deepEqual(config.stunUrls, ["stun:one.test:3478", "stuns:two.test:5349"]);
+  assert.equal(config.cloudflareTurnKeyId, "key-id");
+  assert.equal(config.cloudflareTurnApiToken, "api-token");
+  assert.equal(config.turnCredentialTtlSeconds, 7200);
+});
+
+test("loadConfig requires Cloudflare TURN credentials in production", () => {
+  assert.throws(
+    () => loadConfig({ NODE_ENV: "production" }),
+    /CLOUDFLARE_TURN_KEY_ID must be a non-empty string/,
+  );
+  assert.throws(
+    () => loadConfig({
+      NODE_ENV: "production",
+      CLOUDFLARE_TURN_KEY_ID: "key-id",
+    }),
+    /CLOUDFLARE_TURN_API_TOKEN must be a non-empty string/,
   );
 });

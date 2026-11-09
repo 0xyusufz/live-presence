@@ -13,8 +13,10 @@ pre-description queue in `WebRtcPeer`.
 
 Both clients expose `IDLE`, `CONNECTING`, `NEGOTIATING`, `CONNECTED`, `CLOSING`,
 `CLOSED`, and `FAILED` lifecycle states. Socket closure, leave, authorization
-revocation, device revocation, and peer failure close the local peer. No client
-automatically re-authorizes or starts a new session.
+revocation, device revocation, and peer failure close the local peer. A
+transient control-plane disconnect re-authenticates and lets the viewer create
+a new server-authorized session; explicit leave and authorization revocation
+cancel recovery.
 
 This client integration intentionally does not implement screen capture,
 camera capture, permissions, consent UI, indicator UI, chat, usage tracking,
@@ -24,15 +26,72 @@ remain track-free until a later explicit sender-consent phase.
 
 ## TURN and recovery
 
-Fastify issues ten-minute coturn credentials at `GET /webrtc/ice-servers` for
-an authenticated browser session or device credential. The response contains
-only ICE-server URLs and ephemeral HMAC credentials; the coturn shared secret
-is server-only and is never persisted or logged. Direct ICE remains preferred,
-while callers may inject `iceTransportPolicy: "relay"` for forced-relay
-validation. `infra/docker-compose.yml` exposes coturn's UDP/TCP 3478, TLS
-5349, and bounded 49160-49200 relay range.
+Fastify calls Cloudflare Realtime TURN's
+`generate-ice-servers` endpoint at `GET /webrtc/ice-servers` for an
+authenticated browser session or device credential. The server-side
+`CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_API_TOKEN` are never sent to
+clients, persisted, or logged. Cloudflare returns temporary STUN/TURN
+credentials, which are validated before they are returned with `cache-control:
+no-store` and `referrer-policy: no-referrer`.
 
-An owner peer may perform one bounded ICE restart after terminal ICE failure
-using the existing owner-offer signaling path. Restarting ICE does not grant
-consent or start capture. Server restart or revocation still invalidates
-in-memory sessions and requires fresh authenticated control-plane state.
+The default credential TTL is 24 hours and is configurable with
+`TURN_CREDENTIAL_TTL_SECONDS`; choose a value covering the expected session
+duration. Normal peer connections use `iceTransportPolicy: "all"` so host,
+server-reflexive, and Cloudflare relay candidates can be gathered and ICE can
+select the best viable pair. A selected direct pair keeps media peer-to-peer;
+the presence of relay candidates during gathering does not mean that media
+used Cloudflare. The integration harness inspects the selected candidate pair
+through WebRTC statistics.
+
+When an established connection enters bounded ICE recovery, the owner obtains
+fresh authenticated temporary ICE-server credentials, applies the new
+configuration with `setConfiguration()`, and then performs the existing
+owner-driven ICE restart. This avoids assuming that `restartIce()` changes ICE
+servers and avoids repeated credential requests during healthy connections.
+Callers may inject `iceTransportPolicy: "relay"` only for forced-relay
+validation. The default STUN server is `stun:stun.l.google.com:19302`;
+deployments may override it with comma-separated `STUN_URLS` values.
+
+The existing `infra/docker-compose.yml` coturn service remains a separate
+self-hosted deployment option and is not used by the Cloudflare provider.
+
+Control-plane reconnect uses fresh authentication, presence refresh, and
+jittered exponential backoff from 1 second to a 30-second cap. The retry
+counter resets only after 60 seconds of stable authentication. A viewer
+recreates a session only after server-side authorization succeeds; stale
+session and request references are not persisted.
+
+After ICE becomes disconnected, the owner waits approximately 8 seconds for
+normal recovery. A failed connection may then use at most two owner-offerer
+ICE restart offers. The viewer accepts restart offers only after the peer has
+entered a failed/disconnected recovery state, and returns a fresh answer.
+Restarting ICE does not grant consent or start capture. Server restart or
+revocation invalidates in-memory sessions and requires fresh authenticated
+control-plane state.
+
+Initial ICE negotiation is bounded by a 30-second client-side timeout. If the
+browser remains in a pending negotiating state without reaching a connected
+state, the client reports terminal failure, closes the peer and signaling
+resources, and ignores late peer or signaling callbacks. This timeout is
+separate from the approximately 8-second disconnected recovery grace period
+and does not add an initial retry.
+
+The all-policy fallback scenario starts both peers with
+`iceTransportPolicy: "all"` and uses a deterministic harness-only restriction
+that drops host and server-reflexive candidates before they are sent through
+signaling. Cloudflare relay candidates remain enabled. The test verifies that
+the real selected pair is relay/relay, DTLS is connected, synthetic media is
+rendered, both peers use one shared authorized session, and cleanup closes the
+recovered connection. This is controlled candidate unavailability, not a
+post-connection network outage; production credential-refresh and
+`setConfiguration()` before ICE restart remain covered by deterministic shared
+client tests, and live network failover validation is still pending.
+
+## Live relay validation
+
+Compose syntax validation is not a relay test. A deployment must run a
+two-peer browser/Electron integration with `iceTransportPolicy: "relay"` and
+the authenticated `/webrtc/ice-servers` response, then verify a gathered
+`relay` candidate and a selected relay candidate pair. No reachable coturn
+endpoint and deployment secret are available in this repository test
+environment, so live relay connectivity remains a release blocker.
