@@ -29,6 +29,7 @@ export async function buildApp(
   stunUrls = [] as string[],
   turnCredentialTtlSeconds = 86_400,
   turnFetch?: typeof fetch,
+  networkRecoveryGraceMs = 180_000,
 ): Promise<{
   app: FastifyInstance;
   authorization: ViewerAuthorizationService;
@@ -83,6 +84,7 @@ export async function buildApp(
       cloudflareTurnApiToken,
       stunUrls,
       turnCredentialTtlSeconds,
+      networkRecoveryGraceMs,
     },
   );
   await registerDeviceRoutes(
@@ -102,6 +104,7 @@ export async function buildApp(
       cloudflareTurnApiToken,
       stunUrls,
       turnCredentialTtlSeconds,
+      networkRecoveryGraceMs,
     },
   );
   await registerPresenceRoutes(
@@ -111,6 +114,7 @@ export async function buildApp(
     presenceService,
     authorization,
     webOrigin,
+    networkRecoveryGraceMs,
   );
   await registerTurnRoutes(app, auth, deviceService, turn);
 

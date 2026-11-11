@@ -15,6 +15,7 @@ test("loadConfig accepts valid environment values", () => {
   assert.equal(config.cloudflareTurnKeyId, "development-turn-key-id");
   assert.equal(config.cloudflareTurnApiToken, "development-turn-api-token");
   assert.equal(config.turnCredentialTtlSeconds, 86_400);
+  assert.equal(config.networkRecoveryGraceMs, 180_000);
   assert.equal(config.sessionTtlSeconds, 3600);
 });
 
@@ -38,6 +39,10 @@ test("loadConfig rejects invalid environment values", () => {
   assert.throws(
     () => loadConfig({ PRESENCE_STALE_THRESHOLD_SECONDS: "0" }),
     /PRESENCE_STALE_THRESHOLD_SECONDS must be a positive integer/,
+  );
+  assert.throws(
+    () => loadConfig({ NETWORK_RECOVERY_GRACE_MS: "0" }),
+    /NETWORK_RECOVERY_GRACE_MS must be a positive integer/,
   );
   assert.throws(
     () => loadConfig({ HOST: " " }),

@@ -15,11 +15,14 @@
     }
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "check:config": "tsc --noEmit --project tsconfig.json",
-    "check": "npm run check:config && npm --workspace server run check",
+    "check": "npm run check:config && npm --workspace server run check && npm --workspace apps/desktop run check && npm --workspace apps/viewer run check",
+    "test": "npm run test:shared && npm run test:server",
+    "test:shared": "tsx --test shared/src/client.test.ts shared/src/webrtc.test.ts apps/viewer/src/remote-camera.test.ts apps/viewer/src/device-preference.test.ts apps/viewer/src/viewer-startup.test.ts apps/viewer/src/viewer-status.test.ts apps/viewer/src/viewer-media.test.ts",
+    "test:server": "npm --workspace server test",
     "test:webrtc:integration": "tsx integration/webrtc.integration.test.ts",
     "test:webrtc:integration:direct": "tsx integration/webrtc.integration.test.ts --mode=direct",
     "test:webrtc:integration:relay": "tsx integration/webrtc.integration.test.ts --mode=relay",
@@ -30,6 +33,7 @@
   "license": "MIT",
   "devDependencies": {
     "esbuild": "^0.28.2",
-    "playwright": "^1.65.0"
+    "playwright": "^1.65.0",
+    "typescript": "7.0.2"
   }
 }

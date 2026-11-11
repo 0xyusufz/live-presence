@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   WebRtcPeer,
   type WebRtcConfiguration,
+  type WebRtcDiagnostic,
   type WebRtcPeerConnection,
   type WebRtcTransceiver,
 } from "./webrtc.js";
@@ -12,7 +13,9 @@ class MockConnection implements WebRtcPeerConnection {
   transceivers: WebRtcTransceiver[] = [];
   connectionState = "new";
   iceConnectionState = "new";
+  signalingState = "stable";
   onicecandidate: ((event: { candidate: unknown | null }) => void) | null = null;
+  ontrack: WebRtcPeerConnection["ontrack"] = null;
   onconnectionstatechange: (() => void) | null = null;
   oniceconnectionstatechange: (() => void) | null = null;
   closed = false;
@@ -21,12 +24,18 @@ class MockConnection implements WebRtcPeerConnection {
   candidates: unknown[] = [];
   replaceCalls: Array<{ index: number; track: unknown }> = [];
   offerCalls = 0;
+  answerCalls = 0;
   failOfferCount = 0;
   failAddIce = false;
+  remoteDescriptionError: Error | undefined;
+  answerError: Error | undefined;
+  localDescriptionError: Error | undefined;
+  hasAppliedRemoteOffer = false;
   addTransceiver(_kind: string, init: { direction: "sendonly" | "recvonly" }): WebRtcTransceiver {
     const index = this.transceivers.length;
     const tx: WebRtcTransceiver = {
       mid: String(index),
+      currentDirection: null,
       direction: init.direction,
       sender: { replaceTrack: async (track) => { this.replaceCalls.push({ index, track }); } },
     };
@@ -39,11 +48,49 @@ class MockConnection implements WebRtcPeerConnection {
       this.failOfferCount -= 1;
       throw new Error("offer failed");
     }
-    return { type: "offer" as const, sdp: "offer" };
+    return { type: "offer" as const, sdp: `offer-${this.offerCalls}` };
   }
-  async createAnswer() { return { type: "answer" as const, sdp: "answer" }; }
-  async setLocalDescription(value: unknown) { this.local = value; }
-  async setRemoteDescription(value: unknown) { this.remote = value; }
+  async createAnswer() {
+    this.answerCalls += 1;
+    if (this.answerError) throw this.answerError;
+    return { type: "answer" as const, sdp: "answer" };
+  }
+  async setLocalDescription(value: unknown) {
+    if (this.localDescriptionError) throw this.localDescriptionError;
+    this.local = value;
+    if (
+      typeof value === "object" && value !== null &&
+      "type" in value && value.type === "answer"
+    ) this.signalingState = "stable";
+    for (const transceiver of this.transceivers) {
+      transceiver.currentDirection = transceiver.direction;
+    }
+  }
+  async setRemoteDescription(value: unknown) {
+    if (this.remoteDescriptionError) throw this.remoteDescriptionError;
+    this.remote = value;
+    if (
+      typeof value === "object" && value !== null &&
+      "type" in value && value.type === "offer" &&
+      "sdp" in value && typeof value.sdp === "string"
+    ) {
+      this.signalingState = "have-remote-offer";
+      if (!this.hasAppliedRemoteOffer) {
+        const offeredMids = [...value.sdp.matchAll(/^a=mid:([^\r\n]+)$/gm)].map((match) => match[1]!);
+        const mids = offeredMids.length === 2 ? offeredMids : ["0", "1"];
+        for (const mid of mids) {
+          this.transceivers.push({
+            mid,
+            currentDirection: null,
+            direction: "recvonly",
+            sender: { replaceTrack: async () => {} },
+          });
+        }
+        this.hasAppliedRemoteOffer = true;
+      }
+    }
+    this.ontrack?.({ track: { kind: "video" }, transceiver: { mid: "1" } });
+  }
   async addIceCandidate(value: unknown) {
     if (this.failAddIce) throw new Error("candidate failed");
     this.candidates.push(value);
@@ -75,20 +122,165 @@ test("owner creates fixed sendonly transceivers and exchanges offer/answer and I
   await assert.rejects(() => peer.addIceCandidate({ candidate: "after-close" }), /closed/);
 });
 
-test("viewer answers with the negotiated canonical map and lifecycle revocation closes cleanly", async () => {
+test("viewer relies on remote offer sections to create and negotiate recvonly transceivers", async () => {
   const connection = new MockConnection();
   const messages: unknown[] = [];
   const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => messages.push(message));
+  assert.equal(connection.transceivers.length, 0);
+  assert.equal(connection.signalingState, "stable");
+  await peer.acceptOffer("offer", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }]);
+  assert.equal(connection.signalingState, "stable");
   assert.equal(connection.transceivers.length, 2);
   assert.deepEqual(connection.transceivers.map((tx) => tx.direction), ["recvonly", "recvonly"]);
+  assert.deepEqual(connection.transceivers.map((tx) => tx.currentDirection), ["recvonly", "recvonly"]);
   assert.deepEqual(connection.transceivers.map((tx) => tx.mid), ["0", "1"]);
-  await peer.acceptOffer("offer", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }]);
   assert.equal((messages[0] as { type: string }).type, "answer");
   connection.connectionState = "failed";
   connection.onconnectionstatechange?.();
   assert.equal(peer.state, "failed");
   peer.close();
   await assert.rejects(() => peer.addIceCandidate({}), /closed/);
+});
+
+test("viewer processes a two-media-section desktop offer and preserves canonical screen/camera MIDs", async () => {
+  const connection = new MockConnection();
+  const messages: unknown[] = [];
+  const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => messages.push(message));
+  const sdp = [
+    "v=0",
+    "o=- 123 1 IN IP4 127.0.0.1",
+    "s=-",
+    "t=0 0",
+    "a=group:BUNDLE 0 1",
+    "m=video 9 UDP/TLS/RTP/SAVPF 96",
+    "c=IN IP4 0.0.0.0",
+    "a=mid:0",
+    "a=sendonly",
+    "a=rtpmap:96 VP8/90000",
+    "m=video 9 UDP/TLS/RTP/SAVPF 96",
+    "c=IN IP4 0.0.0.0",
+    "a=mid:1",
+    "a=sendonly",
+    "a=rtpmap:96 VP8/90000",
+    "",
+  ].join("\r\n");
+  await peer.acceptOffer(sdp, [
+    { mid: "0", kind: "screen" },
+    { mid: "1", kind: "camera" },
+  ]);
+
+  assert.equal(connection.transceivers.length, 2);
+  assert.deepEqual(connection.transceivers.map((tx) => tx.mid), ["0", "1"]);
+  assert.deepEqual(connection.transceivers.map((tx) => tx.direction), ["recvonly", "recvonly"]);
+  assert.deepEqual(connection.transceivers.map((tx) => tx.currentDirection), ["recvonly", "recvonly"]);
+  assert.deepEqual(messages, [{
+    type: "answer",
+    session_id: "session",
+    sdp: "answer",
+    track_map: [
+      { mid: "0", kind: "screen" },
+      { mid: "1", kind: "camera" },
+    ],
+  }]);
+  peer.close();
+});
+
+test("viewer sends exactly one answer for a valid offer, including concurrent duplicate delivery", async () => {
+  const connection = new MockConnection();
+  const messages: unknown[] = [];
+  const diagnostics: WebRtcDiagnostic[] = [];
+  const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => messages.push(message));
+  peer.setDiagnosticListener((diagnostic) => diagnostics.push(diagnostic));
+  const trackMap: TrackMap = [
+    { mid: "0", kind: "screen" },
+    { mid: "1", kind: "camera" },
+  ];
+
+  const first = peer.acceptOffer("valid-offer", trackMap);
+  const duplicate = peer.acceptOffer("valid-offer", trackMap);
+  await Promise.all([first, duplicate]);
+  await peer.acceptOffer("valid-offer", trackMap);
+
+  const answers = messages.filter((message) => (message as { type: string }).type === "answer");
+  assert.equal(answers.length, 1);
+  assert.deepEqual(answers[0], {
+    type: "answer",
+    session_id: "session",
+    sdp: "answer",
+    track_map: trackMap,
+  });
+  assert.equal(connection.answerCalls, 1);
+  assert.deepEqual(
+    diagnostics.filter((item) => item.operationStatus === "failed"),
+    [],
+  );
+  assert.ok(diagnostics.some((item) => item.operation === "sendAnswer" && item.operationStatus === "succeeded"));
+  peer.close();
+});
+
+test("viewer answer pipeline reports the exact failed SDP or signaling operation", async (t) => {
+  const cases = [
+    {
+      operation: "setRemoteDescription" as const,
+      message: /setRemoteDescription\(offer\) failed: rejected remote offer/,
+      configure: (connection: MockConnection) => { connection.remoteDescriptionError = new Error("rejected remote offer"); },
+    },
+    {
+      operation: "createAnswer" as const,
+      message: /createAnswer\(\) failed: answer creation rejected/,
+      configure: (connection: MockConnection) => { connection.answerError = new Error("answer creation rejected"); },
+    },
+    {
+      operation: "setLocalDescription" as const,
+      message: /setLocalDescription\(answer\) failed: local answer rejected/,
+      configure: (connection: MockConnection) => { connection.localDescriptionError = new Error("local answer rejected"); },
+    },
+    {
+      operation: "sendAnswer" as const,
+      message: /Sending WebRTC answer through signaling failed: socket send rejected/,
+      configure: (_connection: MockConnection) => {},
+      failSend: true,
+    },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.operation, async () => {
+      const connection = new MockConnection();
+      item.configure(connection);
+      const diagnostics: WebRtcDiagnostic[] = [];
+      const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => {
+        if (item.failSend && (message as { type: string }).type === "answer") {
+          throw new Error("socket send rejected");
+        }
+      });
+      peer.setDiagnosticListener((diagnostic) => diagnostics.push(diagnostic));
+      await assert.rejects(
+        () => peer.acceptOffer("valid-offer", [
+          { mid: "0", kind: "screen" },
+          { mid: "1", kind: "camera" },
+        ]),
+        item.message,
+      );
+      assert.ok(diagnostics.some((diagnostic) =>
+        diagnostic.operation === item.operation && diagnostic.operationStatus === "failed"));
+      peer.close();
+    });
+  }
+});
+
+test("viewer maps early remote tracks by negotiated mid after validating the offer map", async () => {
+  const connection = new MockConnection();
+  const peer = new WebRtcPeer("viewer", "session", () => connection, () => undefined);
+  const received: Array<{ mid: string | null; kind?: string }> = [];
+  peer.setRemoteTrackListener((_track, mid, kind) => received.push({ mid, kind }));
+
+  await peer.acceptOffer("offer", [
+    { mid: "0", kind: "screen" },
+    { mid: "1", kind: "camera" },
+  ]);
+
+  assert.deepEqual(received, [{ mid: "1", kind: "camera" }]);
+  peer.close();
 });
 
 test("offer and answer state transitions reject wrong, duplicate, and out-of-order operations", async () => {

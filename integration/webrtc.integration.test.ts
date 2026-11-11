@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadEnvFile } from "node:process";
 import { test } from "node:test";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { build } from "esbuild";
@@ -41,8 +40,6 @@ declare global {
 }
 
 const mode = process.argv.find((argument) => argument.startsWith("--mode="))?.split("=")[1] ?? "all";
-const rootEnv = join(process.cwd(), ".env");
-if (existsSync(rootEnv)) loadEnvFile(rootEnv);
 
 const cloudflareConfigured = Boolean(
   process.env.CLOUDFLARE_TURN_KEY_ID && process.env.CLOUDFLARE_TURN_API_TOKEN,
@@ -348,6 +345,7 @@ test("Phase 4 direct-preferred Chromium WebRTC negotiation", { skip: (mode !== "
   const viewer = await waitForRenderedMedia(harness.viewerPage);
   assert.equal(owner.lifecycle, "CONNECTED");
   assert.equal(viewer.lifecycle, "CONNECTED");
+  assert.deepEqual(viewer.transceivers, ["0:recvonly:recvonly", "1:recvonly:recvonly"]);
   assert.ok(viewer.receivedTracks > 0, "viewer did not receive a remote media track");
   assert.ok(viewer.renderedFrames > 0, "viewer did not render a remote media frame");
   assert.ok(viewer.stats?.dtlsState === "connected", "DTLS transport did not connect");

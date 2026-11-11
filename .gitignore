@@ -2,6 +2,7 @@ node_modules/
 dist/
 build/
 out/
+.vite/
 .cache/
 .parcel-cache/
 coverage/
@@ -39,3 +40,6 @@ Thumbs.db
 # Docker overrides and local volumes
 docker-compose.override.yml
 *.volume/
+
+# Jetro local data
+.jetro/

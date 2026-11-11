@@ -55,35 +55,29 @@ Chat and viewer requests ride the **control plane, not WebRTC**. They're a few h
 ```mermaid
 graph TB
     subgraph Main["Electron main process"]
-        SM["Share state machine<br/>only thing that can arm capture"]
-        WS["WS client: auth, presence,<br/>signaling, requests, chat"]
-        IND["Indicator window<br/>lifetime bound to SM"]
-        DMH["setDisplayMediaRequestHandler"]
-        REQ["Request inbox<br/>renders prompt only"]
-        USE["Daily usage tracker<br/>idle / lock / suspend"]
-        NOTE["Notifications:<br/>chat, request, 60-min notice"]
+        AUTH["Credential store + authenticated<br/>WebSocket transport"]
+        IPC["Validated IPC + capture watchdog"]
+        IND["Persistent sharing indicator"]
+        DMH["setDisplayMediaRequestHandler<br/>explicit source picker"]
     end
     subgraph Rend["Renderer (Chromium, secure app:// scheme)"]
-        UI["Start/Stop UI + Allow/Deny prompt"]
-        CHAT["Chat side panel"]
-        CAP["getDisplayMedia + getUserMedia"]
+        UI["Local Share Screen / Stop UI"]
+        CAP["getDisplayMedia + optional getUserMedia"]
+        CLIENT["Shared WebRtcClient"]
         PC["RTCPeerConnection, 2 transceivers"]
     end
-    UI -->|"IPC: user click"| SM
-    SM -->|"allow"| CAP --> PC
-    SM --> IND
-    DMH --> CAP
-    WS -.-> PC
-    WS --> REQ --> UI
-    WS --> NOTE
-    WS <--> CHAT
-    USE --> WS
+    UI -->|"local user click"| CAP
+    DMH -->|"enumerate + explicit selection"| CAP
+    CAP --> CLIENT --> PC
+    CLIENT <-->|"validated signaling IPC"| AUTH
+    IPC --> IND
+    CAP -->|"confirmed live track"| IPC
     PC ==> OUT(("Viewer"))
 ```
 
-**WHY a state machine in main, not the renderer:** it's the single thing that can authorize capture, and its indicator window shares the same object lifetime as the capture handles — so "capture running, indicator hidden" isn't a bug to prevent, it's a state that doesn't exist in the code. This is the load-bearing design decision for consent.
+**Phase 5 process ownership:** the renderer owns the `MediaStreamTrack`s and shared `WebRtcClient`; Electron main owns device credentials, the authenticated WebSocket transport, validated IPC, the indicator, and the bounded watchdog. Main does not create capture tracks or make reconnect/ICE-recovery decisions. `getDisplayMedia()` is called immediately in the local Share Screen click handler and its Electron request handler always presents an application-owned source picker; there is no automatic source selection.
 
-Note the shape of the request path in the diagram: an incoming viewer request reaches the **request inbox**, which can only render a prompt in the UI. There is no edge from `WS` or `REQ` into `SM`. The only arrow into the share state machine comes from a user click. See §5.
+In Phase 5, network signaling has no path to a capture call. `capture:screen-pending` is only a watchdog marker; it cannot start capture. The main process shows the indicator only after a live screen track is reported, and stops supervision on capture, IPC, or renderer failure. Future viewer-request UI (§7) must remain prompt-only and must never reach a capture API.
 
 **Separate screen + camera tracks, not composited.** Independent bitrate/fps tuning, viewer can hide/resize camera, and stopping the camera is `replaceTrack(null)` with **no renegotiation** — the single biggest complexity-reduction in the whole design, since full renegotiation is where WebRTC implementations most often break. Both transceivers are reserved at connection setup (§5) so that *turning a track on* mid-session is equally cheap.
 
@@ -105,7 +99,7 @@ new BrowserWindow({
 
 - **Restrictive CSP** on the `app://` origin: no `unsafe-eval`, no remote script origins, `connect-src` limited to your own API/WSS origin and the STUN/TURN endpoints.
 - **Restricted navigation:** deny `will-navigate` and `setWindowOpenHandler` for anything outside `app://`; external links go to the system browser.
-- **IPC sender validation:** every `ipcMain.handle` checks `event.senderFrame` is the app's own top-level frame before acting. The `arm capture` channel in particular is validated here, because it is the channel the entire consent model rests on.
+- **IPC sender validation:** every capture/control IPC handler checks `event.senderFrame` is the app's own top-level frame before acting. Capture itself remains gated by Chromium's user-activated `getDisplayMedia()` call and the explicit source picker; IPC cannot select a source.
 - **Controlled custom origin:** the renderer is served from a registered privileged `app://` scheme. This is the security recommendation for this app specifically — it gives the renderer a stable, controlled origin to write CSP and navigation rules against, and to register before `app.whenReady()` (see below).
 
 ### Windows vs macOS
@@ -222,35 +216,29 @@ A restart drops everyone; clients reconnect with backoff (§10). This isn't a sh
 
 ### THE CONSENT INVARIANT
 
-A server→device **request** message exists in the protocol. It can do exactly one thing: deliver a request to the sender's UI so a human can look at it. It cannot arm, start, resume or extend capture, and no code path connects it to the share state machine.
+A server→device **request** message exists in the broader protocol for a later phase. It can do exactly one thing: deliver a request to the sender's UI so a human can look at it. It cannot arm, start, resume or extend capture, and Phase 5 does not connect it to capture.
 
 ```
-Viewer clicks [ Request Screen ]
+Sender locally clicks [ Share Screen ]
         ↓
-Server checks viewer_permissions, pending-state, cooldown
+Renderer calls getDisplayMedia() immediately in the click handler
         ↓
-Sender's device receives the request  ──►  renders a prompt. Nothing else happens.
+Electron enumerates screen/window sources and shows the explicit picker
         ↓
-Sender sees  [ Allow ]  [ Deny ]
+Sender explicitly selects a screen/window (or cancels)
         ↓
-Sender clicks Allow
-        ↓
-Trusted Electron IPC, validated sender frame, originating in a user gesture
-        ↓
-Main-process share state machine
-        ↓
-Capture starts, indicator window comes up with it
+Live screen track exists; main shows the persistent indicator
 ```
 
-**Without a sender Allow: no screen capture, no camera capture.** Not "capture that stops quickly", not "capture with a warning" — the `getDisplayMedia`/`getUserMedia` call is never reached.
+**Without a local Share Screen click and explicit source selection: no screen capture.** A network message cannot start capture. Camera is optional, independently requested by a local action, and only available during active screen sharing. Phase 5 has no viewer request, Allow/Deny, or request-driven capture UI.
 
-The guarantee is therefore **not** "no such message exists" (it does now). It is:
+The guarantee is therefore **not** "no such message exists" (the wider protocol has request messages). It is:
 
-> Every path that can arm capture terminates at the main-process share state machine, and the state machine accepts arm input from exactly one source: a validated IPC call from the app's own top-level frame, triggered by a user click. Network input has no route into it.
+> The capture call is reachable only from the renderer's explicit local Share Screen click, and `getDisplayMedia()` requires transient user activation. The main process accepts only validated state/supervision IPC and never selects a source or starts capture. Network input has no route to a capture call.
 
-That is a narrower guarantee than the protocol-absence argument it replaces, and it is worth being honest about the difference: it is enforced by one reviewable boundary in `/apps/desktop/main` rather than by the protocol's shape. Keep that boundary small, keep it free of convenience shortcuts, and never add an "auto-allow trusted viewer" option — that option is the entire product's threat model, inverted.
+The source selection remains an explicit app-owned picker, including when Electron resolves the display-media request asynchronously. Keep that path small; never add automatic source selection or a network-triggered capture shortcut.
 
-**Sender always creates the offer.** No `RTCPeerConnection` exists until a human has clicked, so the server cannot cause one to come into being.
+**Sender always creates the offer.** The owner peer is created only after local capture is live and an authorized viewer session joins. Existing live tracks are attached before its offer; Phase 4 owns reconnection and ICE recovery.
 
 ### Session flow
 
@@ -260,12 +248,14 @@ sequenceDiagram
     participant S as Server
     participant V as Viewer
 
-    Note over D: user clicks Start (or Allow on a request)
-    D->>D: getDisplayMedia / getUserMedia, arm indicator
-    D->>S: sharing_started {screen, camera}
+    Note over D: user clicks Share Screen locally
+    D->>D: getDisplayMedia immediately; user selects a source
+    D->>D: confirm live screen track; show main-owned indicator
+    D->>S: sharing_state {screen:true, camera:false}
     V->>S: create_session {device_id}
-    S->>S: check auth + 1-viewer cap
+    S->>S: check auth + viewer authorization + active screen + 1-viewer cap
     S->>D: viewer_joined {viewer_name}
+    D->>D: attach current screen/camera tracks before offer
     D->>D: new RTCPeerConnection, 2 sendonly transceivers
     D->>S: offer {sdp}
     S->>V: offer
@@ -295,7 +285,7 @@ const screenTx = pc.addTransceiver(screenTrack ?? "video", { direction: "sendonl
 const cameraTx = pc.addTransceiver(cameraTrack ?? "video", { direction: "sendonly" });
 ```
 
-**WHY:** a viewer can now request the camera *after* screen sharing is already live (§7 partial states). If the camera transceiver didn't exist yet, honoring that request would mean adding a track to an established connection and running a full renegotiation — exactly the operation §3 avoids. With the slot reserved, turning the camera on is `cameraTx.sender.replaceTrack(cameraTrack)` and turning it off is `replaceTrack(null)`, symmetric and renegotiation-free. The cost is one inactive m-line in the SDP.
+**WHY:** the sender can enable the optional camera after screen sharing is already live without adding a transceiver or renegotiating. With the slot reserved, turning the camera on is `cameraTx.sender.replaceTrack(cameraTrack)` and turning it off is `replaceTrack(null)`. The camera remains independent from the screen track.
 
 **Track identity: the viewer must be able to tell which received track is which.** With two same-kind (`video`) transceivers, the viewer cannot assume ordering in `ontrack` events is stable across browsers or renegotiations, so identity has to be pinned deliberately rather than inferred:
 
@@ -303,7 +293,7 @@ const cameraTx = pc.addTransceiver(cameraTrack ?? "video", { direction: "sendonl
 - Each transceiver's **`mid`** (the SDP media identification tag, stable for the connection's lifetime once negotiated) is treated as the canonical identity. On `viewer_joined`/renegotiation, the sender includes a small `{ mid, kind: "screen" | "camera" }` mapping in the signaling payload so the viewer can bind `ontrack`'s `event.transceiver.mid` to the right label without guessing from track order or label strings.
 - This needs no new infrastructure — it's a couple of extra fields in the existing offer/answer exchange (§7) — and it means a browser that reorders `ontrack` callbacks, or a track that starts `null` and only appears later via `replaceTrack`, still ends up rendered in the correct screen/camera slot in the viewer UI.
 
-Whenever the live set changes mid-session, the sender emits `sharing_updated {screen, camera}` so the viewer's UI (and its Request buttons) follow the real state.
+Whenever the live set changes mid-session, the sender emits `sharing_state {screen, camera}` so the viewer's UI follows the actual available media.
 
 **STUN:** configurable via environment variable — default to a public STUN server, but let the deployer point it anywhere. Keep the implementation simple: STUN carries no media and needs no credentials, so this is a one-line config value, not a subsystem.
 
@@ -322,11 +312,11 @@ must be checked through WebRTC statistics.
 
 **Network change (Wi-Fi → hotspot, VPN toggle):** sender calls `createOffer({iceRestart: true})` on `iceConnectionState === "failed"` or `"disconnected"` past ~8s. Re-gathers candidates, typically recovers in 3–8s, **no re-permission prompt**.
 
-**Laptop sleep/wake:** `powerMonitor.on("suspend")` → send `going_offline`, temporarily interrupt sharing and close the PC cleanly (viewer sees Offline in <1s instead of after a timeout). On `resume`: reconnect the control plane and automatically reconnect the **already-approved active sharing session**, then resume that sharing session without a button click or fresh consent and show `Connected / Sharing resumed`. This automatic resume applies only to that already-approved active session; sleep/wake never approves or resumes a new viewer request. If the app crashes or is relaunched, sharing still returns to IDLE and requires a fresh explicit local user action (§9).
+**Laptop sleep/wake:** only an already-active sharing session with a live screen track may obtain the server-acknowledged, endpoint-specific sleep-resume capability. Ordinary viewer disconnect grace remains ~25 seconds; the separate five-minute sleep window begins only after `prepare_sleep` is acknowledged. On wake, the existing shared client reconnects the control plane, resumes the same session, and reuses surviving tracks—no track is silently reacquired. Once the peer reconnects, show `Connected / Sharing resumed`. A new viewer request is never automatically approved. If continuity cannot be proven or the screen track ended, stop screen and camera and require a fresh local Share Screen action. Crash/relaunch always starts in IDLE.
 
 **Detecting lost screen permission (macOS):** prefer real signals where the platform gives them — track `onended`/`onmute`, `getDisplayMedia` rejection on the next start attempt, and any error surfaced by the capture API. Treat **black-frame detection as a supplementary fallback only**, not as the primary mechanism and not as guaranteed behavior on every macOS version. Whatever the signal, the sender-facing outcome is the same: stop cleanly, and show a clear message explaining that screen-recording permission must be re-granted and the app relaunched. **NEEDS PROTOTYPE** on your actual target macOS version to find out which signals you actually get.
 
-**Capture stops unexpectedly (source window closed, camera unplugged):** the track fires `onended` — release that track, `replaceTrack(null)` on its transceiver, emit `sharing_updated`, and notify the viewer rather than leaving a frozen frame. If the other track is still live, the session continues.
+**Capture stops unexpectedly:** camera track termination detaches only the camera and leaves screen sharing active. Screen track termination stops camera too, closes the sharing session, and requires a fresh local Share Screen action; it never silently reacquires the screen.
 
 ---
 
@@ -420,17 +410,20 @@ One WebSocket, one JSON envelope:
 
 | Type | Direction | Payload (example) |
 |---|---|---|
-| `auth` | client→server, **must be first frame** | `{ "token": "..." }` |
+| `auth` | desktop client→server, **must be first frame** | `{ "token": "..." }` |
+| Browser session cookie | viewer→server during WebSocket upgrade | Existing HttpOnly `live_presence_session`; server authenticates it as a viewer without exposing it to JavaScript |
 | `presence` | server→viewer | `{ "device_id": "d1", "state": "online", "screen": false, "camera": false, "active_usage_seconds": 13320 }` |
-| `sharing_started` | device→server→viewer | `{ "device_id": "d1", "screen": true, "camera": false }` |
-| `sharing_updated` | device→server→viewer | `{ "device_id": "d1", "screen": true, "camera": true }` |
-| `sharing_stopped` | device→server→viewer | `{ "reason": "user" }` |
+| `sharing_state` | device→server | `{ "screen": true, "camera": false }` |
 | `create_session` | viewer→server | `{ "device_id": "d1" }` |
 | `viewer_joined` | server→device | `{ "session_id": "s1", "viewer_user_id": "u2", "viewer_name": "Amit" }` |
 | `viewer_left` | server→device | `{ "session_id": "s1", "viewer_user_id": "u2", "reason": "closed" }` |
 | `offer` / `answer` | relayed opaquely | `{ "session_id": "s1", "sdp": "...", "track_map": [{"mid":"0","kind":"screen"},{"mid":"1","kind":"camera"}] }` |
 | `ice_candidate` | relayed opaquely, both ways | `{ "session_id": "s1", "candidate": {...} }` |
 | `error` | server→client | `{ "code": "NOT_AUTHORIZED" }` |
+| `prepare_sleep` | active owner→server | `{ "session_id": "s1", "request_id": "..." }` |
+| `sleep_marked` | server→active owner and viewer | Endpoint-specific one-use capability, epoch and expiry; only a previously active session is eligible |
+| `resume_session` | reconnecting owner or viewer→server | `{ "session_id": "s1", "epoch": 1, "capability": "...", "request_id": "..." }` |
+| `resume_pending` / `session_resumed` | server→reconnecting endpoint(s) | Rotated capability while the other endpoint is absent, then the resumed session epoch |
 
 `active_usage_seconds` is **omitted entirely** when the device's privacy toggle is OFF (§3). Absent means "not shared", and the viewer UI shows nothing rather than a zero.
 
@@ -447,7 +440,7 @@ One WebSocket, one JSON envelope:
 
 `kind` is `"screen"` or `"camera"`. The server enforces one pending request per `(viewer, device, kind)` and the 30s post-deny cooldown before relaying anything (§9); a request that violates either is answered with `share_request_state` rather than forwarded, so the sender is never prompted twice for the same thing.
 
-**`share_request` arriving at the device renders a prompt and nothing else.** See §5.
+**`share_request` arriving at the device renders a prompt and nothing else.** The Phase 5 desktop does not expose this request UI or connect it to capture. See §5.
 
 ### Chat
 
@@ -463,7 +456,7 @@ One WebSocket, one JSON envelope:
 
 **WHY relay SDP/ICE opaquely instead of parsing them server-side:** keeps you out of a whole class of parsing bugs, and browser SDP changes never break your server. Requests and chat are the opposite case — the server *must* inspect those, because it's the thing enforcing authorization, pending-state and rate limits.
 
-**Don't put the auth token in the WS URL** — it ends up in proxy/access logs. Send it as the first frame instead, with a 5s deadline to authenticate before the connection is dropped.
+**Don't put the auth token in the WS URL** — it ends up in proxy/access logs. Desktop credentials are sent in the first frame with a 5s deadline. Browser viewer auth uses the existing HttpOnly session cookie on the WebSocket handshake; the cookie is never copied into JavaScript or the URL.
 
 ---
 
@@ -635,16 +628,17 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 |---|---|
 | WS disconnect | Exponential backoff + jitter (1s→2s→4s...→30s cap). Jitter matters even with two users — without it a server restart is a synchronized reconnect storm. |
 | WS reconnect | Re-auth, re-fetch presence. Reset backoff only after 60s stable — a flapping network shouldn't tight-loop. |
-| WebRTC/ICE disconnect | Wait ~8s (often self-heals) → ICE restart → if that fails twice, surface a clear error with relay-status shown |
-| Internet drop, <10s | No state change beyond a "reconnecting" badge |
-| Internet drop, minutes | Device marked offline after ~35s (2 missed 15s heartbeats + slack); full re-session on return |
-| Laptop sleep/wake | Graceful `going_offline` + temporary sharing interruption and clean PC close on suspend; on resume, reconnect the control plane and automatically reconnect the **already-approved active sharing session**, resume it without a button click or fresh consent, and show `Connected / Sharing resumed`. A new viewer request still requires explicit local Allow; crash/relaunch still returns to IDLE and requires a fresh action (§5, §9) |
-| Camera unplugged | Track `onended` fires → `replaceTrack(null)`, `sharing_updated`, notify viewer; screen share (if active) continues. **Chat is unaffected** — the relationship is still connected |
-| Screen capture stopped (source window closed) | Same — `onended`, clean stop of that track, notify. If no track remains, session goes to STOPPING. **Chat is unaffected** |
-| Sender clicks Stop | Capture tracks stop, session returns to IDLE. **Chat buffer is untouched** — the viewer is still connected and can keep chatting or send a new screen/camera request |
+| WebRTC/ICE disconnect | Keep the approved local tracks and peer; wait ~8s (often self-heals), then try ICE restart up to twice. A 180-second configurable recovery deadline bounds the complete signaling/ICE recovery window; on expiry, stop safely and surface the timeout. |
+| Temporary internet drop | Keep approved capture tracks and the existing session for `NETWORK_RECOVERY_GRACE_MS` (default 180000 ms). Re-authenticate signaling, reattach both endpoints to the same session, and restart ICE without creating a peer/session duplicate. Show `Reconnecting` until WebRTC recovers. |
+| Device presence during interruption | Mark the device offline after ~35s (2 missed 15s heartbeats + slack); the existing approved session remains recoverable until its separate recovery grace expires. |
+| Recovery deadline expires | End the session and safely stop local capture exactly once with a clear timeout reason; do not retry capture or silently create a replacement session. |
+| Laptop sleep/wake | A server-acknowledged sleep marker opens a five-minute continuity window for the already-active session only; ordinary viewer disconnect grace stays ~25 seconds. Reconnect using the existing shared-client recovery path and surviving tracks only; no silent reacquisition or fresh consent. Show `Connected / Sharing resumed` after peer recovery. New requests are never auto-approved; ended screen or unprovable continuity stops both tracks and requires a fresh local Share Screen action. Crash/relaunch starts IDLE (§5, §9) |
+| Camera unplugged | Camera `onended` fires → detach only camera with `replaceTrack(null)`; screen share continues |
+| Screen capture stopped (source window closed) | Screen `onended` stops camera too, ends the complete sharing session, and requires a fresh local Share Screen action; never silently reacquire |
+| Sender clicks Stop | Capture tracks stop, the server invalidates any resume capability, and the session returns to IDLE. No viewer request can restart capture |
 | macOS permission lost | Detect via track/error signals, black-frame check as fallback (§5) → stop, clear recovery message. Chat is unaffected |
 | App crash | Capture dies with the process. **On relaunch: always IDLE, never auto-resume sharing** — a fresh click is required |
-| Viewer closes tab / temporary disconnect | Server sees WS close → capture tracks (if any were live) stay live through a short grace period (~20–30s) to tolerate a refresh or brief drop; the chat buffer is retained through the same window since the control relationship is still considered "briefly away," not ended. Only if the viewer hasn't reconnected by the end of the grace period does the sender drop to armed-but-idle, stop any capture tracks (camera LED off), **and the relationship is now considered ended — only at that point does the chat buffer clear** |
+| Viewer closes tab / temporary disconnect | Server sees WS close → approved capture tracks stay live through the configurable recovery grace period to tolerate refresh or a brief drop; the chat buffer is retained through the same window since the control relationship is still considered "briefly away," not ended. Only if the viewer hasn't reconnected by the end of the grace period does the sender drop to armed-but-idle, stop any capture tracks (camera LED off), **and the relationship is now considered ended — only at that point does the chat buffer clear** |
 | Sender closes app | Graceful stop sent before quit where possible; otherwise timeout-based. This ends the control relationship, so the chat buffer clears with it |
 | Server restart | Everyone reconnects (backoff). Pending requests, cooldowns and chat buffers are gone — clients reset request UI to NONE rather than showing stale pending state |
 | Sender offline when a request arrives | Request is rejected immediately with `share_request_state: CANCELLED`; nothing queues for later delivery |

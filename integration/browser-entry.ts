@@ -37,6 +37,7 @@ type HarnessSnapshot = {
   renderedFrames: number;
   peerConnectionState: string | null;
   iceConnectionState: string | null;
+  transceivers: string[];
   openSockets: number;
   stats: StatsSnapshot | null;
   gatheredCandidateTypes: string[];
@@ -178,14 +179,6 @@ class BrowserClient {
         lastError = error instanceof Error ? error.message : "setLocalDescription failed";
         throw error;
       })) as typeof peer.setLocalDescription;
-    Object.defineProperty(peer, "transceivers", {
-      configurable: true,
-      get: () => {
-        const all = peer.getTransceivers();
-        const negotiated = all.filter((transceiver) => transceiver.mid !== null);
-        return negotiated.length === 2 ? negotiated : all;
-      },
-    });
     this.currentConnection = peer;
     connection = peer;
     peerConnectionsCreated += 1;
@@ -472,6 +465,7 @@ async function start(options: StartOptions): Promise<void> {
     if (options.role === "viewer") {
       client.start();
     } else {
+      client.setSharingState(true, false);
       await client.start();
     }
   } catch (error) {
@@ -504,6 +498,9 @@ async function snapshot(): Promise<HarnessSnapshot> {
     renderedFrames,
     peerConnectionState: connection?.connectionState ?? null,
     iceConnectionState: connection?.iceConnectionState ?? null,
+    transceivers: connection?.getTransceivers().map((transceiver) =>
+      `${transceiver.mid ?? "null"}:${transceiver.direction}:${transceiver.currentDirection ?? "pending"}`,
+    ) ?? [],
     openSockets: sockets.filter((socket) => socket.readyState === WebSocket.OPEN).length,
     stats,
     gatheredCandidateTypes: connection ? await gatheredCandidateTypes(connection) : [],

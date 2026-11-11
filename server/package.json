@@ -5,7 +5,9 @@
   "scripts": {
     "check": "tsc --noEmit --project tsconfig.json",
     "start": "node --env-file=../.env --import=tsx src/index.ts",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "tsx --test src/**/*.test.ts",
+    "access:grant": "node --env-file-if-exists=../.env --import=tsx src/cli/access-main.ts grant",
+    "access:revoke": "node --env-file-if-exists=../.env --import=tsx src/cli/access-main.ts revoke"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

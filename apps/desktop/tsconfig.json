@@ -2,7 +2,9 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
-    "rootDir": "../.."
+    "rootDir": "../..",
+    "jsx": "react-jsx",
+    "types": ["node"]
   },
-  "include": ["src/**/*.ts", "../../shared/src/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "forge.config.ts", "vite.*.config.ts", "../../shared/src/**/*.ts"]
 }

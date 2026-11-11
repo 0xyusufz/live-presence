@@ -1,10 +1,10 @@
 import { buildApp } from "./app.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, resolveDatabasePath } from "./config.js";
 
 async function start(): Promise<void> {
   const config = loadConfig();
   const server = await buildApp(
-    config.databasePath,
+    resolveDatabasePath(config.databasePath),
     config.sessionTtlSeconds,
     config.nodeEnv,
     undefined,
@@ -15,6 +15,8 @@ async function start(): Promise<void> {
     config.cloudflareTurnApiToken,
     config.stunUrls,
     config.turnCredentialTtlSeconds,
+    undefined,
+    config.networkRecoveryGraceMs,
   );
 
   try {

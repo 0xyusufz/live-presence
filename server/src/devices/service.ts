@@ -249,6 +249,15 @@ export class DeviceService {
     };
   }
 
+  public getActiveDeviceOwner(deviceId: string): string | undefined {
+    const device = this.db
+      .select({ userId: devices.userId })
+      .from(devices)
+      .where(and(eq(devices.id, deviceId), isNull(devices.revokedAt)))
+      .get();
+    return device?.userId;
+  }
+
   public revokeDevice(userId: string, deviceId: string): void {
     this.db.transaction((transaction) => {
       const device = transaction

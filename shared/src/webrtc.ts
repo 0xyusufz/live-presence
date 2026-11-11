@@ -2,6 +2,7 @@ import { validTrackMap, type ClientMessage, type MediaKind, type TrackMap } from
 
 export interface WebRtcTrack {
   readonly kind?: string;
+  readonly readyState?: string;
 }
 
 export interface WebRtcSender {
@@ -10,6 +11,7 @@ export interface WebRtcSender {
 
 export interface WebRtcTransceiver {
   readonly mid: string | null;
+  currentDirection?: string | null;
   readonly sender: WebRtcSender;
   direction: string;
 }
@@ -22,6 +24,7 @@ export interface WebRtcDescription {
 export interface WebRtcPeerConnection {
   readonly connectionState?: string;
   readonly iceConnectionState?: string;
+  readonly signalingState?: string;
   readonly transceivers: readonly WebRtcTransceiver[];
   addTransceiver(kind: string, init: { direction: "sendonly" | "recvonly" }): WebRtcTransceiver;
   setConfiguration(configuration: WebRtcConfiguration): void;
@@ -33,9 +36,35 @@ export interface WebRtcPeerConnection {
   close(): void;
   onicecandidate: ((event: { candidate: unknown | null }) => void) | null;
   onerror?: (() => void) | null;
-  ontrack?: ((event: { track: WebRtcTrack }) => void) | null;
+  ontrack?: ((event: { track: WebRtcTrack; transceiver?: { mid: string | null } }) => void) | null;
   onconnectionstatechange: (() => void) | null;
   oniceconnectionstatechange: (() => void) | null;
+  onsignalingstatechange?: (() => void) | null;
+}
+
+export type WebRtcFailureCategory = "negotiation" | "sdp" | "ice" | "peer" | "signaling";
+
+export type WebRtcDiagnostic = {
+  role: "owner" | "viewer";
+  sessionId: string;
+  peerState: PeerState;
+  connectionState?: string;
+  iceConnectionState?: string;
+  signalingState?: string;
+  operation?: "setRemoteDescription" | "createAnswer" | "setLocalDescription" | "sendAnswer";
+  operationStatus?: "started" | "succeeded" | "failed";
+};
+
+export class WebRtcPeerError extends Error {
+  constructor(
+    readonly category: WebRtcFailureCategory,
+    message: string,
+    readonly diagnostic: WebRtcDiagnostic,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "WebRtcPeerError";
+  }
 }
 
 export type IceTransportPolicy = "all" | "relay";
@@ -57,10 +86,12 @@ const MAX_QUEUED_ICE_CANDIDATES = 64;
 type NegotiationState =
   | "new"
   | "offer_created"
+  | "offer_applying"
   | "offer_applied"
   | "answer_created"
   | "answer_applied"
   | "restart_offer_created"
+  | "restart_offer_applying"
   | "restart_offer_applied"
   | "restart_answer_created"
   | "restart_answer_applied"
@@ -93,7 +124,7 @@ export class WebRtcPeer {
   private readonly sessionId: string;
   private readonly role: "owner" | "viewer";
   private readonly send: SignalingSender;
-  private readonly transceivers!: Record<MediaKind, WebRtcTransceiver>;
+  private readonly transceivers: Record<MediaKind, WebRtcTransceiver> | undefined = undefined;
   private stateValue: PeerState = "new";
   private negotiationState: NegotiationState = "new";
   private remoteDescriptionSet = false;
@@ -101,7 +132,13 @@ export class WebRtcPeer {
   private readonly queuedCandidates: unknown[] = [];
   private closed = false;
   private stateListener: ((state: PeerState) => void) | undefined;
-  private remoteTrackListener: ((track: WebRtcTrack) => void) | undefined;
+  private diagnosticListener: ((diagnostic: WebRtcDiagnostic) => void) | undefined;
+  private failureListener: ((error: WebRtcPeerError) => void) | undefined;
+  private remoteTrackListener: ((track: WebRtcTrack, mid: string | null, kind?: MediaKind) => void) | undefined;
+  private remoteTrackKinds = new Map<string, MediaKind>();
+  private pendingRemoteTracks: Array<{ track: WebRtcTrack; mid: string | null }> = [];
+  private pendingOffer?: { key: string; promise: Promise<void> };
+  private lastAnsweredOfferKey: string | undefined;
 
   constructor(
     role: "owner" | "viewer",
@@ -115,20 +152,42 @@ export class WebRtcPeer {
     this.connection = factory();
     this.connection.onicecandidate = (event) => {
       if (!this.closed && event.candidate !== null) {
-        this.send({ type: "ice_candidate", session_id: this.sessionId, candidate: event.candidate });
+        try {
+          this.send({ type: "ice_candidate", session_id: this.sessionId, candidate: event.candidate });
+        } catch (error) {
+          this.failureListener?.(this.makeError("signaling", "Sending ICE candidate failed", error));
+        }
       }
     };
-    this.connection.onerror = () => this.close();
-    this.connection.ontrack = (event) => this.remoteTrackListener?.(event.track);
+    this.connection.onerror = () => {
+      this.stateValue = "failed";
+      this.negotiationState = "failed";
+      this.emitDiagnostic();
+      const error = this.makeError("peer", "Peer connection reported an error");
+      this.failureListener?.(error);
+      this.close();
+    };
+    this.connection.ontrack = (event) => {
+      const mid = event.transceiver?.mid ?? null;
+      const kind = mid === null ? undefined : this.remoteTrackKinds.get(mid);
+      if (kind) this.remoteTrackListener?.(event.track, mid, kind);
+      else this.pendingRemoteTracks.push({ track: event.track, mid });
+    };
     this.connection.onconnectionstatechange = () => this.updateState(this.connection.connectionState);
     this.connection.oniceconnectionstatechange = () => this.updateState(this.connection.iceConnectionState);
-    const direction = role === "owner" ? "sendonly" : "recvonly";
-    const screen = this.connection.addTransceiver("video", { direction });
-    const camera = this.connection.addTransceiver("video", { direction });
-    this.transceivers = { screen, camera };
+    if ("onsignalingstatechange" in this.connection) {
+      this.connection.onsignalingstatechange = () => this.emitDiagnostic();
+    }
+    if (role === "owner") {
+      const screen = this.connection.addTransceiver("video", { direction: "sendonly" });
+      const camera = this.connection.addTransceiver("video", { direction: "sendonly" });
+      this.transceivers = { screen, camera };
+    }
   }
 
   get state(): PeerState { return this.stateValue; }
+
+  get diagnostic(): WebRtcDiagnostic { return this.createDiagnostic(); }
 
   get restartOfferPending(): boolean {
     return this.negotiationState === "restart_offer_created";
@@ -148,7 +207,52 @@ export class WebRtcPeer {
     listener?.(this.stateValue);
   }
 
-  setRemoteTrackListener(listener: ((track: WebRtcTrack) => void) | undefined): void {
+  setDiagnosticListener(listener: ((diagnostic: WebRtcDiagnostic) => void) | undefined): void {
+    this.diagnosticListener = listener;
+    this.emitDiagnostic();
+  }
+
+  setFailureListener(listener: ((error: WebRtcPeerError) => void) | undefined): void {
+    this.failureListener = listener;
+  }
+
+  private createDiagnostic(): WebRtcDiagnostic {
+    return {
+      role: this.role,
+      sessionId: this.sessionId,
+      peerState: this.stateValue,
+      ...(this.connection.connectionState ? { connectionState: this.connection.connectionState } : {}),
+      ...(this.connection.iceConnectionState ? { iceConnectionState: this.connection.iceConnectionState } : {}),
+      ...(this.connection.signalingState ? { signalingState: this.connection.signalingState } : {}),
+    };
+  }
+
+  private emitDiagnostic(): void {
+    this.diagnosticListener?.(this.createDiagnostic());
+  }
+
+  private emitOperation(
+    operation: NonNullable<WebRtcDiagnostic["operation"]>,
+    operationStatus: NonNullable<WebRtcDiagnostic["operationStatus"]>,
+  ): void {
+    this.diagnosticListener?.({ ...this.createDiagnostic(), operation, operationStatus });
+  }
+
+  private makeError(
+    category: WebRtcFailureCategory,
+    operation: string,
+    cause?: unknown,
+  ): WebRtcPeerError {
+    const detail = cause instanceof Error ? cause.message : undefined;
+    const safeDetail = detail && !/(?:v=0|a=candidate:|candidate:|bearer\s|cookie|token|credential|authorization)/i.test(detail)
+      ? `: ${detail.slice(0, 240)}`
+      : "";
+    return new WebRtcPeerError(category, `${operation}${safeDetail}`, this.createDiagnostic(), {
+      ...(cause === undefined ? {} : { cause }),
+    });
+  }
+
+  setRemoteTrackListener(listener: ((track: WebRtcTrack, mid: string | null, kind?: MediaKind) => void) | undefined): void {
     this.remoteTrackListener = listener;
   }
 
@@ -164,6 +268,7 @@ export class WebRtcPeer {
       this.negotiationState = "failed";
     }
     else if (value === "connecting" || value === "checking") this.stateValue = "connecting";
+    this.emitDiagnostic();
     this.stateListener?.(this.stateValue);
   }
 
@@ -179,19 +284,45 @@ export class WebRtcPeer {
       ].includes(this.negotiationState))) {
       throw new Error("peer cannot create an offer in its current state");
     }
+    let description: WebRtcDescription;
     try {
       if (restarting) this.negotiationState = "restart_offer_created";
-      const description = await this.connection.createOffer(options);
+      description = await this.connection.createOffer(options);
       await this.connection.setLocalDescription(description);
       if (!restarting) this.negotiationState = "offer_created";
+    } catch (error) {
+      this.negotiationState = "failed";
+      throw this.makeError(restarting ? "ice" : "negotiation", "Creating WebRTC offer failed", error);
+    }
+    try {
       this.send({ type: "offer", session_id: this.sessionId, sdp: description.sdp ?? "", track_map: trackMapFromTransceivers(this.connection.transceivers) });
     } catch (error) {
       this.negotiationState = "failed";
-      throw error;
+      throw this.makeError("signaling", "Sending WebRTC offer failed", error);
     }
   }
 
-  async acceptOffer(sdp: string, trackMap: TrackMap): Promise<void> {
+  acceptOffer(sdp: string, trackMap: TrackMap): Promise<void> {
+    const key = JSON.stringify([sdp, trackMap]);
+    if (this.pendingOffer?.key === key) return this.pendingOffer.promise;
+    if (this.lastAnsweredOfferKey === key) return Promise.resolve();
+    const operation = this.applyOffer(sdp, trackMap);
+    let tracked: Promise<void>;
+    tracked = operation.then(
+      () => {
+        this.lastAnsweredOfferKey = key;
+        if (this.pendingOffer?.promise === tracked) this.pendingOffer = undefined;
+      },
+      (error: unknown) => {
+        if (this.pendingOffer?.promise === tracked) this.pendingOffer = undefined;
+        throw error;
+      },
+    );
+    this.pendingOffer = { key, promise: tracked };
+    return tracked;
+  }
+
+  private async applyOffer(sdp: string, trackMap: TrackMap): Promise<void> {
     if (this.closed) throw new Error("peer is closed");
     const restarting = this.negotiationState === "failed" ||
       this.negotiationState === "restart_answer_applied";
@@ -199,22 +330,69 @@ export class WebRtcPeer {
       throw new Error("peer cannot accept an offer in its current state");
     }
     if (!validTrackMap(trackMap)) throw new Error("invalid track map");
+    this.negotiationState = restarting ? "restart_offer_applying" : "offer_applying";
     try {
-      await this.connection.setRemoteDescription({ type: "offer", sdp });
+      this.emitOperation("setRemoteDescription", "started");
+      try {
+        await this.connection.setRemoteDescription({ type: "offer", sdp });
+      } catch (error) {
+        this.emitOperation("setRemoteDescription", "failed");
+        throw this.makeError("sdp", "Viewer setRemoteDescription(offer) failed", error);
+      }
+      this.emitOperation("setRemoteDescription", "succeeded");
       this.remoteDescriptionSet = true;
       await this.flushQueuedCandidates();
       const negotiatedMap = trackMapFromTransceivers(this.connection.transceivers, "recvonly");
       if (negotiatedMap.some((entry, index) => entry.mid !== trackMap[index].mid || entry.kind !== trackMap[index].kind)) {
         throw new Error("track map does not match negotiated transceivers");
       }
+      this.remoteTrackKinds = new Map(negotiatedMap.map((entry) => [entry.mid, entry.kind]));
+      for (const pending of this.pendingRemoteTracks.splice(0)) {
+        const kind = pending.mid === null ? undefined : this.remoteTrackKinds.get(pending.mid);
+        if (kind) this.remoteTrackListener?.(pending.track, pending.mid, kind);
+      }
       this.negotiationState = restarting ? "restart_offer_applied" : "offer_applied";
-      const description = await this.connection.createAnswer();
-      await this.connection.setLocalDescription(description);
+      this.emitOperation("createAnswer", "started");
+      let description: WebRtcDescription;
+      try {
+        description = await this.connection.createAnswer();
+      } catch (error) {
+        this.emitOperation("createAnswer", "failed");
+        throw this.makeError("negotiation", "Viewer createAnswer() failed", error);
+      }
+      this.emitOperation("createAnswer", "succeeded");
+      this.emitOperation("setLocalDescription", "started");
+      try {
+        await this.connection.setLocalDescription(description);
+      } catch (error) {
+        this.emitOperation("setLocalDescription", "failed");
+        throw this.makeError("sdp", "Viewer setLocalDescription(answer) failed", error);
+      }
+      this.emitOperation("setLocalDescription", "succeeded");
       this.negotiationState = restarting ? "restart_answer_created" : "answer_created";
-      this.send({ type: "answer", session_id: this.sessionId, sdp: description.sdp ?? "", track_map: negotiatedMap });
+      const negotiatedTransceivers = this.connection.transceivers;
+      const negotiatedAnswerMap = trackMapFromTransceivers(negotiatedTransceivers, "recvonly");
+      if (
+        negotiatedAnswerMap.some((entry, index) =>
+          entry.mid !== negotiatedMap[index].mid ||
+          entry.kind !== negotiatedMap[index].kind ||
+          (negotiatedTransceivers[index]?.currentDirection !== undefined &&
+            negotiatedTransceivers[index]?.currentDirection !== "recvonly"))
+      ) {
+        throw new Error("viewer answer did not negotiate the canonical recvonly transceivers");
+      }
+      this.emitOperation("sendAnswer", "started");
+      try {
+        this.send({ type: "answer", session_id: this.sessionId, sdp: description.sdp ?? "", track_map: negotiatedMap });
+      } catch (error) {
+        this.emitOperation("sendAnswer", "failed");
+        throw this.makeError("signaling", "Sending WebRTC answer through signaling failed", error);
+      }
+      this.emitOperation("sendAnswer", "succeeded");
     } catch (error) {
       this.negotiationState = "failed";
-      throw error;
+      if (error instanceof WebRtcPeerError) throw error;
+      throw this.makeError("sdp", "Processing remote SDP offer failed", error);
     }
   }
 
@@ -232,7 +410,8 @@ export class WebRtcPeer {
       this.negotiationState = restarting ? "restart_answer_applied" : "answer_applied";
     } catch (error) {
       this.negotiationState = "failed";
-      throw error;
+      if (error instanceof WebRtcPeerError) throw error;
+      throw this.makeError("sdp", "Processing remote SDP answer failed", error);
     }
   }
 
@@ -251,15 +430,16 @@ export class WebRtcPeer {
       await this.connection.addIceCandidate(candidate);
     } catch (error) {
       this.negotiationState = "failed";
-      throw error;
+      throw this.makeError("ice", "Adding ICE candidate failed", error);
     }
   }
 
   async replaceTrack(kind: MediaKind, track: WebRtcTrack | null): Promise<void> {
     if (this.closed) throw new Error("peer is closed");
-    if (this.role !== "owner" || this.negotiationState === "failed" || !this.transceivers[kind]) {
+    if (this.role !== "owner" || this.negotiationState === "failed" || !this.transceivers?.[kind]) {
       throw new Error("peer is not an owner");
     }
+    if (track?.readyState === "ended") throw new Error("cannot attach an ended track");
     await this.transceivers[kind].sender.replaceTrack(track);
   }
 
@@ -273,8 +453,10 @@ export class WebRtcPeer {
       }
     } catch (error) {
       this.queuedCandidates.length = 0;
+      this.pendingRemoteTracks.length = 0;
+      this.remoteTrackKinds.clear();
       this.negotiationState = "failed";
-      throw error;
+      throw this.makeError("ice", "Applying queued ICE candidates failed", error);
     } finally {
       this.flushingCandidates = false;
     }
@@ -291,6 +473,7 @@ export class WebRtcPeer {
     this.connection.ontrack = null;
     this.connection.onconnectionstatechange = null;
     this.connection.oniceconnectionstatechange = null;
+    if ("onsignalingstatechange" in this.connection) this.connection.onsignalingstatechange = null;
     this.connection.close();
   }
 }

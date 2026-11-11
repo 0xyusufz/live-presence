@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 export type ServerConfig = {
   databasePath: string;
   host: string;
@@ -11,6 +13,7 @@ export type ServerConfig = {
   cloudflareTurnApiToken: string;
   stunUrls: string[];
   turnCredentialTtlSeconds: number;
+  networkRecoveryGraceMs: number;
 };
 
 const nodeEnvironments = new Set<ServerConfig["nodeEnv"]>([
@@ -70,6 +73,17 @@ function nodeEnvironment(
 }
 
 const DEFAULT_STUN_URLS = ["stun:stun.l.google.com:19302"];
+
+export const SERVER_ROOT = resolve(__dirname, "..");
+
+export function resolveDatabasePath(
+  databasePath: string,
+  baseDirectory = SERVER_ROOT,
+): string {
+  return databasePath === ":memory:"
+    ? databasePath
+    : resolve(baseDirectory, databasePath);
+}
 
 function iceUrls(
   environment: NodeJS.ProcessEnv,
@@ -147,6 +161,11 @@ export function loadConfig(
       environment,
       "TURN_CREDENTIAL_TTL_SECONDS",
       "86400",
+    ),
+    networkRecoveryGraceMs: positiveInteger(
+      environment,
+      "NETWORK_RECOVERY_GRACE_MS",
+      "180000",
     ),
   };
 }
