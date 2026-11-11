@@ -5,6 +5,7 @@ import {
   INITIAL_NEGOTIATION_TIMEOUT_MS,
   ViewerWebRtcClient,
   type DesktopDiagnostic,
+  type ClientSignalingDiagnostic,
   NETWORK_RECOVERY_TIMEOUT_MS,
   type RecoveryDiagnostic,
   type SignalingSocket,
@@ -33,6 +34,8 @@ class MockConnection implements WebRtcPeerConnection {
   local: unknown;
   remote: unknown;
   remoteDescriptionError: Error | undefined;
+  remoteDescriptionGate: Promise<void> | undefined;
+  iceCandidateGate: Promise<void> | undefined;
   offerCalls = 0;
   answerCalls = 0;
   failOfferCount = 0;
@@ -84,6 +87,7 @@ class MockConnection implements WebRtcPeerConnection {
     }
   }
   async setRemoteDescription(value: unknown) {
+    await this.remoteDescriptionGate;
     if (this.remoteDescriptionError) throw this.remoteDescriptionError;
     this.remote = value;
     if (
@@ -103,7 +107,10 @@ class MockConnection implements WebRtcPeerConnection {
       }
     }
   }
-  async addIceCandidate() { this.candidateCalls += 1; }
+  async addIceCandidate() {
+    await this.iceCandidateGate;
+    this.candidateCalls += 1;
+  }
   close() { this.closed = true; }
 }
 
@@ -113,12 +120,43 @@ class MockSocket implements SignalingSocket {
   peer: MockSocket | undefined;
   sent: string[] = [];
   onopen: (() => void) | null = null;
-  onmessage: ((event: { data: unknown }) => void) | null = null;
+  private messageHandler: ((event: { data: unknown }) => void) | null = null;
+  private negotiationId: string | undefined;
+  get onmessage(): ((event: { data: unknown }) => void) | null {
+    if (!this.messageHandler) return null;
+    return (event) => {
+      let data = event.data;
+      if (typeof data === "string") {
+        try {
+          const message = JSON.parse(data) as Record<string, unknown>;
+          if (
+            (message.type === "offer" || message.type === "answer" || message.type === "ice_candidate") &&
+            typeof message.negotiation_id !== "string"
+          ) {
+            message.negotiation_id = this.negotiationId ?? "test-negotiation-id";
+            data = JSON.stringify(message);
+          }
+        } catch {
+          // Leave malformed fixture data unchanged for parser tests.
+        }
+      }
+      this.messageHandler?.({ data });
+    };
+  }
+  set onmessage(handler: ((event: { data: unknown }) => void) | null) {
+    this.messageHandler = handler;
+  }
   onclose: ((event?: { code?: number }) => void) | null = null;
   onerror: (() => void) | null = null;
 
   send(data: string): void {
     this.sent.push(data);
+    try {
+      const message = JSON.parse(data) as Record<string, unknown>;
+      if (typeof message.negotiation_id === "string") this.negotiationId = message.negotiation_id;
+    } catch {
+      // Outbound non-JSON data is not part of the signaling protocol.
+    }
   }
 
   open(): void {
@@ -168,6 +206,12 @@ class ManualScheduler implements ClientScheduler {
     this.timers.delete(id);
     timer.callback();
   }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
 }
 
 test("desktop and viewer clients negotiate through the existing signaling messages", async () => {
@@ -732,7 +776,10 @@ test("sharing activation reports only socket delivery until backend acknowledgem
     screen: true,
     camera: false,
   });
-  assert.equal(diagnostics.at(-1)?.sent, true);
+  assert.equal(
+    diagnostics.filter((diagnostic) => diagnostic.event === "sharing-state").at(-1)?.sent,
+    true,
+  );
   assert.equal(confirmations.length, 0);
 
   socket.onmessage?.({
@@ -1187,6 +1234,7 @@ test("viewer processes the offer after session creation and sends one answer", a
   const offer = JSON.stringify({
     type: "offer",
     session_id: "00000000-0000-0000-0000-000000000002",
+    negotiation_id: "viewer-negotiation-1",
     sdp: "valid-offer",
     track_map: [
       { mid: "0", kind: "screen" },
@@ -1198,11 +1246,12 @@ test("viewer processes the offer after session creation and sends one answer", a
   await new Promise((resolve) => setImmediate(resolve));
 
   const answers = socket.sent
-    .map((data) => JSON.parse(data) as { type: string; session_id?: string; sdp?: string })
+    .map((data) => JSON.parse(data) as { type: string; session_id?: string; negotiation_id?: string; sdp?: string })
     .filter((message) => message.type === "answer");
   assert.deepEqual(answers, [{
     type: "answer",
     session_id: "00000000-0000-0000-0000-000000000002",
+    negotiation_id: "viewer-negotiation-1",
     sdp: "viewer-answer",
     track_map: [
       { mid: "0", kind: "screen" },
@@ -1352,6 +1401,7 @@ async function connectedDesktop(
   onTerminalError?: (error: Error) => void,
   configuration?: {
     loadRefreshCredential?: () => Promise<string>;
+    refreshPresence?: () => Promise<void>;
     loadIceServers?: (credential: string) => Promise<{
       iceServers: readonly { urls: string | readonly string[]; username?: string; credential?: string }[];
       iceTransportPolicy?: "all" | "relay";
@@ -1373,6 +1423,7 @@ async function connectedDesktop(
     peerFactory: configuration?.peerFactory ?? (() => connection),
     loadRefreshCredential: configuration?.loadRefreshCredential ?? (async () => "credential"),
     loadIceServers: configuration?.loadIceServers,
+    refreshPresence: configuration?.refreshPresence,
     reconnect: {
       scheduler,
       ...(configuration?.recoveryTimeoutMs === undefined
@@ -1528,10 +1579,12 @@ test("desktop retries restart failure but waits for the bounded recovery deadlin
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();
   const terminalErrors: Error[] = [];
+  const diagnostics: DesktopDiagnostic[] = [];
   const { client, connection: peerConnection } = await connectedDesktop(
     scheduler,
     connection,
     (error) => terminalErrors.push(error),
+    { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
   );
   connection.failOfferCount = 2;
   peerConnection.connectionState = "failed";
@@ -1546,6 +1599,348 @@ test("desktop retries restart failure but waits for the bounded recovery deadlin
   assert.equal(scheduler.runNext(), NETWORK_RECOVERY_TIMEOUT_MS);
   assert.match(terminalErrors[0]?.message ?? "", /network recovery timed out after 180 seconds/);
   assert.equal(client.lifecycle, "FAILED");
+  assert.ok(diagnostics.some((diagnostic) =>
+    diagnostic.event === "recovery_timed_out" &&
+    diagnostic.sessionId === "00000000-0000-0000-0000-000000000002" &&
+    diagnostic.peerGeneration !== undefined));
+  client.close();
+});
+
+test("explicit Stop Sharing clears pending recovery and ICE restart timers", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket, connection: peerConnection } = await connectedDesktop(scheduler, connection);
+  await client.setSharingState(true, false);
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === 8_000));
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+
+  await client.stopSharingSession();
+  assert.ok(![...scheduler.timers.values()].some((timer) =>
+    timer.delay === 8_000 || timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)!), {
+    type: "sharing_state",
+    screen: false,
+    camera: false,
+  });
+  assert.equal(peerConnection.offerCalls, 1);
+  client.close();
+});
+
+test("a new recovery event re-arms bounded ICE restart attempts without parallel offers", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const diagnostics: DesktopDiagnostic[] = [];
+  const { client, socket, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+  );
+  await client.setSharingState(true, false);
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+
+  assert.equal(scheduler.runNext(), 8_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.runNext(), 8_000);
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.runNext(), 8_000);
+  assert.equal(peerConnection.offerCalls, 3);
+
+  const newRecoveryEvent = {
+    type: "session_recovery",
+    session_id: "00000000-0000-0000-0000-000000000002",
+    recovery_attempt_id: "recovery-attempt-new-cycle",
+  };
+  socket.onmessage?.({ data: JSON.stringify(newRecoveryEvent) });
+  socket.onmessage?.({ data: JSON.stringify(newRecoveryEvent) });
+  const receivedDiagnostic = diagnostics.find((diagnostic) =>
+    diagnostic.event === "session_recovery_received" &&
+    diagnostic.recoveryAttemptId === "recovery-attempt-new-cycle");
+  assert.ok(receivedDiagnostic);
+  assert.ok(receivedDiagnostic.timestamp);
+  assert.equal(receivedDiagnostic.sessionId, "00000000-0000-0000-0000-000000000002");
+  assert.ok(receivedDiagnostic.peerGeneration !== undefined);
+  assert.ok(receivedDiagnostic.negotiationId);
+  assert.ok(receivedDiagnostic.socketConnectionGeneration !== undefined);
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 4);
+  assert.equal(
+    diagnostics.filter((diagnostic) => diagnostic.event === "ice_restart_started").length,
+    3,
+  );
+  assert.ok(diagnostics.some((diagnostic) =>
+    diagnostic.event === "ice_restart_retry_scheduled" &&
+    diagnostic.reason === "new-recovery-event" &&
+    diagnostic.attempt === 1));
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "recovery-attempt-queued",
+    }),
+  });
+  assert.equal(peerConnection.offerCalls, 4);
+  assert.equal(scheduler.timers.size, 2);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: JSON.parse(socket.sent.filter((data) => JSON.parse(data).type === "offer").at(-1)!).negotiation_id,
+      sdp: "restart-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 4);
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 5);
+  assert.equal([...scheduler.timers.values()].filter((timer) => timer.delay === 8_000).length, 1);
+  client.close();
+});
+
+test("session recovery received during authentication is drained after reauthentication", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const authGate = deferred<void>();
+  let refreshCount = 0;
+  const { client, sockets } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => true,
+    refreshPresence: async () => {
+      refreshCount += 1;
+      if (refreshCount === 2) await authGate.promise;
+    },
+  });
+  await client.setSharingState(true, false);
+  connection.connectionState = "disconnected";
+  connection.onconnectionstatechange?.();
+  sockets[0]!.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  const replacementSocket = sockets[1]!;
+  replacementSocket.open();
+  replacementSocket.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  replacementSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "recovery-during-auth",
+    }),
+  });
+  replacementSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "recovery-during-auth",
+    }),
+  });
+  assert.equal(connection.offerCalls, 1);
+
+  authGate.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connection.offerCalls, 2);
+  client.close();
+});
+
+test("peer reconnect and disconnect during signaling loss defers a restart until reauthentication", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const authGate = deferred<void>();
+  let refreshCount = 0;
+  const { client, sockets } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => true,
+    refreshPresence: async () => {
+      refreshCount += 1;
+      if (refreshCount === 2) await authGate.promise;
+    },
+  });
+  await client.setSharingState(true, false);
+  sockets[0]!.disconnect();
+
+  connection.connectionState = "connected";
+  connection.onconnectionstatechange?.();
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  connection.connectionState = "disconnected";
+  connection.onconnectionstatechange?.();
+  assert.equal(connection.offerCalls, 1);
+
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  const replacementSocket = sockets[1]!;
+  replacementSocket.open();
+  replacementSocket.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  authGate.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connection.offerCalls, 2);
+  client.close();
+});
+
+test("same-session peer replacement rejects stale negotiation signaling", async () => {
+  const scheduler = new ManualScheduler();
+  const firstConnection = new MockConnection();
+  const replacementConnection = new MockConnection();
+  const connections = [firstConnection, replacementConnection];
+  let peerFactoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, firstConnection, undefined, {
+    peerFactory: () => connections[peerFactoryCalls++]!,
+    isSharingActive: () => true,
+  });
+  const oldNegotiationId = JSON.parse(
+    socket.sent.filter((data) => JSON.parse(data).type === "offer").at(-1)!,
+  ).negotiation_id as string;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const currentOffer = JSON.parse(socket.sent.filter((data) => JSON.parse(data).type === "offer").at(-1)!);
+  const newNegotiationId = currentOffer.negotiation_id as string;
+  assert.notEqual(newNegotiationId, oldNegotiationId);
+  assert.equal(firstConnection.closed, true);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: oldNegotiationId,
+      sdp: "stale-answer",
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "ice_candidate",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: oldNegotiationId,
+      candidate: { candidate: "stale" },
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(replacementConnection.remote, undefined);
+  assert.equal(replacementConnection.candidateCalls, 0);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: newNegotiationId,
+      sdp: "current-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "ice_candidate",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: newNegotiationId,
+      candidate: { candidate: "current" },
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(replacementConnection.candidateCalls, 1);
+  assert.equal(client.lifecycle, "NEGOTIATING");
+  client.close();
+});
+
+test("a delayed answer from a replaced peer cannot clear the current peer restart timer", async () => {
+  const scheduler = new ManualScheduler();
+  const firstConnection = new MockConnection();
+  const replacementConnection = new MockConnection();
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(
+    scheduler,
+    firstConnection,
+    undefined,
+    {
+      peerFactory: () => factoryCalls++ === 0 ? firstConnection : replacementConnection,
+    },
+  );
+  await client.setSharingState(true, false);
+  firstConnection.connectionState = "disconnected";
+  firstConnection.onconnectionstatechange?.();
+  assert.equal(scheduler.runNext(), 8_000);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let resolveDelayedAnswer!: () => void;
+  firstConnection.remoteDescriptionGate = new Promise<void>((resolve) => {
+    resolveDelayedAnswer = resolve;
+  });
+  let resolveDelayedCandidate!: () => void;
+  firstConnection.iceCandidateGate = new Promise<void>((resolve) => {
+    resolveDelayedCandidate = resolve;
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      sdp: "delayed-old-peer-answer",
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "ice_candidate",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      candidate: { candidate: "candidate:delayed-old-peer" },
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await client.stopSharingSession();
+  await client.setSharingState(true, false);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      viewer_user_id: "viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      sdp: "replacement-peer-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  replacementConnection.connectionState = "connected";
+  replacementConnection.onconnectionstatechange?.();
+  replacementConnection.connectionState = "disconnected";
+  replacementConnection.onconnectionstatechange?.();
+  assert.equal(scheduler.runNext(), 8_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(replacementConnection.offerCalls, 2);
+
+  resolveDelayedAnswer();
+  resolveDelayedCandidate();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(replacementConnection.candidateCalls, 0);
+  assert.equal(
+    [...scheduler.timers.values()].filter((timer) => timer.delay === 8_000).length,
+    1,
+  );
+  assert.equal(client.lifecycle, "RECONNECTING");
   client.close();
 });
 
@@ -1662,7 +2057,7 @@ test("owner reconnect retains approved tracks and restarts the same peer session
     undefined,
     {
       isSharingActive: () => true,
-      recoveryTimeoutMs: 60_000,
+      recoveryTimeoutMs: 120_000,
       onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
     },
   );
@@ -1680,6 +2075,9 @@ test("owner reconnect retains approved tracks and restarts the same peer session
     data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
   });
   await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(diagnostics.some((diagnostic) =>
+    diagnostic.event === "signaling_reconnected" &&
+    diagnostic.sessionId === "00000000-0000-0000-0000-000000000002"));
   sockets[1]!.onmessage?.({
     data: JSON.stringify({
       type: "session_recovery",
@@ -1696,7 +2094,10 @@ test("owner reconnect retains approved tracks and restarts the same peer session
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(peerConnection.offerCalls, 2);
   assert.equal(peerConnection.closed, false);
-  assert.deepEqual(JSON.parse(sockets[1]!.sent.at(-1)!), {
+  const reconnectOffer = JSON.parse(sockets[1]!.sent.at(-1)!);
+  const { negotiation_id: _reconnectNegotiationId, ...reconnectOfferWithoutId } = reconnectOffer;
+  assert.equal(typeof _reconnectNegotiationId, "string");
+  assert.deepEqual(reconnectOfferWithoutId, {
     type: "offer",
     session_id: "00000000-0000-0000-0000-000000000002",
     sdp: "owner-offer",
@@ -1713,6 +2114,7 @@ test("owner reconnect retains approved tracks and restarts the same peer session
   peerConnection.connectionState = "connected";
   peerConnection.onconnectionstatechange?.();
   assert.equal(client.lifecycle, "CONNECTED");
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 120_000));
   client.close();
 });
 
@@ -1817,7 +2219,10 @@ test("owner replaces its peer and approved tracks when a fresh viewer reattaches
     { index: 1, track: cameraTrack },
   ]);
   assert.equal(connections[1]!.offerCalls, 1);
-  assert.deepEqual(JSON.parse(socket.sent.at(-1)!), {
+  const replacementOffer = JSON.parse(socket.sent.at(-1)!);
+  const { negotiation_id: _replacementNegotiationId, ...replacementOfferWithoutId } = replacementOffer;
+  assert.equal(typeof _replacementNegotiationId, "string");
+  assert.deepEqual(replacementOfferWithoutId, {
     type: "offer",
     session_id: "00000000-0000-0000-0000-000000000002",
     sdp: "owner-offer",
@@ -1886,7 +2291,10 @@ test("owner replaces the peer with the existing screen and camera tracks after r
       { index: 1, track: cameraTrack },
     ]);
     assert.equal(connections[index + 1]!.offerCalls, 1);
-    assert.deepEqual(JSON.parse(socket.sent.at(-1)!), {
+    const replacementOffer = JSON.parse(socket.sent.at(-1)!);
+    const { negotiation_id: _replacementNegotiationId, ...replacementOfferWithoutId } = replacementOffer;
+    assert.equal(typeof _replacementNegotiationId, "string");
+    assert.deepEqual(replacementOfferWithoutId, {
       type: "offer",
       session_id: sessionId,
       sdp: "owner-offer",
@@ -1900,7 +2308,7 @@ test("viewer reconnect reattaches to the existing session without creating anoth
   const scheduler = new ManualScheduler();
   const sockets: MockSocket[] = [];
   const connections: MockConnection[] = [];
-  const diagnostics: Array<WebRtcDiagnostic | RecoveryDiagnostic> = [];
+  const diagnostics: Array<WebRtcDiagnostic | RecoveryDiagnostic | ClientSignalingDiagnostic> = [];
   const viewer = new ViewerWebRtcClient({
     socketFactory: () => {
       const socket = new MockSocket();
@@ -2103,19 +2511,26 @@ test("recoverable attachment waits beyond initial negotiation deadline and resum
   viewer.close();
 });
 
-test("recoverable attachment becomes terminal when owner recovery grace expires", async () => {
+test("recoverable attachment retires its peer when owner recovery grace expires and accepts a later session", async () => {
   const socket = new MockSocket();
   const scheduler = new ManualScheduler();
   const failures: Error[] = [];
+  const connections: MockConnection[] = [];
+  const diagnostics: Array<WebRtcDiagnostic | RecoveryDiagnostic | ClientSignalingDiagnostic> = [];
   const deviceId = "00000000-0000-0000-0000-000000000001";
   const sessionId = "00000000-0000-0000-0000-000000000002";
   const viewer = new ViewerWebRtcClient({
     socketFactory: () => socket,
-    peerFactory: () => new MockConnection(),
+    peerFactory: () => {
+      const connection = new MockConnection();
+      connections.push(connection);
+      return connection;
+    },
     browserSessionToken: "browser-session-token",
     deviceId,
     reconnect: { scheduler },
     onTerminalError: (error) => failures.push(error),
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
   });
   viewer.start();
   socket.open();
@@ -2135,10 +2550,197 @@ test("recoverable attachment becomes terminal when owner recovery grace expires"
 
   scheduler.runDelay(45_000);
 
-  assert.equal(viewer.lifecycle, "FAILED");
-  assert.equal(failures.length, 1);
-  assert.match(failures[0]!.message, /recovery window expired/);
-  assert.equal(socket.readyState, 3);
+  assert.equal(viewer.lifecycle, "RECONNECTING");
+  assert.equal(viewer.failure, undefined);
+  assert.equal(failures.length, 0);
+  assert.equal(connections[0]!.closed, true);
+  assert.equal(socket.readyState, 1);
+  assert.equal(
+    socket.sent.filter((data) => JSON.parse(data).type === "create_session").length,
+    1,
+  );
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "device_sharing_state",
+      device_id: deviceId,
+      screen: true,
+      camera: true,
+    }),
+  });
+  assert.equal(
+    socket.sent.filter((data) => JSON.parse(data).type === "create_session").length,
+    2,
+  );
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      device_id: deviceId,
+    }),
+  });
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.closed, false);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "expired-negotiation",
+      sdp: "stale-offer",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  assert.equal(viewer.lifecycle, "NEGOTIATING");
+  assert.equal(connections[1]!.answerCalls, 0);
+  assert.equal(viewer.failure, undefined);
+  assert.ok(diagnostics.some((diagnostic) =>
+    "phase" in diagnostic &&
+    diagnostic.phase === "stale_session_signaling_ignored" &&
+    diagnostic.sessionId === sessionId));
+  viewer.close();
+});
+
+test("viewer recovers from repeated recovery timeouts without refreshing or duplicating sessions", async () => {
+  const scheduler = new ManualScheduler();
+  const socket = new MockSocket();
+  const connections: MockConnection[] = [];
+  const remoteTracks: Array<{ track: WebRtcTrack; kind?: "screen" | "camera" }> = [];
+  const failures: Error[] = [];
+  const diagnostics: Array<WebRtcDiagnostic | RecoveryDiagnostic | ClientSignalingDiagnostic> = [];
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const sessionIds = [
+    "00000000-0000-0000-0000-000000000002",
+    "00000000-0000-0000-0000-000000000003",
+    "00000000-0000-0000-0000-000000000004",
+  ];
+  let socketFactoryCalls = 0;
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => {
+      socketFactoryCalls += 1;
+      return socket;
+    },
+    peerFactory: () => {
+      const connection = new MockConnection();
+      connections.push(connection);
+      return connection;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId,
+    reconnect: { scheduler },
+    onTerminalError: (error) => failures.push(error),
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+  });
+  viewer.onRemoteTrack = (track, _mid, kind) => {
+    if (kind) remoteTracks.push({ track, kind });
+  };
+
+  viewer.start();
+  socket.open();
+  socket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const createSessionCount = (): number =>
+    socket.sent.filter((data) => JSON.parse(data).type === "create_session").length;
+  const negotiate = async (sessionId: string, negotiationId: string): Promise<void> => {
+    socket.onmessage?.({
+      data: JSON.stringify({ type: "session_created", session_id: sessionId, device_id: deviceId }),
+    });
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "offer",
+        session_id: sessionId,
+        negotiation_id: negotiationId,
+        sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+        track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+      }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(connections.at(-1)!.answerCalls, 1);
+    assert.ok(socket.sent.some((data) => {
+      const message = JSON.parse(data);
+      return message.type === "answer" &&
+        message.session_id === sessionId &&
+        message.negotiation_id === negotiationId;
+    }));
+    for (const [kind, mid] of [["screen", "0"], ["camera", "1"]] as const) {
+      const track: WebRtcTrack = { kind: "video", readyState: "live" };
+      connections.at(-1)!.ontrack?.({ track, transceiver: { mid } });
+      assert.equal(remoteTracks.at(-1)?.track, track);
+      assert.equal(remoteTracks.at(-1)?.kind, kind);
+    }
+    connections.at(-1)!.connectionState = "connected";
+    connections.at(-1)!.onconnectionstatechange?.();
+    assert.equal(viewer.lifecycle, "CONNECTED");
+  };
+
+  assert.equal(createSessionCount(), 1);
+  await negotiate(sessionIds[0]!, "negotiation-0");
+  for (let cycle = 0; cycle < 2; cycle += 1) {
+    const expiredSessionId = sessionIds[cycle]!;
+    const expiredPeer = connections[cycle]!;
+    expiredPeer.connectionState = "disconnected";
+    expiredPeer.onconnectionstatechange?.();
+    scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+
+    assert.equal(viewer.lifecycle, "RECONNECTING");
+    assert.equal(viewer.failure, undefined);
+    assert.equal(expiredPeer.closed, true);
+    assert.equal(socket.readyState, 1);
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "ice_candidate",
+        session_id: expiredSessionId,
+        negotiation_id: `negotiation-${cycle}`,
+        candidate: { candidate: "candidate:stale" },
+      }),
+    });
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "answer",
+        session_id: expiredSessionId,
+        negotiation_id: `negotiation-${cycle}`,
+        sdp: "stale-answer",
+      }),
+    });
+    assert.equal(viewer.lifecycle, "RECONNECTING");
+    assert.equal(viewer.failure, undefined);
+    assert.equal(
+      diagnostics.filter((diagnostic) =>
+        "phase" in diagnostic &&
+        diagnostic.phase === "stale_session_signaling_ignored" &&
+        diagnostic.sessionId === expiredSessionId).length,
+      2,
+    );
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "device_sharing_state",
+        device_id: deviceId,
+        screen: true,
+        camera: true,
+      }),
+    });
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "device_sharing_state",
+        device_id: deviceId,
+        screen: true,
+        camera: true,
+      }),
+    });
+    assert.equal(createSessionCount(), cycle + 2);
+
+    await negotiate(sessionIds[cycle + 1]!, `negotiation-${cycle + 1}`);
+    assert.equal(connections.length, cycle + 2);
+  }
+
+  assert.equal(socketFactoryCalls, 1);
+  assert.equal(createSessionCount(), 3);
+  assert.equal(connections.length, 3);
+  assert.equal(failures.length, 0);
   viewer.close();
 });
 
@@ -2146,7 +2748,7 @@ test("reconnect retires replaced session signaling but still rejects unknown ses
   const scheduler = new ManualScheduler();
   const sockets: MockSocket[] = [];
   const connections: MockConnection[] = [];
-  const diagnostics: Array<WebRtcDiagnostic | RecoveryDiagnostic> = [];
+  const diagnostics: Array<WebRtcDiagnostic | RecoveryDiagnostic | ClientSignalingDiagnostic> = [];
   const viewer = new ViewerWebRtcClient({
     socketFactory: () => {
       const socket = new MockSocket();

@@ -94,7 +94,9 @@ test("owner transport shares one authenticated connection, heartbeats, and close
     assert.equal(credentialLoads, 1);
     releaseCredential!("test-device-credential");
     await Promise.all([first, concurrent]);
-    await waitForEvent(events, "open");
+    const opened = await waitForEvent(events, "open");
+    assert.equal(opened.type, "open");
+    if (opened.type === "open") assert.equal(opened.connectionGeneration, 1);
     assert.equal(connectionCount, 1);
 
     transport.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }));

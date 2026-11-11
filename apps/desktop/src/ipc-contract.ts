@@ -1,9 +1,9 @@
 import type { WebRtcConfiguration } from "../../../shared/src/webrtc.js";
 
 export type SocketEvent =
-  | { type: "open" }
+  | { type: "open"; connectionGeneration?: number }
   | { type: "message"; data: string }
-  | { type: "close"; code?: number }
+  | { type: "close"; code?: number; connectionGeneration?: number }
   | { type: "error"; message: string };
 
 export type AppEvent =

@@ -11,8 +11,9 @@ export type ClientMessage =
   | { type: "leave_session"; session_id: string }
   | { type: "prepare_sleep"; session_id: string; request_id: string }
   | { type: "resume_session"; session_id: string; epoch: number; capability: string; request_id: string }
-  | { type: "offer" | "answer"; session_id: string; sdp: string; track_map?: TrackMap }
-  | { type: "ice_candidate"; session_id: string; candidate: unknown }
+  | { type: "offer"; session_id: string; negotiation_id: string; sdp: string; track_map?: TrackMap }
+  | { type: "answer"; session_id: string; negotiation_id: string; sdp: string; track_map?: TrackMap }
+  | { type: "ice_candidate"; session_id: string; negotiation_id: string; candidate: unknown }
   | { type: "share_request"; session_id: string; request_id: string; kind: MediaKind }
   | { type: "share_request_cancel"; session_id: string; request_id: string }
   | { type: "share_request_decision"; session_id: string; request_id: string; decision: "allow" | "deny" };
@@ -42,8 +43,9 @@ export type ServerMessage =
   | { type: "share_request_cancel"; session_id: string; request_id: string }
   | { type: "share_request_state"; session_id: string; request_id: string; kind: MediaKind; state: "ALLOWED" | "DENIED" | "CANCELLED" }
   | { type: "error"; code: string }
-  | { type: "offer" | "answer"; session_id: string; sdp: string; track_map?: TrackMap }
-  | { type: "ice_candidate"; session_id: string; candidate: unknown };
+  | { type: "offer"; session_id: string; negotiation_id: string; sdp: string; track_map?: TrackMap }
+  | { type: "answer"; session_id: string; negotiation_id: string; sdp: string; track_map?: TrackMap }
+  | { type: "ice_candidate"; session_id: string; negotiation_id: string; candidate: unknown };
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const SESSION_ID = /^[0-9a-f-]{36}$/i;
@@ -120,13 +122,28 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
         ? { type: "resume_session", session_id: item.session_id, epoch: item.epoch as number, capability: item.capability, request_id: item.request_id } : null;
     case "offer":
     case "answer":
-      return validSession(item.session_id) && string(item.sdp, MAX_SDP) &&
+      return validSession(item.session_id) &&
+        string(item.negotiation_id, 128) && ID.test(item.negotiation_id) &&
+        string(item.sdp, MAX_SDP) &&
         item.sdp.length <= MAX_SDP && validTrackMap(item.track_map)
-        ? { type: item.type, session_id: item.session_id, sdp: item.sdp, ...(item.track_map === undefined ? {} : { track_map: item.track_map }) } : null;
+        ? {
+          type: item.type,
+          session_id: item.session_id,
+          negotiation_id: item.negotiation_id,
+          sdp: item.sdp,
+          ...(item.track_map === undefined ? {} : { track_map: item.track_map }),
+        } : null;
     case "ice_candidate":
-      return validSession(item.session_id) && record(item.candidate) !== null &&
+      return validSession(item.session_id) &&
+        string(item.negotiation_id, 128) && ID.test(item.negotiation_id) &&
+        record(item.candidate) !== null &&
         JSON.stringify(item.candidate).length <= MAX_CANDIDATE
-        ? { type: "ice_candidate", session_id: item.session_id, candidate: item.candidate } : null;
+        ? {
+          type: "ice_candidate",
+          session_id: item.session_id,
+          negotiation_id: item.negotiation_id,
+          candidate: item.candidate,
+        } : null;
     case "share_request":
       return validSession(item.session_id) && string(item.request_id, 128) && ID.test(item.request_id) &&
         (item.kind === "screen" || item.kind === "camera")
@@ -260,14 +277,34 @@ export function parseServerMessage(value: unknown): ServerMessage | null {
         return exactKeys(item, ["type", "code"]) && string(item.code, 128) ? { type: "error", code: item.code } : null;
       case "offer":
       case "answer":
-        return exactKeys(item, item.track_map === undefined ? ["type", "session_id", "sdp"] : ["type", "session_id", "sdp", "track_map"]) &&
-          validSession(session) && string(item.sdp, MAX_SDP) && validTrackMap(item.track_map)
-          ? { type: item.type, session_id: session, sdp: item.sdp, ...(item.track_map === undefined ? {} : { track_map: item.track_map }) } : null;
+        return exactKeys(
+          item,
+          item.track_map === undefined
+            ? ["type", "session_id", "negotiation_id", "sdp"]
+            : ["type", "session_id", "negotiation_id", "sdp", "track_map"],
+        ) &&
+          validSession(session) &&
+          string(item.negotiation_id, 128) && ID.test(item.negotiation_id) &&
+          string(item.sdp, MAX_SDP) && validTrackMap(item.track_map)
+          ? {
+            type: item.type,
+            session_id: session,
+            negotiation_id: item.negotiation_id,
+            sdp: item.sdp,
+            ...(item.track_map === undefined ? {} : { track_map: item.track_map }),
+          } : null;
       case "ice_candidate":
-        return exactKeys(item, ["type", "session_id", "candidate"]) &&
-          validSession(session) && record(item.candidate) !== null &&
+        return exactKeys(item, ["type", "session_id", "negotiation_id", "candidate"]) &&
+          validSession(session) &&
+          string(item.negotiation_id, 128) && ID.test(item.negotiation_id) &&
+          record(item.candidate) !== null &&
           JSON.stringify(item.candidate).length <= MAX_CANDIDATE
-          ? { type: "ice_candidate", session_id: session, candidate: item.candidate } : null;
+          ? {
+            type: "ice_candidate",
+            session_id: session,
+            negotiation_id: item.negotiation_id,
+            candidate: item.candidate,
+          } : null;
       default:
         return null;
   }

@@ -692,6 +692,11 @@ test("signaling enforces offer/answer direction and routes valid messages", asyn
   const wsUrl = `ws://127.0.0.1:${address.port}/ws`;
   const owner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
   const viewer = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+  const diagnosticLogs: string[] = [];
+  const originalInfo = console.info;
+  console.info = (...values: unknown[]) => {
+    for (const value of values) if (typeof value === "string") diagnosticLogs.push(value);
+  };
 
   try {
     await Promise.all([waitForOpen(owner), waitForOpen(viewer)]);
@@ -728,23 +733,47 @@ test("signaling enforces offer/answer direction and routes valid messages", asyn
     const sessionId = createdSession?.session_id as string;
     assert.equal((await nextMessage(owner)).type, "viewer_joined");
 
-    owner.send(JSON.stringify({ type: "offer", session_id: sessionId, sdp: "v=0" }));
+    owner.send(JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "negotiation-1",
+      sdp: "v=0",
+    }));
     assert.equal((await nextMessage(viewer)).type, "offer");
-    viewer.send(JSON.stringify({ type: "offer", session_id: sessionId, sdp: "v=0" }));
+    viewer.send(JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "negotiation-1",
+      sdp: "v=0",
+    }));
     assert.equal((await nextMessage(viewer)).code, "WRONG_ROLE");
-    viewer.send(JSON.stringify({ type: "answer", session_id: sessionId, sdp: "v=0" }));
+    viewer.send(JSON.stringify({
+      type: "answer",
+      session_id: sessionId,
+      negotiation_id: "negotiation-1",
+      sdp: "v=0",
+    }));
     assert.equal((await nextMessage(owner)).type, "answer");
-    owner.send(JSON.stringify({ type: "answer", session_id: sessionId, sdp: "v=0" }));
+    owner.send(JSON.stringify({
+      type: "answer",
+      session_id: sessionId,
+      negotiation_id: "negotiation-1",
+      sdp: "v=0",
+    }));
     assert.equal((await nextMessage(owner)).code, "WRONG_ROLE");
     owner.send(JSON.stringify({
       type: "ice_candidate",
       session_id: sessionId,
-      candidate: { candidate: "owner" },
+      negotiation_id: "negotiation-1",
+      candidate: {
+        candidate: "candidate:1 1 UDP 2122260223 192.0.2.44 54400 typ relay ufrag private-token",
+      },
     }));
     assert.equal((await nextMessage(viewer)).type, "ice_candidate");
     viewer.send(JSON.stringify({
       type: "ice_candidate",
       session_id: sessionId,
+      negotiation_id: "negotiation-1",
       candidate: { candidate: "viewer" },
     }));
     assert.equal((await nextMessage(owner)).type, "ice_candidate");
@@ -768,7 +797,19 @@ test("signaling enforces offer/answer direction and routes valid messages", asyn
     assert.equal(sharingInactive?.type, "device_sharing_state");
     assert.equal(viewerLeft?.type, "viewer_left");
     assert.equal(await ownerClosed, 1008);
+    const relayLogs = diagnosticLogs.filter((line) =>
+      line.includes("offer_relayed") || line.includes("answer_relayed") || line.includes("ice_candidate_relayed"));
+    assert.ok(relayLogs.some((line) => line.includes('"event":"offer_relayed"')));
+    assert.ok(relayLogs.some((line) => line.includes('"event":"answer_relayed"')));
+    assert.ok(relayLogs.some((line) =>
+      line.includes('"event":"ice_candidate_relayed"') && line.includes('"candidateType":"relay"')));
+    const serializedRelayLogs = relayLogs.join("\n");
+    assert.equal(serializedRelayLogs.includes("192.0.2.44"), false);
+    assert.equal(serializedRelayLogs.includes("private-token"), false);
+    assert.equal(serializedRelayLogs.includes("candidate:1"), false);
+    assert.equal(serializedRelayLogs.includes("v=0"), false);
   } finally {
+    console.info = originalInfo;
     owner.close();
     viewer.close();
     await server.app.close();
@@ -869,17 +910,28 @@ test("overlapping owner reconnect replaces the stale socket and resumes the same
     assert.equal(await ownerClosed, 1008);
 
     const recoveredOffer = nextMessage(viewer);
-    ownerAgain.send(JSON.stringify({ type: "offer", session_id: sessionId, sdp: "recovery-offer" }));
+    ownerAgain.send(JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "recovery-negotiation",
+      sdp: "recovery-offer",
+    }));
     assert.deepEqual(await recoveredOffer, {
       type: "offer",
       session_id: sessionId,
+      negotiation_id: "recovery-negotiation",
       sdp: "recovery-offer",
     });
     await new Promise((resolve) => setImmediate(resolve));
     viewer.off("message", collectViewerMessages);
     assert.deepEqual(viewerMessages, [
       ownerRecovery,
-      { type: "offer", session_id: sessionId, sdp: "recovery-offer" },
+      {
+        type: "offer",
+        session_id: sessionId,
+        negotiation_id: "recovery-negotiation",
+        sdp: "recovery-offer",
+      },
     ]);
 
     const viewerClosed = waitForClose(viewer);
@@ -1067,10 +1119,16 @@ test("fresh authorized viewer replacement attaches to the existing session witho
     await assertNoMessage(owner);
 
     const replacementOffer = nextMessage(replacementViewer);
-    owner.send(JSON.stringify({ type: "offer", session_id: sessionId, sdp: "reattach-offer" }));
+    owner.send(JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "reattach-negotiation",
+      sdp: "reattach-offer",
+    }));
     assert.deepEqual(await replacementOffer, {
       type: "offer",
       session_id: sessionId,
+      negotiation_id: "reattach-negotiation",
       sdp: "reattach-offer",
     });
   } finally {

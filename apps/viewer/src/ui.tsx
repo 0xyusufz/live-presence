@@ -170,7 +170,12 @@ export function ViewerApp(): JSX.Element {
       onDiagnostic: (diagnostic) => {
         const log = "operationStatus" in diagnostic && diagnostic.operationStatus === "failed"
           ? console.warn
-          : "event" in diagnostic && (diagnostic.event === "recovery" || diagnostic.event === "peer")
+          : "event" in diagnostic && (
+            diagnostic.event === "recovery" ||
+            diagnostic.event === "peer_connection_state_changed" ||
+            diagnostic.event === "ice_connection_state_changed" ||
+            diagnostic.event === "signaling_state_changed"
+          )
             ? console.info
             : console.debug;
         log("[viewer-webrtc]", diagnostic);

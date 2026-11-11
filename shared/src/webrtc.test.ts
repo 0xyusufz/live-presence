@@ -9,6 +9,8 @@ import {
 } from "./webrtc.js";
 import { validTrackMap, type TrackMap } from "./protocol.js";
 
+const NEGOTIATION_ID = "test-negotiation-1";
+
 class MockConnection implements WebRtcPeerConnection {
   transceivers: WebRtcTransceiver[] = [];
   connectionState = "new";
@@ -18,6 +20,7 @@ class MockConnection implements WebRtcPeerConnection {
   ontrack: WebRtcPeerConnection["ontrack"] = null;
   onconnectionstatechange: (() => void) | null = null;
   oniceconnectionstatechange: (() => void) | null = null;
+  onsignalingstatechange: (() => void) | null = null;
   closed = false;
   remote: unknown;
   local: unknown;
@@ -122,13 +125,48 @@ test("owner creates fixed sendonly transceivers and exchanges offer/answer and I
   await assert.rejects(() => peer.addIceCandidate({ candidate: "after-close" }), /closed/);
 });
 
+test("WebRTC diagnostics report transitions and candidate type without sensitive payloads", async () => {
+  const connection = new MockConnection();
+  const diagnostics: WebRtcDiagnostic[] = [];
+  const sensitiveCandidate = {
+    candidate: "candidate:1 1 UDP 2122260223 192.0.2.44 54400 typ relay ufrag private-token",
+  };
+  const peer = new WebRtcPeer("owner", "session-safe", () => connection, () => undefined, NEGOTIATION_ID);
+  peer.setDiagnosticListener((diagnostic) => diagnostics.push(diagnostic));
+  await peer.createOffer();
+  await peer.acceptAnswer("answer");
+  connection.connectionState = "disconnected";
+  connection.onconnectionstatechange?.();
+  await peer.createOffer({ iceRestart: true });
+  connection.onicecandidate?.({ candidate: sensitiveCandidate });
+  connection.connectionState = "connected";
+  connection.onconnectionstatechange?.();
+  connection.iceConnectionState = "connected";
+  connection.oniceconnectionstatechange?.();
+  connection.signalingState = "have-local-offer";
+  connection.onsignalingstatechange?.();
+
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.event === "ice_restart_offer_created"));
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.event === "ice_restart_offer_sent"));
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.event === "ice_candidate_sent" &&
+    diagnostic.candidateType === "relay"));
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.event === "peer_connection_state_changed"));
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.event === "ice_connection_state_changed"));
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.event === "signaling_state_changed"));
+  const serialized = JSON.stringify(diagnostics);
+  assert.equal(serialized.includes("192.0.2.44"), false);
+  assert.equal(serialized.includes("private-token"), false);
+  assert.equal(serialized.includes("candidate:1"), false);
+  assert.equal(serialized.includes("sdp"), false);
+});
+
 test("viewer relies on remote offer sections to create and negotiate recvonly transceivers", async () => {
   const connection = new MockConnection();
   const messages: unknown[] = [];
   const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => messages.push(message));
   assert.equal(connection.transceivers.length, 0);
   assert.equal(connection.signalingState, "stable");
-  await peer.acceptOffer("offer", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }]);
+  await peer.acceptOffer("offer", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }], NEGOTIATION_ID);
   assert.equal(connection.signalingState, "stable");
   assert.equal(connection.transceivers.length, 2);
   assert.deepEqual(connection.transceivers.map((tx) => tx.direction), ["recvonly", "recvonly"]);
@@ -167,7 +205,7 @@ test("viewer processes a two-media-section desktop offer and preserves canonical
   await peer.acceptOffer(sdp, [
     { mid: "0", kind: "screen" },
     { mid: "1", kind: "camera" },
-  ]);
+  ], NEGOTIATION_ID);
 
   assert.equal(connection.transceivers.length, 2);
   assert.deepEqual(connection.transceivers.map((tx) => tx.mid), ["0", "1"]);
@@ -176,6 +214,7 @@ test("viewer processes a two-media-section desktop offer and preserves canonical
   assert.deepEqual(messages, [{
     type: "answer",
     session_id: "session",
+    negotiation_id: peer.negotiationId,
     sdp: "answer",
     track_map: [
       { mid: "0", kind: "screen" },
@@ -196,16 +235,17 @@ test("viewer sends exactly one answer for a valid offer, including concurrent du
     { mid: "1", kind: "camera" },
   ];
 
-  const first = peer.acceptOffer("valid-offer", trackMap);
-  const duplicate = peer.acceptOffer("valid-offer", trackMap);
+  const first = peer.acceptOffer("valid-offer", trackMap, NEGOTIATION_ID);
+  const duplicate = peer.acceptOffer("valid-offer", trackMap, NEGOTIATION_ID);
   await Promise.all([first, duplicate]);
-  await peer.acceptOffer("valid-offer", trackMap);
+  await peer.acceptOffer("valid-offer", trackMap, NEGOTIATION_ID);
 
   const answers = messages.filter((message) => (message as { type: string }).type === "answer");
   assert.equal(answers.length, 1);
   assert.deepEqual(answers[0], {
     type: "answer",
     session_id: "session",
+    negotiation_id: peer.negotiationId,
     sdp: "answer",
     track_map: trackMap,
   });
@@ -258,7 +298,7 @@ test("viewer answer pipeline reports the exact failed SDP or signaling operation
         () => peer.acceptOffer("valid-offer", [
           { mid: "0", kind: "screen" },
           { mid: "1", kind: "camera" },
-        ]),
+        ], NEGOTIATION_ID),
         item.message,
       );
       assert.ok(diagnostics.some((diagnostic) =>
@@ -277,7 +317,7 @@ test("viewer maps early remote tracks by negotiated mid after validating the off
   await peer.acceptOffer("offer", [
     { mid: "0", kind: "screen" },
     { mid: "1", kind: "camera" },
-  ]);
+  ], NEGOTIATION_ID);
 
   assert.deepEqual(received, [{ mid: "1", kind: "camera" }]);
   peer.close();
@@ -296,8 +336,15 @@ test("offer and answer state transitions reject wrong, duplicate, and out-of-ord
   const viewerConnection = new MockConnection();
   const viewer = new WebRtcPeer("viewer", "session", () => viewerConnection, () => undefined);
   await assert.rejects(() => viewer.createOffer(), /current state/);
-  await viewer.acceptOffer("offer", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }]);
-  await assert.rejects(() => viewer.acceptOffer("offer-2", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }]), /current state/);
+  await viewer.acceptOffer(
+    "offer",
+    [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    NEGOTIATION_ID,
+  );
+  await assert.rejects(
+    () => viewer.acceptOffer("offer-2", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }], NEGOTIATION_ID),
+    /current state/,
+  );
 });
 
 test("terminal peer failure rejects later negotiation operations", async () => {
@@ -370,7 +417,11 @@ test("track map validation rejects missing, duplicate, and reordered identities"
 test("viewer rejects a valid-shaped track map with incorrect negotiated mids", async () => {
   const peer = new WebRtcPeer("viewer", "session", () => new MockConnection(), () => undefined);
   await assert.rejects(
-    () => peer.acceptOffer("offer", [{ mid: "1", kind: "screen" }, { mid: "0", kind: "camera" }]),
+    () => peer.acceptOffer(
+      "offer",
+      [{ mid: "1", kind: "screen" }, { mid: "0", kind: "camera" }],
+      NEGOTIATION_ID,
+    ),
     /does not match/,
   );
 });
@@ -384,7 +435,14 @@ test("owner and viewer complete a bounded ICE restart after initial negotiation"
   const viewer = new WebRtcPeer("viewer", "session", () => viewerConnection, (message) => viewerMessages.push(message));
 
   await owner.createOffer();
-  await viewer.acceptOffer("offer", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }]);
+  const negotiationId = owner.negotiationId;
+  assert.ok(negotiationId);
+  await viewer.acceptOffer(
+    "offer",
+    [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    negotiationId,
+  );
+  assert.equal((viewerMessages[0] as { negotiation_id: string }).negotiation_id, negotiationId);
   await owner.acceptAnswer("answer");
   ownerConnection.connectionState = "disconnected";
   ownerConnection.onconnectionstatechange?.();
@@ -392,12 +450,20 @@ test("owner and viewer complete a bounded ICE restart after initial negotiation"
   viewerConnection.onconnectionstatechange?.();
 
   await owner.createOffer({ iceRestart: true });
-  const restartOffer = ownerMessages.at(-1) as { sdp: string; track_map: [{ mid: string; kind: "screen" }, { mid: string; kind: "camera" }] };
-  await viewer.acceptOffer(restartOffer.sdp, restartOffer.track_map);
+  const restartOffer = ownerMessages.at(-1) as {
+    sdp: string;
+    negotiation_id: string;
+    track_map: [{ mid: string; kind: "screen" }, { mid: string; kind: "camera" }];
+  };
+  assert.equal(restartOffer.negotiation_id, negotiationId);
+  await viewer.acceptOffer(restartOffer.sdp, restartOffer.track_map, restartOffer.negotiation_id);
   const restartAnswer = viewerMessages.at(-1) as { sdp: string };
   await owner.acceptAnswer(restartAnswer.sdp);
   assert.equal(owner.state, "disconnected");
-  await assert.rejects(() => viewer.acceptOffer("duplicate", restartOffer.track_map), /current state/);
+  await assert.rejects(
+    () => viewer.acceptOffer("duplicate", restartOffer.track_map, restartOffer.negotiation_id),
+    /current state/,
+  );
 });
 
 test("owner can make a second restart after the first offer is abandoned", async () => {
@@ -419,10 +485,10 @@ test("viewer accepts restart only after recovery and rejects it while answering"
   const connection = new MockConnection();
   const viewer = new WebRtcPeer("viewer", "session", () => connection, () => undefined);
   const trackMap: TrackMap = [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }];
-  await viewer.acceptOffer("offer", trackMap);
-  await assert.rejects(() => viewer.acceptOffer("restart", trackMap), /current state/);
+  await viewer.acceptOffer("offer", trackMap, NEGOTIATION_ID);
+  await assert.rejects(() => viewer.acceptOffer("restart", trackMap, NEGOTIATION_ID), /current state/);
   connection.connectionState = "failed";
   connection.onconnectionstatechange?.();
-  await viewer.acceptOffer("restart", trackMap);
-  await assert.rejects(() => viewer.acceptOffer("duplicate", trackMap), /current state/);
+  await viewer.acceptOffer("restart", trackMap, NEGOTIATION_ID);
+  await assert.rejects(() => viewer.acceptOffer("duplicate", trackMap, NEGOTIATION_ID), /current state/);
 });

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { parseClientMessage, parseServerMessage, type ClientMessage } from "../../../../shared/src/protocol.js";
 import type { WebRtcConfiguration } from "../../../../shared/src/webrtc.js";
@@ -17,11 +16,13 @@ export class MainSignalingTransport {
   private authenticated = false;
   private connectInFlight: Promise<void> | undefined;
   private generation = 0;
+  private socketConnectionGeneration = 0;
   private authenticatedDeviceId: string | undefined;
   private lastHeartbeatAckAt = 0;
   private heartbeatSentCount = 0;
   private heartbeatAckCount = 0;
   private activeSessionId: string | undefined;
+  private activeRecoveryAttemptId: string | undefined;
 
   get deviceId(): string | undefined { return this.authenticatedDeviceId; }
 
@@ -63,6 +64,7 @@ export class MainSignalingTransport {
       handshakeTimeout: 10_000,
       maxPayload: 128 * 1024,
     });
+    const socketConnectionGeneration = ++this.socketConnectionGeneration;
     this.socket = socket;
     socket.once("open", () => {
       if (this.socket !== socket) return;
@@ -95,27 +97,34 @@ export class MainSignalingTransport {
         this.heartbeatAckCount = 0;
         console.info(JSON.stringify({
           source: "desktop-main",
-          event: "signaling-authenticated",
+          event: "owner_authentication_completed",
+          timestamp: new Date(this.now()).toISOString(),
           deviceId: this.authenticatedDeviceId,
+          socketConnectionGeneration,
           signalingState: "open",
         }));
-        this.emit({ type: "open" });
+        this.emit({ type: "open", connectionGeneration: socketConnectionGeneration });
         if (!this.stopHeartbeat) {
           this.stopHeartbeat = this.scheduleHeartbeat(() => {
             if (this.socket === socket && this.authenticated && socket.readyState === WebSocket.OPEN) {
               if (this.now() - this.lastHeartbeatAckAt >= this.heartbeatIntervalMs * 2) {
                 console.warn(JSON.stringify({
                   source: "desktop-main",
-                  event: "signaling-heartbeat-timeout",
+                  event: "heartbeat_timeout",
+                  timestamp: new Date(this.now()).toISOString(),
                   deviceId: this.authenticatedDeviceId,
+                  socketConnectionGeneration,
                   signalingState: "open",
                   sent: false,
                   category: "signaling-timeout",
+                  reason: "no heartbeat acknowledgement within two heartbeat intervals",
                   sessionId: this.activeSessionId,
                   heartbeatSentCount: this.heartbeatSentCount,
                   heartbeatAckCount: this.heartbeatAckCount,
                   lastHeartbeatAckAgeMs: this.now() - this.lastHeartbeatAckAt,
-                  recoveryAttemptId: randomUUID(),
+                  ...(this.activeRecoveryAttemptId
+                    ? { recoveryAttemptId: this.activeRecoveryAttemptId }
+                    : {}),
                 }));
                 socket.terminate();
                 return;
@@ -123,14 +132,19 @@ export class MainSignalingTransport {
               try {
                 socket.send(JSON.stringify({ type: "heartbeat" }));
                 this.heartbeatSentCount += 1;
-                console.debug(JSON.stringify({
-                  source: "desktop-main",
-                  event: "signaling-heartbeat-sent",
-                  deviceId: this.authenticatedDeviceId,
-                  sessionId: this.activeSessionId,
-                  signalingState: "open",
-                  heartbeatSentCount: this.heartbeatSentCount,
-                }));
+                if (this.heartbeatSentCount === 1 || this.heartbeatSentCount % 10 === 0) {
+                  console.debug(JSON.stringify({
+                    source: "desktop-main",
+                    event: "heartbeat_sent",
+                    timestamp: new Date(this.now()).toISOString(),
+                    deviceId: this.authenticatedDeviceId,
+                    sessionId: this.activeSessionId,
+                    recoveryAttemptId: this.activeRecoveryAttemptId,
+                    socketConnectionGeneration,
+                    signalingState: "open",
+                    heartbeatSentCount: this.heartbeatSentCount,
+                  }));
+                }
               } catch {
                 socket.terminate();
               }
@@ -142,18 +156,28 @@ export class MainSignalingTransport {
         const previousAckAt = this.lastHeartbeatAckAt;
         this.lastHeartbeatAckAt = this.now();
         this.heartbeatAckCount += 1;
-        console.info(JSON.stringify({
-          source: "desktop-main",
-          event: "signaling-heartbeat-ack-received",
-          deviceId: this.authenticatedDeviceId,
-          sessionId: this.activeSessionId,
-          signalingState: "open",
-          heartbeatAckCount: this.heartbeatAckCount,
-          heartbeatAckIntervalMs: previousAckAt ? this.lastHeartbeatAckAt - previousAckAt : undefined,
-        }));
+        if (this.heartbeatAckCount === 1 || this.heartbeatAckCount % 10 === 0) {
+          console.info(JSON.stringify({
+            source: "desktop-main",
+            event: "heartbeat_ack_received",
+            timestamp: new Date(this.now()).toISOString(),
+            deviceId: this.authenticatedDeviceId,
+            sessionId: this.activeSessionId,
+            recoveryAttemptId: this.activeRecoveryAttemptId,
+            socketConnectionGeneration,
+            signalingState: "open",
+            heartbeatAckCount: this.heartbeatAckCount,
+            heartbeatAckIntervalMs: previousAckAt ? this.lastHeartbeatAckAt - previousAckAt : undefined,
+          }));
+        }
       }
       if (message.type === "viewer_joined" || message.type === "session_recovery") {
         this.activeSessionId = message.session_id;
+        if (message.type === "session_recovery") {
+          this.activeRecoveryAttemptId = message.recovery_attempt_id;
+        } else {
+          this.activeRecoveryAttemptId = undefined;
+        }
       }
       this.emit({ type: "message", data: JSON.stringify(message) });
     });
@@ -164,9 +188,12 @@ export class MainSignalingTransport {
       if (this.socket !== socket) return;
       console.warn(JSON.stringify({
         source: "desktop-main",
-        event: "signaling-socket-closed",
+        event: "websocket_closed",
+        timestamp: new Date(this.now()).toISOString(),
         deviceId: this.authenticatedDeviceId,
         sessionId: this.activeSessionId,
+        recoveryAttemptId: this.activeRecoveryAttemptId,
+        socketConnectionGeneration,
         signalingState: "closed",
         closeCode: code,
         authenticated: this.authenticated,
@@ -177,7 +204,7 @@ export class MainSignalingTransport {
           : undefined,
       }));
       this.cleanup(socket);
-      this.emit({ type: "close", code });
+      this.emit({ type: "close", code, connectionGeneration: socketConnectionGeneration });
     });
   }
 
@@ -204,7 +231,10 @@ export class MainSignalingTransport {
         sharingState: { screen: message.screen, camera: message.camera },
         sent: true,
       }));
-      if (!message.screen) this.activeSessionId = undefined;
+      if (!message.screen) {
+        this.activeSessionId = undefined;
+        this.activeRecoveryAttemptId = undefined;
+      }
     }
     if (message.type === "offer" || message.type === "ice_candidate") {
       this.activeSessionId = message.session_id;
@@ -248,7 +278,11 @@ export class MainSignalingTransport {
     if (socket) {
       this.cleanup(socket);
       socket.close();
-      this.emit({ type: "close", code: 1000 });
+      this.emit({
+        type: "close",
+        code: 1000,
+        connectionGeneration: this.socketConnectionGeneration,
+      });
     }
   }
 
@@ -259,6 +293,7 @@ export class MainSignalingTransport {
     this.authenticatedDeviceId = undefined;
     this.lastHeartbeatAckAt = 0;
     this.activeSessionId = undefined;
+    this.activeRecoveryAttemptId = undefined;
     this.socket = undefined;
   }
 

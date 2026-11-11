@@ -38,6 +38,7 @@ function makeSocket(): SignalingSocket {
       unsubscribe ??= window.livePresence.onSocketEvent((event) => {
         if (event.type === "open") {
           readyState = 1;
+          socket.connectionGeneration = event.connectionGeneration;
           socket.onopen?.();
         } else if (event.type === "message") {
           socket.onmessage?.({ data: event.data });
@@ -166,6 +167,7 @@ function ShareWindow(): JSX.Element {
         console.info(JSON.stringify({
           source: "desktop-renderer",
           event: diagnostic.event,
+          timestamp: diagnostic.timestamp,
           deviceId: diagnostic.deviceId,
           lifecycle: diagnostic.lifecycle,
           signalingState: diagnostic.signalingState,
@@ -174,9 +176,15 @@ function ShareWindow(): JSX.Element {
           category: diagnostic.category,
           recoveryAttemptId: diagnostic.recoveryAttemptId,
           recoveryPhase: diagnostic.recoveryPhase,
-          originalError: diagnostic.event === "failure" || diagnostic.event === "signaling"
-            ? diagnostic.message
-            : undefined,
+          peerGeneration: diagnostic.peerGeneration,
+          negotiationId: diagnostic.negotiationId,
+          socketConnectionGeneration: diagnostic.socketConnectionGeneration,
+          peerState: diagnostic.peerState,
+          iceState: diagnostic.iceState,
+          candidateType: diagnostic.candidateType,
+          messageType: diagnostic.messageType,
+          attempt: diagnostic.attempt,
+          reason: diagnostic.reason,
           sessionId: diagnostic.sessionId,
           peer: diagnostic.peer,
         }));

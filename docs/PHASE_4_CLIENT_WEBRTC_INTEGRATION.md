@@ -72,6 +72,17 @@ Restarting ICE does not grant consent or start capture. Server restart or
 revocation invalidates in-memory sessions and requires fresh authenticated
 control-plane state.
 
+Offer, answer, and ICE-candidate signaling includes a required opaque
+`negotiation_id`. The owner creates a new identifier for each peer connection;
+the viewer adopts it from the offer and echoes it with its answer and ICE
+candidates. ICE restart on the same peer retains that identifier. Receivers
+ignore signaling for a different negotiation, preventing delayed messages
+from an old peer from being applied after same-session peer replacement. This
+is a wire-protocol compatibility change: desktop, viewer, and signaling server
+components must be upgraded together. Mixed versions can reject or drop
+signaling messages because older clients do not send the required identifier
+and newer clients require it.
+
 Initial ICE negotiation is bounded by a 30-second client-side timeout. If the
 browser remains in a pending negotiating state without reaching a connected
 state, the client reports terminal failure, closes the peer and signaling

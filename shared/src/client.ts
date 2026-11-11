@@ -5,6 +5,7 @@ import {
   type TrackMap,
 } from "./protocol.js";
 import {
+  candidateTypeFromCandidate,
   WebRtcPeer,
   WebRtcPeerError,
   type PeerState,
@@ -25,13 +26,76 @@ export type ClientLifecycleState =
   | "CLOSED"
   | "FAILED";
 
+export type ClientSignalingDiagnostic = {
+  event:
+    | "websocket_closed"
+    | "reconnect_attempt_started"
+    | "websocket_reconnected"
+    | "owner_authentication_completed"
+    | "session_recovery_received"
+    | "recovery_attempt_queued"
+    | "recovery_attempt_started"
+    | "ice_restart_answer_received"
+    | "ice_restart_answer_applied"
+    | "ice_candidate_received"
+    | "ice_candidate_rejected"
+    | "offer_received"
+    | "answer_received"
+    | "answer_applied"
+    | "signaling_message_rejected"
+    | "lifecycle_changed";
+  timestamp: string;
+  deviceId?: string;
+  sessionId?: string;
+  recoveryAttemptId?: string;
+  peerGeneration?: number;
+  negotiationId?: string;
+  socketConnectionGeneration?: number;
+  reason?: string;
+  peerState?: PeerState;
+  iceState?: string;
+  messageType?: string;
+  candidateType?: WebRtcDiagnostic["candidateType"];
+  attempt?: number;
+  lifecycle?: ClientLifecycleState;
+};
+
 export type DesktopDiagnostic = {
-  event: "lifecycle" | "peer" | "failure" | "sharing-state" | "signaling" | "recovery";
+  event:
+    | "lifecycle"
+    | "peer"
+    | "failure"
+    | "sharing-state"
+    | "signaling"
+    | "recovery"
+    | "recovery_started"
+    | "signaling_reconnected"
+    | "session_recovery_received"
+    | "ice_restart_started"
+    | "ice_restart_failed"
+    | "ice_restart_retry_scheduled"
+    | "recovery_completed"
+    | "recovery_timed_out"
+    | ClientSignalingDiagnostic["event"]
+    | NonNullable<WebRtcDiagnostic["event"]>
+    | "ice_configuration_refresh_started"
+    | "ice_configuration_refresh_completed"
+    | "ice_configuration_refresh_failed";
+  timestamp?: string;
   lifecycle: ClientLifecycleState;
   deviceId?: string;
   sessionId?: string;
   recoveryAttemptId?: string;
   recoveryPhase?: string;
+  peerGeneration?: number;
+  negotiationId?: string;
+  socketConnectionGeneration?: number;
+  peerState?: PeerState;
+  iceState?: string;
+  candidateType?: WebRtcDiagnostic["candidateType"];
+  messageType?: string;
+  attempt?: number;
+  reason?: string;
   signalingState?: "connecting" | "open" | "closed" | "not-connected";
   sharingState?: { screen: boolean; camera: boolean };
   sent?: boolean;
@@ -43,14 +107,19 @@ export type DesktopDiagnostic = {
 export type RecoveryDiagnostic = {
   event: "recovery";
   phase: string;
+  timestamp?: string;
   recoveryAttemptId: string;
   sessionId?: string;
+  peerGeneration?: number;
+  negotiationId?: string;
+  socketConnectionGeneration?: number;
   signalingState?: "connecting" | "open" | "closed" | "not-connected";
   peer?: WebRtcDiagnostic;
 };
 
 export interface SignalingSocket {
   readyState: number;
+  connectionGeneration?: number;
   authenticationManaged?: boolean;
   connect?: () => void;
   send(data: string): void | Promise<void>;
@@ -130,7 +199,9 @@ export abstract class WebRtcClient {
   private initialNegotiationTimer: ReturnType<typeof setTimeout> | undefined;
   private recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   protected peerGeneration = 0;
+  protected socketConnectionGeneration = 0;
   protected recoveryAttemptId: string | undefined;
+  protected readonly pendingIceCandidatesByNegotiation = new Map<string, unknown[]>();
   private readonly reconnectOptions: Required<Omit<ReconnectOptions, "scheduler">>;
   protected readonly clientScheduler: ClientScheduler;
   onRemoteTrack: ((track: WebRtcTrack, mid: string | null, kind?: "screen" | "camera") => void) | undefined;
@@ -160,7 +231,12 @@ export abstract class WebRtcClient {
     if (this.terminal && !["FAILED", "CLOSING", "CLOSED"].includes(value)) return;
     if (this.closing && !["CLOSING", "CLOSED"].includes(value)) return;
     if (this.lifecycleValue === value) return;
+    const previous = this.lifecycleValue;
     this.lifecycleValue = value;
+    this.reportClientDiagnostic("lifecycle_changed", {
+      reason: `${previous} -> ${value}`,
+      lifecycle: value,
+    });
     this.onLifecycleChange(value);
   }
 
@@ -172,6 +248,7 @@ export abstract class WebRtcClient {
     if (this.closing || this.terminal || this.socket) return;
     this.setLifecycle(this.peer && this.sessionId ? "RECONNECTING" : "CONNECTING");
     const socket = this.socketFactory();
+    this.socketConnectionGeneration = socket.connectionGeneration ?? this.socketConnectionGeneration + 1;
     this.socket = socket;
     this.signalingAuthenticated = false;
     socket.onopen = () => {
@@ -199,8 +276,7 @@ export abstract class WebRtcClient {
         } catch (error) {
           handleFailure(error);
         }
-      }
-      else this.fail(new Error("Received malformed signaling message"), "signaling");
+      } else this.fail(new Error("Received malformed signaling message"), "signaling");
     };
     socket.onerror = () => {
       if (this.socket !== socket) return;
@@ -215,6 +291,9 @@ export abstract class WebRtcClient {
       this.clearStableTimer();
       if (!this.closing) {
         if (preservePeer && !this.terminal) this.beginRecovery();
+        this.reportClientDiagnostic("websocket_closed", {
+          reason: `socket close code ${event?.code ?? "unknown"}`,
+        });
         this.onSocketClosed(event?.code);
         if (event?.code === 1008) {
           this.markTerminal();
@@ -244,11 +323,23 @@ export abstract class WebRtcClient {
     sessionId: string,
     configuration?: WebRtcConfiguration,
     initialNegotiationTimeoutMs: number | null = INITIAL_NEGOTIATION_TIMEOUT_MS,
+    negotiationId?: string,
   ): WebRtcPeer {
     this.closePeer();
-    const peer = new WebRtcPeer(role, sessionId, () => this.peerFactory(configuration), (message) => this.send(message));
+    const peer = new WebRtcPeer(
+      role,
+      sessionId,
+      () => this.peerFactory(configuration),
+      (message) => this.send(message),
+      negotiationId,
+    );
     peer.setStateListener((state) => this.onPeerState(state));
-    peer.setDiagnosticListener((diagnostic) => this.onPeerDiagnostic(diagnostic));
+    peer.setDiagnosticListener((diagnostic) => this.onPeerDiagnostic({
+      ...diagnostic,
+      peerGeneration: this.peerGeneration,
+      ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
+      socketConnectionGeneration: this.socketConnectionGeneration,
+    }));
     peer.setFailureListener((error) => this.fail(error));
     peer.setRemoteTrackListener((track, mid, kind) => this.onRemoteTrack?.(track, mid, kind));
     this.peer = peer;
@@ -309,6 +400,19 @@ export abstract class WebRtcClient {
       ) return;
       this.signalingAuthenticated = true;
       this.startStableTimer();
+      this.onSignalingAuthenticated();
+      if (message.role === "owner") {
+        this.reportClientDiagnostic("owner_authentication_completed", {
+          reason: "authenticated message processed by shared signaling client",
+          messageType: "authenticated",
+        });
+        if (this.socketConnectionGeneration > 1) {
+          this.reportClientDiagnostic("websocket_reconnected", {
+            reason: "replacement signaling socket authenticated",
+            messageType: "authenticated",
+          });
+        }
+      }
       if (this.peer?.state === "connected") {
         this.completeRecovery();
         this.setLifecycle("CONNECTED");
@@ -324,22 +428,117 @@ export abstract class WebRtcClient {
     } else if (message.type === "session_resumed") {
       this.onSessionResumed(message);
     } else if (message.type === "session_recovery") {
+      this.reportClientDiagnostic("session_recovery_received", {
+        sessionId: message.session_id,
+        recoveryAttemptId: message.recovery_attempt_id,
+        messageType: message.type,
+      });
       this.onSessionRecovery(message);
     } else if (message.type === "offer" || message.type === "answer" || message.type === "ice_candidate") {
       if (message.session_id !== this.sessionId || !this.peer) {
+        this.reportClientDiagnostic("signaling_message_rejected", {
+          sessionId: message.session_id,
+          negotiationId: message.negotiation_id,
+          messageType: message.type,
+          reason: !this.peer ? "no active peer" : "session ID did not match active session",
+        });
         this.fail(new Error("Signaling message did not match the active session"), "signaling");
         return;
       }
-      if (message.type === "offer") {
-        if (!message.track_map) {
-          return this.fail(new Error("Signaling offer is missing its track map"), "signaling");
+      let peer = this.peer;
+      if (
+        message.type === "offer" &&
+        peer.negotiationId !== undefined &&
+        message.negotiation_id !== peer.negotiationId
+      ) {
+        if (!this.replacePeerForNegotiation(message)) return;
+        peer = this.peer!;
+      }
+      if (message.type === "ice_candidate" && peer.negotiationId === undefined) {
+        this.queueIceCandidate(message.negotiation_id, message.candidate);
+        return;
+      }
+      if (message.type !== "offer" && message.negotiation_id !== peer.negotiationId) {
+        if (
+          message.type === "ice_candidate" &&
+          this.shouldBufferCandidateForNegotiation(message.negotiation_id)
+        ) {
+          this.reportClientDiagnostic("ice_candidate_received", {
+            messageType: message.type,
+            negotiationId: message.negotiation_id,
+            candidateType: candidateTypeFromCandidate(message.candidate),
+            reason: "candidate buffered until matching offer",
+          });
+          this.queueIceCandidate(message.negotiation_id, message.candidate);
+          return;
         }
-        await this.peer.acceptOffer(message.sdp, message.track_map);
-      } else if (message.type === "answer") {
-        await this.peer.acceptAnswer(message.sdp);
+        if (message.type === "ice_candidate") {
+          this.reportClientDiagnostic("ice_candidate_rejected", {
+            messageType: message.type,
+            negotiationId: message.negotiation_id,
+            candidateType: candidateTypeFromCandidate(message.candidate),
+            reason: "negotiation ID did not match active peer",
+          });
+        } else {
+          this.reportClientDiagnostic("signaling_message_rejected", {
+            messageType: message.type,
+            negotiationId: message.negotiation_id,
+            reason: "negotiation ID did not match active peer",
+          });
+        }
+        this.onRecoveryDiagnostic(
+          "stale_negotiation_signaling_ignored",
+          message.negotiation_id,
+          message.session_id,
+        );
+        return;
+      }
+      const peerGeneration = this.peerGeneration;
+      const restartAnswer = message.type === "answer" && peer.restartOfferPending;
+      try {
+        if (message.type === "offer") {
+          this.reportClientDiagnostic("offer_received", {
+            messageType: message.type,
+            negotiationId: message.negotiation_id,
+          });
+          if (!message.track_map) {
+            return this.fail(new Error("Signaling offer is missing its track map"), "signaling");
+          }
+          await peer.acceptOffer(message.sdp, message.track_map, message.negotiation_id);
+          await this.flushIceCandidates(message.negotiation_id, peer);
+        } else if (message.type === "answer") {
+          this.reportClientDiagnostic(
+            restartAnswer ? "ice_restart_answer_received" : "answer_received",
+            { messageType: message.type, negotiationId: message.negotiation_id },
+          );
+          await peer.acceptAnswer(message.sdp);
+        } else if (message.type === "ice_candidate") {
+          this.reportClientDiagnostic("ice_candidate_received", {
+            messageType: message.type,
+            negotiationId: message.negotiation_id,
+            candidateType: candidateTypeFromCandidate(message.candidate),
+          });
+          await peer.addIceCandidate(message.candidate);
+        }
+      } catch (error) {
+        if (this.peer !== peer || this.peerGeneration !== peerGeneration) return;
+        if (message.type === "ice_candidate") {
+          this.reportClientDiagnostic("ice_candidate_rejected", {
+            messageType: message.type,
+            negotiationId: message.negotiation_id,
+            candidateType: candidateTypeFromCandidate(message.candidate),
+            reason: "candidate could not be applied",
+          });
+        }
+        throw error;
+      }
+      if (this.peer !== peer || this.peerGeneration !== peerGeneration) return;
+      if (message.type === "answer") {
+        this.reportClientDiagnostic(
+          restartAnswer ? "ice_restart_answer_applied" : "answer_applied",
+          { messageType: message.type, negotiationId: message.negotiation_id },
+        );
         this.onAnswerApplied();
-      } else if (message.type === "ice_candidate") {
-        await this.peer.addIceCandidate(message.candidate);
       }
     } else if (message.type === "viewer_left" && message.session_id === this.sessionId) {
       if (message.reason === "temporary_disconnect") {
@@ -357,6 +556,32 @@ export abstract class WebRtcClient {
       this.markTerminal();
       this.fail(new Error(`Signaling server rejected the session (${message.code})`), "signaling");
       this.socket?.close();
+    }
+  }
+
+  private queueIceCandidate(negotiationId: string, candidate: unknown): void {
+    let queued = this.pendingIceCandidatesByNegotiation.get(negotiationId);
+    if (!queued) {
+      if (this.pendingIceCandidatesByNegotiation.size >= 16) {
+        this.fail(new Error("ICE negotiation queue is full"), "signaling");
+        return;
+      }
+      queued = [];
+    }
+    if (queued.length >= 64) {
+      this.fail(new Error("ICE candidate queue is full"), "signaling");
+      return;
+    }
+    queued.push(candidate);
+    this.pendingIceCandidatesByNegotiation.set(negotiationId, queued);
+  }
+
+  private async flushIceCandidates(negotiationId: string, peer: WebRtcPeer): Promise<void> {
+    const candidates = this.pendingIceCandidatesByNegotiation.get(negotiationId) ?? [];
+    this.pendingIceCandidatesByNegotiation.delete(negotiationId);
+    for (const candidate of candidates) {
+      if (this.peer !== peer || peer.negotiationId !== negotiationId) return;
+      await peer.addIceCandidate(candidate);
     }
   }
 
@@ -382,6 +607,24 @@ export abstract class WebRtcClient {
 
   protected onPeerDiagnostic(_diagnostic: WebRtcDiagnostic): void {}
 
+  protected onRecoveryCompleted(): void {}
+
+  protected onRecoveryTimeout(error: Error): void {
+    this.fail(error, "timeout");
+  }
+
+  protected onSignalingAuthenticated(): void {}
+
+  protected replacePeerForNegotiation(
+    _message: Extract<ServerMessage, { type: "offer" }>,
+  ): boolean {
+    return false;
+  }
+
+  protected shouldBufferCandidateForNegotiation(_negotiationId: string): boolean {
+    return false;
+  }
+
   protected onServerError(_code: string): boolean {
     return false;
   }
@@ -402,7 +645,14 @@ export abstract class WebRtcClient {
     this.reconnectAttempts += 1;
     this.reconnectTimer = this.clientScheduler.setTimeout(() => {
       this.reconnectTimer = undefined;
-      if (!this.closing && !this.terminal) callback();
+      if (!this.closing && !this.terminal) {
+        this.onReconnectAttemptStarted(this.reconnectAttempts, jittered);
+        this.reportClientDiagnostic("reconnect_attempt_started", {
+          attempt: this.reconnectAttempts,
+          reason: "signaling reconnect timer elapsed",
+        });
+        callback();
+      }
     }, jittered);
   }
 
@@ -449,9 +699,8 @@ export abstract class WebRtcClient {
       this.recoveryTimer = undefined;
       if (!this.peer || this.terminal || this.closing) return;
       this.onRecoveryDiagnostic("timed_out");
-      this.fail(
+      this.onRecoveryTimeout(
         new Error(`network recovery timed out after ${this.reconnectOptions.recoveryTimeoutMs / 1000} seconds`),
-        "timeout",
       );
     }, this.reconnectOptions.recoveryTimeoutMs);
     this.recoveryAttemptId = crypto.randomUUID();
@@ -463,13 +712,39 @@ export abstract class WebRtcClient {
     if (this.recoveryAttemptId) this.onRecoveryDiagnostic("completed");
     this.recoveryAttemptId = undefined;
     this.clearRecoveryTimer();
+    this.onRecoveryCompleted();
   }
 
   protected onRecoveryDiagnostic(
     _phase: string,
     _recoveryAttemptId?: string,
     _sessionId?: string,
+    _reason?: string,
   ): void {}
+
+  protected onClientDiagnostic(_diagnostic: ClientSignalingDiagnostic): void {}
+
+  protected onReconnectAttemptStarted(_attempt: number, _delayMs: number): void {}
+
+  protected reportClientDiagnostic(
+    event: ClientSignalingDiagnostic["event"],
+    fields: Partial<Omit<ClientSignalingDiagnostic, "event" | "timestamp">> = {},
+  ): void {
+    this.onClientDiagnostic({
+      event,
+      timestamp: new Date().toISOString(),
+      ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+      ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+      ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
+      peerGeneration: this.peerGeneration,
+      negotiationId: this.peer?.negotiationId,
+      socketConnectionGeneration: this.socketConnectionGeneration,
+      peerState: this.peer?.state,
+      iceState: this.peer?.diagnostic.iceConnectionState,
+      lifecycle: this.lifecycleValue,
+      ...fields,
+    });
+  }
 
   private clearRecoveryTimer(): void {
     if (this.recoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.recoveryTimer);
@@ -480,6 +755,7 @@ export abstract class WebRtcClient {
     this.peerGeneration += 1;
     this.clearInitialNegotiationTimer();
     this.clearRecoveryTimer();
+    this.pendingIceCandidatesByNegotiation.clear();
     this.peer?.close();
     this.peer = undefined;
     this.sessionId = undefined;
@@ -601,6 +877,10 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private restartResponseTimer: ReturnType<typeof setTimeout> | undefined;
   private startInFlight: Promise<void> | undefined;
   private awaitingControlPlaneRecovery = false;
+  private lastSessionRecoveryId: string | undefined;
+  private queuedRecoveryEvent = false;
+  private pendingIceRecovery = false;
+  private restartOfferGeneration: number | undefined;
 
   protected override onPeerState(state: PeerState): void {
     if (this.terminal || this.closing) return;
@@ -616,13 +896,18 @@ export class DesktopWebRtcClient extends WebRtcClient {
       return;
     }
     if (state === "connected") {
-      this.iceRestartAttempts = 0;
       this.iceRestartInFlight = false;
+      this.restartOperationId += 1;
+      this.restartOfferGeneration = undefined;
+      this.pendingIceRecovery = false;
       this.completeRecovery();
       if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
       this.iceRecoveryTimer = undefined;
       this.clearRestartResponseTimer();
       super.onPeerState(state);
+      if (!this.signalingAuthenticated || this.socket?.readyState !== 1) {
+        this.setLifecycle("RECONNECTING");
+      }
       return;
     }
     if (state === "disconnected") {
@@ -643,12 +928,16 @@ export class DesktopWebRtcClient extends WebRtcClient {
   protected override onLifecycleChange(lifecycle: ClientLifecycleState): void {
     this.onDiagnostic?.({
       event: "lifecycle",
+      timestamp: new Date().toISOString(),
       lifecycle,
       ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
       ...(this.failureSessionId ?? this.sessionId
         ? { sessionId: this.failureSessionId ?? this.sessionId }
         : {}),
       signalingState: this.getSignalingState(),
+      peerGeneration: this.peerGeneration,
+      negotiationId: this.peer?.negotiationId,
+      socketConnectionGeneration: this.socketConnectionGeneration,
       sharingState: { ...this.sharingState },
     });
   }
@@ -657,10 +946,45 @@ export class DesktopWebRtcClient extends WebRtcClient {
     recoveryPhase: string,
     recoveryAttemptId?: string,
     sessionId?: string,
+    reason?: string,
   ): void {
+    const attemptValue = /ice_restart_(?:started|failed)_(\d+)/.exec(recoveryPhase)?.[1];
+    const event =
+      recoveryPhase === "started" ? "recovery_started" :
+      recoveryPhase === "timed_out" ? "recovery_timed_out" :
+      recoveryPhase === "completed" ? "recovery_completed" :
+      recoveryPhase.startsWith("ice_restart_started_") ? "ice_restart_started" :
+      recoveryPhase.startsWith("ice_restart_failed_") ? "ice_restart_failed" : undefined;
+    if (event) {
+      this.onDiagnostic?.({
+        event,
+        timestamp: new Date().toISOString(),
+        lifecycle: this.lifecycle,
+        ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+        ...(sessionId ?? this.failureSessionId ?? this.sessionId
+          ? { sessionId: sessionId ?? this.failureSessionId ?? this.sessionId }
+          : {}),
+        ...(recoveryAttemptId ?? this.recoveryAttemptId
+          ? { recoveryAttemptId: recoveryAttemptId ?? this.recoveryAttemptId }
+          : {}),
+        recoveryPhase,
+        peerGeneration: this.peerGeneration,
+        negotiationId: this.peer?.negotiationId,
+        socketConnectionGeneration: this.socketConnectionGeneration,
+        ...(attemptValue ? { attempt: Number(attemptValue) } : {}),
+        ...(reason
+          ? { reason }
+          : event === "recovery_timed_out"
+            ? { reason: "overall recovery deadline expired" }
+            : event === "ice_restart_failed"
+              ? { reason: "restart failed" }
+              : {}),
+      });
+    }
     this.onDiagnostic?.({
       event: "recovery",
       recoveryPhase,
+      timestamp: new Date().toISOString(),
       recoveryAttemptId: recoveryAttemptId ?? this.recoveryAttemptId,
       lifecycle: this.lifecycle,
       ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
@@ -675,11 +999,29 @@ export class DesktopWebRtcClient extends WebRtcClient {
 
   protected override onPeerDiagnostic(peer: WebRtcDiagnostic): void {
     this.onDiagnostic?.({
-      event: "peer",
+      event: peer.event ?? "peer",
+      timestamp: peer.timestamp,
       lifecycle: this.lifecycle,
       ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
       sessionId: peer.sessionId,
+      recoveryAttemptId: peer.recoveryAttemptId,
+      peerGeneration: peer.peerGeneration,
+      negotiationId: peer.negotiationId,
+      socketConnectionGeneration: peer.socketConnectionGeneration,
+      peerState: peer.peerState,
+      iceState: peer.iceConnectionState,
+      candidateType: peer.candidateType,
+      reason: peer.reason,
       peer,
+    });
+  }
+
+  protected override onClientDiagnostic(diagnostic: ClientSignalingDiagnostic): void {
+    this.onDiagnostic?.({
+      ...diagnostic,
+      lifecycle: this.lifecycle,
+      signalingState: this.getSignalingState(),
+      sharingState: { ...this.sharingState },
     });
   }
 
@@ -702,6 +1044,19 @@ export class DesktopWebRtcClient extends WebRtcClient {
       peer: this.peer?.diagnostic,
     });
     this.onTerminalError?.(error);
+  }
+
+  protected override onRecoveryCompleted(): void {
+    if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
+    this.iceRecoveryTimer = undefined;
+    this.clearRestartResponseTimer();
+    this.restartOperationId += 1;
+    this.iceRestartAttempts = 0;
+    this.iceRestartInFlight = false;
+    this.restartOfferGeneration = undefined;
+    this.queuedRecoveryEvent = false;
+    this.pendingIceRecovery = false;
+    this.awaitingControlPlaneRecovery = false;
   }
 
   protected override onSocketClosed(code?: number): void {
@@ -780,13 +1135,34 @@ export class DesktopWebRtcClient extends WebRtcClient {
       if (this.signalingAuthenticated) this.setLifecycle("CONNECTED");
       return;
     }
-    if (this.awaitingControlPlaneRecovery) {
+    const newRecoveryEvent = message.recovery_attempt_id !== undefined
+      ? message.recovery_attempt_id !== this.lastSessionRecoveryId
+      : this.awaitingControlPlaneRecovery;
+    if (newRecoveryEvent) {
+      this.lastSessionRecoveryId = message.recovery_attempt_id;
       this.awaitingControlPlaneRecovery = false;
-      this.iceRestartAttempts = 0;
+      if (
+        this.iceRestartInFlight ||
+        this.restartResponseTimer !== undefined ||
+        this.restartOfferGeneration === this.peerGeneration ||
+        this.peer.restartOfferPending
+      ) {
+        this.queuedRecoveryEvent = true;
+        this.reportClientDiagnostic("recovery_attempt_queued", {
+          reason: "distinct recovery event arrived while restart negotiation was active",
+          messageType: "session_recovery",
+        });
+        return;
+      }
+      this.queuedRecoveryEvent = true;
+      this.reportClientDiagnostic("recovery_attempt_queued", {
+        reason: "distinct recovery event retained until signaling and peer are ready",
+        messageType: "session_recovery",
+      });
+    } else {
+      return;
     }
-    if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
-    this.iceRecoveryTimer = undefined;
-    this.scheduleIceRecovery(true);
+    this.drainPendingRecovery();
   }
 
   private getSignalingState(): DesktopDiagnostic["signalingState"] {
@@ -838,6 +1214,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
   }
 
   protected override async onAuthenticated(sourceSocket?: SignalingSocket): Promise<void> {
+    const signalingReconnected = this.awaitingControlPlaneRecovery;
     await this.refreshPresence?.();
     if (this.terminal || this.closing || (sourceSocket && this.socket !== sourceSocket)) return;
     if (this.sharingState.screen && !this.isSharingActive()) {
@@ -860,63 +1237,250 @@ export class DesktopWebRtcClient extends WebRtcClient {
       this.resume = undefined;
       this.resumeRequestId = undefined;
     }
+    if (signalingReconnected) {
+      this.onDiagnostic?.({
+        event: "signaling_reconnected",
+        lifecycle: this.lifecycle,
+        ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+        ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+        ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
+        peerGeneration: this.peerGeneration,
+        reason: "owner signaling socket reauthenticated",
+        signalingState: this.getSignalingState(),
+        sharingState: { ...this.sharingState },
+      });
+    }
+  }
+
+  protected override onSignalingAuthenticated(): void {
+    if (this.peer?.state === "connected") {
+      this.completeRecovery();
+      return;
+    }
+    this.drainPendingRecovery();
+  }
+
+  private drainPendingRecovery(): void {
+    if (
+      !this.signalingAuthenticated ||
+      !this.peer ||
+      this.peer.state === "connected" ||
+      this.iceRestartInFlight ||
+      this.restartResponseTimer !== undefined ||
+      this.restartOfferGeneration === this.peerGeneration ||
+      this.peer.restartOfferPending
+    ) return;
+    if (this.queuedRecoveryEvent) {
+      this.queuedRecoveryEvent = false;
+      this.pendingIceRecovery = false;
+      this.iceRestartAttempts = 0;
+      if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
+      this.iceRecoveryTimer = undefined;
+      this.scheduleIceRecovery(true, false, "new-recovery-event");
+      return;
+    }
+    if (this.pendingIceRecovery) {
+      this.pendingIceRecovery = false;
+      this.scheduleIceRecovery(true, false, "peer-disconnected-during-signaling-loss");
+    }
   }
 
   private iceRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
   private iceRestartAttempts = 0;
   private iceRestartInFlight = false;
+  private restartOperationId = 0;
 
-  private scheduleIceRecovery(immediate = false, abandonPending = false): void {
+  private scheduleIceRecovery(
+    immediate = false,
+    abandonPending = false,
+    reason = "peer-state-change",
+  ): void {
     if (!this.peer || this.iceRecoveryTimer !== undefined || this.iceRestartInFlight) return;
     this.beginRecovery();
-    if (this.peer.restartOfferPending && !abandonPending) return;
+    if (this.socket?.readyState !== 1 || !this.signalingAuthenticated) {
+      if (!this.pendingIceRecovery) {
+        this.reportClientDiagnostic("recovery_attempt_queued", {
+          reason: "signaling is not authenticated",
+        });
+      }
+      this.pendingIceRecovery = true;
+      return;
+    }
+    const peer = this.peer;
+    const generation = this.peerGeneration;
+    if (
+      (peer.restartOfferPending || this.restartOfferGeneration === generation) &&
+      !abandonPending
+    ) return;
     if (this.peer.restartOfferPending) this.peer.markRestartOfferFailed();
+    this.restartOfferGeneration = undefined;
     this.clearRestartResponseTimer();
-    if (this.socket?.readyState !== 1) return;
+    if (this.socket?.readyState !== 1 || !this.signalingAuthenticated) return;
     if (this.iceRestartAttempts >= 2) {
       return;
     }
+    this.onDiagnostic?.({
+      event: "ice_restart_retry_scheduled",
+      lifecycle: this.lifecycle,
+      ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+      ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+      ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
+      peerGeneration: generation,
+      attempt: this.iceRestartAttempts + 1,
+      reason,
+      signalingState: this.getSignalingState(),
+      sharingState: { ...this.sharingState },
+    });
     const delay = immediate ? 0 : 8_000;
     this.iceRecoveryTimer = this.clientScheduler.setTimeout(() => {
       this.iceRecoveryTimer = undefined;
-      const peer = this.peer;
-      if (!peer || this.terminal || this.closing) return;
+      if (
+        this.peer !== peer ||
+        this.peerGeneration !== generation ||
+        this.terminal ||
+        this.closing ||
+        !this.signalingAuthenticated
+      ) return;
+      if (this.iceRestartInFlight || this.restartOfferGeneration === generation || peer.restartOfferPending) return;
+      this.reportClientDiagnostic("recovery_attempt_started", {
+        attempt: this.iceRestartAttempts + 1,
+        reason,
+      });
       this.iceRestartAttempts += 1;
+      const operationId = ++this.restartOperationId;
       this.iceRestartInFlight = true;
-      this.onRecoveryDiagnostic(`ice_restart_started_${this.iceRestartAttempts}`);
+      const refreshesIceConfiguration = Boolean(this.loadIceServers || this.loadManagedIceServers);
+      this.onRecoveryDiagnostic(
+        `ice_restart_started_${this.iceRestartAttempts}`,
+        undefined,
+        undefined,
+        reason,
+      );
+      if (refreshesIceConfiguration) {
+        this.onDiagnostic?.({
+          event: "ice_configuration_refresh_started",
+          timestamp: new Date().toISOString(),
+          lifecycle: this.lifecycle,
+          ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+          ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+          ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
+          peerGeneration: generation,
+          attempt: this.iceRestartAttempts,
+          reason,
+        });
+      }
       void this.refreshIceConfiguration(peer).then(() => {
-        if (this.peer !== peer || this.terminal || this.closing) return;
-        return peer.createOffer({ iceRestart: true });
-      }).then(() => {
-        if (this.peer !== peer || this.terminal || this.closing) return;
+        if (
+          this.peer !== peer ||
+          this.peerGeneration !== generation ||
+          this.restartOperationId !== operationId ||
+          this.terminal ||
+          this.closing
+        ) return false;
+        if (refreshesIceConfiguration) {
+          this.onDiagnostic?.({
+            event: "ice_configuration_refresh_completed",
+            timestamp: new Date().toISOString(),
+            lifecycle: this.lifecycle,
+            ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+            ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+            ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
+            peerGeneration: generation,
+            attempt: this.iceRestartAttempts,
+          });
+        }
+        if (this.socket?.readyState !== 1 || !this.signalingAuthenticated) {
+          this.iceRestartInFlight = false;
+          this.pendingIceRecovery = true;
+          return false;
+        }
+        return peer.createOffer({ iceRestart: true }).then(() => true);
+      }).then((offerCreated) => {
+        if (
+          !offerCreated ||
+          this.peer !== peer ||
+          this.peerGeneration !== generation ||
+          this.restartOperationId !== operationId ||
+          this.terminal ||
+          this.closing
+        ) return;
         this.iceRestartInFlight = false;
+        this.restartOfferGeneration = generation;
         this.restartResponseTimer = this.clientScheduler.setTimeout(() => {
           this.restartResponseTimer = undefined;
-          if (this.peer !== peer || this.terminal || this.closing) return;
+          if (
+            this.peer !== peer ||
+            this.peerGeneration !== generation ||
+            this.restartOperationId !== operationId ||
+            this.terminal ||
+            this.closing
+          ) return;
+          this.restartOperationId += 1;
           peer.markRestartOfferFailed();
-          this.scheduleIceRecovery(true, true);
+          this.restartOfferGeneration = undefined;
+          this.onRecoveryDiagnostic(
+            `ice_restart_failed_${this.iceRestartAttempts}`,
+            undefined,
+            undefined,
+            "restart answer timed out",
+          );
+          if (this.iceRestartAttempts < 2) {
+            this.scheduleIceRecovery(true, true, "restart-answer-timeout");
+          } else {
+            this.drainPendingRecovery();
+          }
         }, 8_000);
       }).catch(() => {
+        if (
+          this.peer !== peer ||
+          this.peerGeneration !== generation ||
+          this.restartOperationId !== operationId ||
+          this.terminal ||
+          this.closing
+        ) return;
         this.iceRestartInFlight = false;
-        this.onRecoveryDiagnostic(`ice_restart_failed_${this.iceRestartAttempts}`);
-        if (this.peer !== peer || this.terminal || this.closing) return;
-        if (this.socket?.readyState !== 1) return;
-        if (this.iceRestartAttempts < 2) this.scheduleIceRecovery(true);
+        this.onRecoveryDiagnostic(
+          `ice_restart_failed_${this.iceRestartAttempts}`,
+          undefined,
+          undefined,
+          "restart offer or ICE configuration failed",
+        );
+        if (this.socket?.readyState !== 1 || !this.signalingAuthenticated) return;
+        if (this.iceRestartAttempts < 2) {
+          this.scheduleIceRecovery(true, false, "restart-offer-failed");
+        } else {
+          this.drainPendingRecovery();
+        }
       });
     }, delay);
   }
 
   private async refreshIceConfiguration(peer: WebRtcPeer): Promise<void> {
-    if (!this.loadIceServers && !this.loadManagedIceServers) return;
-    const credential = (await this.loadRefreshCredential?.()) ?? undefined;
-    if (!this.managedAuthentication && !credential) throw new Error("device credential unavailable");
-    const configuration = credential
-      ? await this.loadIceServers?.(credential)
-      : await this.loadManagedIceServers?.();
-    if (!configuration) throw new Error("ICE configuration unavailable");
-    if (this.peer !== peer || this.terminal || this.closing) return;
-    peer.setConfiguration(configuration);
-    this.iceConfiguration = configuration;
+    try {
+      if (!this.loadIceServers && !this.loadManagedIceServers) return;
+      const credential = (await this.loadRefreshCredential?.()) ?? undefined;
+      if (!this.managedAuthentication && !credential) throw new Error("device credential unavailable");
+      const configuration = credential
+        ? await this.loadIceServers?.(credential)
+        : await this.loadManagedIceServers?.();
+      if (!configuration) throw new Error("ICE configuration unavailable");
+      if (this.peer !== peer || this.terminal || this.closing) return;
+      peer.setConfiguration(configuration);
+      this.iceConfiguration = configuration;
+    } catch (error) {
+      this.onDiagnostic?.({
+        event: "ice_configuration_refresh_failed",
+        timestamp: new Date().toISOString(),
+        lifecycle: this.lifecycle,
+        ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+        ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+        ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
+        peerGeneration: this.peerGeneration,
+        attempt: this.iceRestartAttempts,
+        reason: "ICE configuration refresh failed",
+      });
+      throw error;
+    }
   }
 
   private clearRestartResponseTimer(): void {
@@ -926,6 +1490,8 @@ export class DesktopWebRtcClient extends WebRtcClient {
 
   protected override onAnswerApplied(): void {
     this.clearRestartResponseTimer();
+    this.restartOfferGeneration = undefined;
+    if (this.peer?.state !== "connected") this.drainPendingRecovery();
   }
 
   protected override closePeer(): void {
@@ -934,6 +1500,11 @@ export class DesktopWebRtcClient extends WebRtcClient {
     this.clearRestartResponseTimer();
     this.iceRestartAttempts = 0;
     this.iceRestartInFlight = false;
+    this.restartOperationId += 1;
+    this.restartOfferGeneration = undefined;
+    this.lastSessionRecoveryId = undefined;
+    this.queuedRecoveryEvent = false;
+    this.pendingIceRecovery = false;
     this.awaitingControlPlaneRecovery = false;
     super.closePeer();
   }
@@ -979,7 +1550,13 @@ export class DesktopWebRtcClient extends WebRtcClient {
         if (!this.isSharingActive()) return;
         this.closePeer();
         this.setLifecycle("NEGOTIATING");
-        const peer = this.createPeer("owner", message.session_id, this.iceConfiguration);
+        const peer = this.createPeer(
+          "owner",
+          message.session_id,
+          this.iceConfiguration,
+          INITIAL_NEGOTIATION_TIMEOUT_MS,
+          crypto.randomUUID(),
+        );
         const generation = this.peerGeneration;
         void Promise.resolve(this.prepareOwnerPeer?.(peer)).then(() => {
           if (this.peer !== peer || this.peerGeneration !== generation || this.terminal || this.closing) return;
@@ -1011,7 +1588,13 @@ export class DesktopWebRtcClient extends WebRtcClient {
           if (this.socket !== socket || this.terminal || this.closing || !this.isSharingActive()) return;
         }
         this.setLifecycle("NEGOTIATING");
-        const peer = this.createPeer("owner", message.session_id, this.iceConfiguration);
+        const peer = this.createPeer(
+          "owner",
+          message.session_id,
+          this.iceConfiguration,
+          INITIAL_NEGOTIATION_TIMEOUT_MS,
+          crypto.randomUUID(),
+        );
         const generation = this.peerGeneration;
         void Promise.resolve(this.prepareOwnerPeer?.(peer)).then(() => {
           if (this.peer !== peer || this.peerGeneration !== generation || this.terminal || this.closing) return;
@@ -1107,7 +1690,13 @@ export class DesktopWebRtcClient extends WebRtcClient {
     if (!this.sharingState.screen || (this.peer && this.sessionId === message.session_id)) return;
     if (this.peer || this.sessionId) this.closePeer();
     this.setLifecycle("NEGOTIATING");
-    const peer = this.createPeer("owner", message.session_id, this.iceConfiguration);
+    const peer = this.createPeer(
+      "owner",
+      message.session_id,
+      this.iceConfiguration,
+      INITIAL_NEGOTIATION_TIMEOUT_MS,
+      crypto.randomUUID(),
+    );
     const generation = this.peerGeneration;
     void Promise.resolve(this.prepareOwnerPeer?.(peer)).then(() => {
       if (this.peer !== peer || this.peerGeneration !== generation || this.terminal || this.closing || !this.sharingState.screen) return;
@@ -1148,7 +1737,9 @@ export type ViewerClientOptions = {
   loadIceServers?: () => Promise<WebRtcConfiguration>;
   reconnect?: ReconnectOptions;
   refreshPresence?: () => Promise<void>;
-  onDiagnostic?: (diagnostic: WebRtcDiagnostic | RecoveryDiagnostic) => void;
+  onDiagnostic?: (
+    diagnostic: WebRtcDiagnostic | RecoveryDiagnostic | ClientSignalingDiagnostic
+  ) => void;
   onTerminalError?: (error: Error) => void;
   onSessionEnded?: (reason: string) => void;
   onSharingState?: (state: { screen: boolean; camera: boolean }) => void;
@@ -1161,7 +1752,9 @@ export class ViewerWebRtcClient extends WebRtcClient {
   private readonly deviceId: string;
   private readonly loadIceServers?: () => Promise<WebRtcConfiguration>;
   private readonly refreshPresence?: () => Promise<void>;
-  private readonly onDiagnostic?: (diagnostic: WebRtcDiagnostic | RecoveryDiagnostic) => void;
+  private readonly onDiagnostic?: (
+    diagnostic: WebRtcDiagnostic | RecoveryDiagnostic | ClientSignalingDiagnostic
+  ) => void;
   private readonly onTerminalError?: (error: Error) => void;
   private readonly onViewerSessionEnded?: (reason: string) => void;
   private readonly onSharingState?: (state: { screen: boolean; camera: boolean }) => void;
@@ -1171,6 +1764,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
   private hasEstablishedSession = false;
   private authorizationRetryCount = 0;
   private readonly retiredSessionIds = new Set<string>();
+  private readonly retiredNegotiationIds = new Set<string>();
   private sharingActive: boolean | undefined;
   private sessionRequestPending = false;
   private peerEverConnected = false;
@@ -1192,6 +1786,31 @@ export class ViewerWebRtcClient extends WebRtcClient {
     this.onViewerSessionEnded = options.onSessionEnded;
     this.onSharingState = options.onSharingState;
     this.onDeviceAvailability = options.onDeviceAvailability;
+  }
+
+  protected override replacePeerForNegotiation(
+    message: Extract<ServerMessage, { type: "offer" }>,
+  ): boolean {
+    if (this.retiredNegotiationIds.has(message.negotiation_id) || !this.sessionId) return false;
+    const previousNegotiationId = this.peer?.negotiationId;
+    const queuedCandidates = this.pendingIceCandidatesByNegotiation.get(message.negotiation_id);
+    if (previousNegotiationId) this.retireNegotiation(previousNegotiationId);
+    this.closePeer();
+    if (queuedCandidates) {
+      this.pendingIceCandidatesByNegotiation.set(message.negotiation_id, queuedCandidates);
+    }
+    this.peerEverConnected = false;
+    this.setLifecycle("NEGOTIATING");
+    this.createPeer("viewer", message.session_id, this.iceConfiguration);
+    return true;
+  }
+
+  protected override shouldBufferCandidateForNegotiation(negotiationId: string): boolean {
+    return !this.retiredNegotiationIds.has(negotiationId);
+  }
+
+  private retireNegotiation(negotiationId: string): void {
+    this.retiredNegotiationIds.add(negotiationId);
   }
 
   start(reconnecting = false): void {
@@ -1248,6 +1867,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
         const ownerRecoveryRemainingMs =
           message.type === "session_attached" ? message.owner_recovery_remaining_ms : undefined;
         const ownerRecoveryPending = ownerRecoveryRemainingMs !== undefined;
+        if (this.sessionId !== message.session_id) this.retiredNegotiationIds.clear();
         this.setLifecycle(ownerRecoveryPending ? "RECONNECTING" : "NEGOTIATING");
         const peer = this.createPeer(
           "viewer",
@@ -1260,10 +1880,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
           this.ownerRecoveryTimer = this.clientScheduler.setTimeout(() => {
             this.ownerRecoveryTimer = undefined;
             if (this.ownerRecoverySessionId !== message.session_id) return;
-            this.ownerRecoverySessionId = undefined;
-            this.onDeviceAvailability?.(false);
-            this.fail(new Error("Desktop recovery window expired before the owner reconnected"), "timeout");
-            this.socket?.close();
+            this.retireTimedOutSession();
           }, ownerRecoveryRemainingMs);
         }
       }
@@ -1343,6 +1960,30 @@ export class ViewerWebRtcClient extends WebRtcClient {
     }
   }
 
+  private retireCurrentSession(): void {
+    if (this.sessionId) this.retireSession(this.sessionId);
+    if (this.peer?.negotiationId) this.retireNegotiation(this.peer.negotiationId);
+  }
+
+  private retireTimedOutSession(): void {
+    this.retireCurrentSession();
+    this.clearOwnerRecoveryWait();
+    this.sessionRequestPending = false;
+    this.peerEverConnected = false;
+    this.reconnecting = false;
+    this.recoveryAttemptId = undefined;
+    this.sharingActive = false;
+    this.onDeviceAvailability?.(false);
+    this.onSharingState?.({ screen: false, camera: false });
+    this.onViewerSessionEnded?.("recovery_timeout");
+    this.closePeer();
+    this.setLifecycle("RECONNECTING");
+  }
+
+  protected override onRecoveryTimeout(_error: Error): void {
+    this.retireTimedOutSession();
+  }
+
   protected override onServerMessage(message: ServerMessage): boolean {
     if (message.type === "session_recovery") {
       this.sessionRequestPending = false;
@@ -1388,6 +2029,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
       this.sessionRequestPending = false;
       this.peerEverConnected = false;
       if (this.peer || this.sessionId) {
+        this.retireCurrentSession();
         this.closePeer();
         this.setLifecycle("CLOSED");
         this.onViewerSessionEnded?.("sharing_stopped");
@@ -1484,6 +2126,13 @@ export class ViewerWebRtcClient extends WebRtcClient {
     this.onDiagnostic?.(diagnostic);
   }
 
+  protected override onClientDiagnostic(diagnostic: ClientSignalingDiagnostic): void {
+    this.onDiagnostic?.({
+      ...diagnostic,
+      ...(this.deviceId ? { deviceId: this.deviceId } : {}),
+    });
+  }
+
   protected override onRecoveryDiagnostic(
     phase: string,
     recoveryAttemptId?: string,
@@ -1492,8 +2141,12 @@ export class ViewerWebRtcClient extends WebRtcClient {
     this.onDiagnostic?.({
       event: "recovery",
       phase,
+      timestamp: new Date().toISOString(),
       recoveryAttemptId: recoveryAttemptId ?? this.recoveryAttemptId ?? crypto.randomUUID(),
       ...(sessionId ?? this.sessionId ? { sessionId: sessionId ?? this.sessionId } : {}),
+      peerGeneration: this.peerGeneration,
+      negotiationId: this.peer?.negotiationId,
+      socketConnectionGeneration: this.socketConnectionGeneration,
       signalingState: this.socket?.readyState === 1
         ? "open"
         : this.socket?.readyState === 3 ? "closed" : "connecting",
@@ -1537,12 +2190,11 @@ export class ViewerWebRtcClient extends WebRtcClient {
   protected override onSessionEnded(reason: string): void {
     this.sessionRequestPending = false;
     this.clearOwnerRecoveryWait();
-    this.onViewerSessionEnded?.(reason);
     if (reason === "recovery_timeout") {
-      this.onDeviceAvailability?.(false);
-      this.fail(new Error("Desktop recovery window expired before the owner reconnected"), "timeout");
+      this.retireTimedOutSession();
       return;
     }
+    this.onViewerSessionEnded?.(reason);
     if (reason === "sharing_stopped") {
       this.sharingActive = false;
       this.peerEverConnected = false;

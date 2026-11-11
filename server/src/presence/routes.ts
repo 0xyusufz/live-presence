@@ -13,6 +13,7 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from "../../../shared/src/protocol.js";
+import { candidateTypeFromCandidate } from "../../../shared/src/webrtc.js";
 
 const AUTH_TIMEOUT_MS = 5_000;
 export const VIEWER_DISCONNECT_GRACE_MS = 180_000;
@@ -75,6 +76,8 @@ export async function registerPresenceRoutes(
 
   const webSocketServer = new WebSocketServer({ noServer: true });
   const sockets = new Map<string, WebSocket>();
+  const socketConnectionGenerations = new WeakMap<WebSocket, number>();
+  let nextSocketConnectionGeneration = 0;
   type Connection = { socket: WebSocket; userId: string; deviceId?: string; presenceId?: string; role: "owner" | "viewer" };
   type Session = {
     id: string;
@@ -103,19 +106,44 @@ export async function registerPresenceRoutes(
       session_id: session.id,
       recovery_attempt_id: recoveryAttemptId,
     };
+    for (const [role, connection] of [
+      ["owner", session.owner],
+      ["viewer", session.viewer],
+    ] as const) {
+      if (!connection) continue;
+      console.info(JSON.stringify({
+        source: "backend",
+        event: "session_recovery_notification_attempted",
+        timestamp: new Date().toISOString(),
+        deviceId: session.deviceId,
+        sessionId: session.id,
+        recoveryAttemptId,
+        targetRole: role,
+        socketConnectionGeneration: socketConnectionGenerations.get(connection.socket),
+        messageType: message.type,
+        socketReadyState: connection.socket.readyState,
+      }));
+    }
     const ownerSent = session.owner ? send(session.owner.socket, message) : false;
     const viewerSent = session.viewer ? send(session.viewer.socket, message) : false;
-    console.info(JSON.stringify({
-      source: "backend",
-      event: "session-recovery-notified",
-      deviceId: session.deviceId,
-      sessionId: session.id,
-      recoveryAttemptId,
-      ownerAttached: session.owner !== undefined,
-      ownerSent,
-      viewerAttached: session.viewer !== undefined,
-      viewerSent,
-    }));
+    for (const [role, connection, sent] of [
+      ["owner", session.owner, ownerSent],
+      ["viewer", session.viewer, viewerSent],
+    ] as const) {
+      if (!connection) continue;
+      console.info(JSON.stringify({
+        source: "backend",
+        event: "session_recovery_notification_sent",
+        timestamp: new Date().toISOString(),
+        deviceId: session.deviceId,
+        sessionId: session.id,
+        recoveryAttemptId,
+        targetRole: role,
+        socketConnectionGeneration: socketConnectionGenerations.get(connection.socket),
+        messageType: message.type,
+        sent,
+      }));
+    }
   };
   const connections = new Map<WebSocket, Connection>();
   const sessions = new Map<string, Session>();
@@ -217,6 +245,7 @@ export async function registerPresenceRoutes(
   };
 
   const onConnection = (socket: WebSocket, request: IncomingMessage): void => {
+    socketConnectionGenerations.set(socket, ++nextSocketConnectionGeneration);
     let connectionId: string | undefined;
     let authenticated = false;
     const authTimer = setTimeout(() => {
@@ -634,7 +663,24 @@ export async function registerPresenceRoutes(
             }
             const peer = session.owner?.socket === socket ? session.viewer?.socket : session.owner?.socket;
             if (!peer) return;
-            send(peer, message);
+            const sent = send(peer, message);
+            const messageType = type === "offer" ? "offer_relayed" :
+              type === "answer" ? "answer_relayed" : "ice_candidate_relayed";
+            console.info(JSON.stringify({
+              source: "backend",
+              event: messageType,
+              timestamp: new Date().toISOString(),
+              deviceId: session.deviceId,
+              sessionId: session.id,
+              negotiationId: message.negotiation_id,
+              socketConnectionGeneration: socketConnectionGenerations.get(socket),
+              recipientSocketConnectionGeneration: socketConnectionGenerations.get(peer),
+              messageType: type,
+              ...(type === "ice_candidate"
+                ? { candidateType: candidateTypeFromCandidate(message.candidate) }
+                : {}),
+              sent,
+            }));
           } else if (type === "share_request" && session.viewer?.socket === socket) {
             if (session.requests.has(message.request_id)) {
               send(socket, { type: "error", code: "REQUEST_EXISTS" }); return;
