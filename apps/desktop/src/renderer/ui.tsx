@@ -36,9 +36,22 @@ function makeSocket(): SignalingSocket {
     onerror: null,
     connect: () => {
       unsubscribe ??= window.livePresence.onSocketEvent((event) => {
-        if (event.type === "open") {
+        if (event.type === "authentication-started") {
+          console.info(JSON.stringify({
+            source: "desktop-renderer",
+            event: "owner_authentication_started",
+            timestamp: new Date().toISOString(),
+            socketConnectionGeneration: event.connectionGeneration,
+          }));
+        } else if (event.type === "open") {
           readyState = 1;
           socket.connectionGeneration = event.connectionGeneration;
+          console.info(JSON.stringify({
+            source: "desktop-renderer",
+            event: "owner_authentication_completed",
+            timestamp: new Date().toISOString(),
+            socketConnectionGeneration: event.connectionGeneration,
+          }));
           socket.onopen?.();
         } else if (event.type === "message") {
           socket.onmessage?.({ data: event.data });
@@ -164,10 +177,16 @@ function ShareWindow(): JSX.Element {
         }
       },
       onDiagnostic: (diagnostic) => {
+        const recoveryLifecycleEvent =
+          diagnostic.event === "recovery_started" ||
+          diagnostic.event === "session_recovery_received" ||
+          diagnostic.event === "recovery_completed" ||
+          diagnostic.event === "recovery_timed_out" ||
+          diagnostic.event === "recovery";
         console.info(JSON.stringify({
           source: "desktop-renderer",
           event: diagnostic.event,
-          timestamp: diagnostic.timestamp,
+          timestamp: diagnostic.timestamp ?? new Date().toISOString(),
           deviceId: diagnostic.deviceId,
           lifecycle: diagnostic.lifecycle,
           signalingState: diagnostic.signalingState,
@@ -187,6 +206,15 @@ function ShareWindow(): JSX.Element {
           reason: diagnostic.reason,
           sessionId: diagnostic.sessionId,
           peer: diagnostic.peer,
+          ...(recoveryLifecycleEvent
+            ? {
+                recoveryCause: diagnostic.event === "recovery_timed_out"
+                  ? "overall_recovery_deadline_expired"
+                  : diagnostic.reason,
+                screenTrackLive: capture.current.screen?.readyState === "live",
+                cameraTrackLive: capture.current.camera?.readyState === "live",
+              }
+            : {}),
         }));
       },
       onSharingStateConfirmed: ({ deviceId, screen, camera }) => {

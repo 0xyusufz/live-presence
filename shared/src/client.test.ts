@@ -2047,6 +2047,93 @@ test("closing the control plane cancels pending ICE restart activity", async () 
   client.close();
 });
 
+test("desktop reconnects after retryable stale-presence closure and retains live approved tracks", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  const cameraTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    {
+      isSharingActive: () => screenTrack.readyState === "live" && cameraTrack.readyState === "live",
+      prepareOwnerPeer: async (peer) => {
+        await peer.replaceTrack("screen", screenTrack);
+        await peer.replaceTrack("camera", cameraTrack);
+      },
+    },
+  );
+  await client.setSharingState(true, true);
+
+  socket.disconnect(1013);
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(peerConnection.closed, false);
+  assert.equal(screenTrack.readyState, "live");
+  assert.equal(cameraTrack.readyState, "live");
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(sockets.length, 2);
+  assert.equal(peerConnection.closed, false);
+  assert.deepEqual(peerConnection.replaceCalls, [
+    { index: 0, track: screenTrack },
+    { index: 1, track: cameraTrack },
+  ]);
+  client.close();
+});
+
+test("desktop retires its peer after retryable close when approved sharing is no longer active", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  const cameraTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  let sharingActive = true;
+  const { client, socket, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    {
+      isSharingActive: () => sharingActive,
+      prepareOwnerPeer: async (peer) => {
+        await peer.replaceTrack("screen", screenTrack);
+        await peer.replaceTrack("camera", cameraTrack);
+      },
+    },
+  );
+  await client.setSharingState(true, true);
+
+  sharingActive = false;
+  socket.disconnect(1013);
+  assert.equal(peerConnection.closed, true);
+  assert.equal(client.lifecycle, "CLOSED");
+  client.close();
+});
+
+test("desktop remains terminal after authentication or policy close code 1008", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    { isSharingActive: () => true },
+  );
+
+  socket.disconnect(1008);
+
+  assert.equal(client.lifecycle, "FAILED");
+  assert.equal(peerConnection.closed, true);
+  assert.equal(scheduler.timers.size, 0);
+  assert.equal(sockets.length, 1);
+  client.close();
+});
+
 test("owner reconnect retains approved tracks and restarts the same peer session", async () => {
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();

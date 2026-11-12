@@ -8,8 +8,10 @@ export type PresenceRecord = {
   userId: string;
 };
 
+export type PresenceConnectionCloseCause = "stale" | "revoked" | "shutdown";
+
 export type PresenceServiceOptions = {
-  closeConnection?: (connectionId: string) => void;
+  closeConnection?: (connectionId: string, cause: PresenceConnectionCloseCause) => void;
   now?: () => number;
   staleThresholdSeconds: number;
 };
@@ -19,7 +21,7 @@ export class PresenceService {
   private readonly records = new Map<string, PresenceRecord>();
   private readonly staleThresholdMs: number;
   private readonly sweepTimer: NodeJS.Timeout;
-  private closeConnection?: (connectionId: string) => void;
+  private closeConnection?: (connectionId: string, cause: PresenceConnectionCloseCause) => void;
 
   public constructor(options: PresenceServiceOptions) {
     this.now = options.now ?? Date.now;
@@ -33,7 +35,7 @@ export class PresenceService {
   }
 
   public setConnectionCloser(
-    closeConnection: (connectionId: string) => void,
+    closeConnection: (connectionId: string, cause: PresenceConnectionCloseCause) => void,
   ): void {
     this.closeConnection = closeConnection;
   }
@@ -77,7 +79,7 @@ export class PresenceService {
     for (const [connectionId, record] of this.records) {
       if (record.deviceId === deviceId) {
         this.records.delete(connectionId);
-        this.closeConnection?.(connectionId);
+        this.closeConnection?.(connectionId, "revoked");
       }
     }
   }
@@ -100,7 +102,7 @@ export class PresenceService {
   public close(): void {
     clearInterval(this.sweepTimer);
     for (const connectionId of this.records.keys()) {
-      this.closeConnection?.(connectionId);
+      this.closeConnection?.(connectionId, "shutdown");
     }
     this.records.clear();
   }
@@ -110,7 +112,7 @@ export class PresenceService {
     for (const [connectionId, record] of this.records) {
       if (record.lastSeen <= cutoff) {
         this.records.delete(connectionId);
-        this.closeConnection?.(connectionId);
+        this.closeConnection?.(connectionId, "stale");
       }
     }
   }

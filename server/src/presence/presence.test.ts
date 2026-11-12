@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WebSocket, type RawData } from "ws";
 import { buildApp } from "../app.js";
+import { closeExpiredPresenceSocket, PRESENCE_EXPIRED_CLOSE_CODE } from "./routes.js";
 import { PresenceService } from "./service.js";
 
 function cookieValue(value: string | string[] | undefined): string {
@@ -172,9 +173,11 @@ async function createDevice(
 
 test("presence service distinguishes connections and expires at the threshold", () => {
   let now = 1_700_000_000_000;
+  const closed: Array<{ connectionId: string; cause: string }> = [];
   const presence = new PresenceService({
     now: () => now,
     staleThresholdSeconds: 10,
+    closeConnection: (connectionId, cause) => closed.push({ connectionId, cause }),
   });
 
   const first = presence.connect("user-a", "device-a");
@@ -194,13 +197,14 @@ test("presence service distinguishes connections and expires at the threshold", 
 
   now += 10_000;
   assert.deepEqual(presence.getUserPresence("user-a"), []);
+  assert.deepEqual(closed, [{ connectionId: deviceB.connectionId, cause: "stale" }]);
   presence.close();
 });
 
 test("presence service removes every connection for a revoked device", () => {
-  const closed: string[] = [];
+  const closed: Array<{ connectionId: string; cause: string }> = [];
   const presence = new PresenceService({
-    closeConnection: (connectionId) => closed.push(connectionId),
+    closeConnection: (connectionId, cause) => closed.push({ connectionId, cause }),
     staleThresholdSeconds: 45,
   });
   const first = presence.connect("user-a", "device-a");
@@ -209,12 +213,79 @@ test("presence service removes every connection for a revoked device", () => {
 
   presence.revokeDevice("device-a");
 
-  assert.deepEqual(closed.sort(), [first.connectionId, second.connectionId].sort());
+  assert.deepEqual(
+    closed.sort((left, right) => left.connectionId.localeCompare(right.connectionId)),
+    [
+      { connectionId: first.connectionId, cause: "revoked" },
+      { connectionId: second.connectionId, cause: "revoked" },
+    ].sort((left, right) => left.connectionId.localeCompare(right.connectionId)),
+  );
   assert.deepEqual(
     presence.getUserPresence("user-a").map((record) => record.deviceId),
     ["device-b"],
   );
   presence.close();
+});
+
+test("stale-presence and heartbeat close intents are diagnosed without sensitive payloads", () => {
+  const logs: string[] = [];
+  const originalInfo = console.info;
+  console.info = (...values: unknown[]) => {
+    for (const value of values) if (typeof value === "string") logs.push(value);
+  };
+  const closes: Array<{ code?: number; reason?: string }> = [];
+  const socket = {
+    readyState: WebSocket.OPEN,
+    close: (code?: number, reason?: string) => closes.push({ code, reason }),
+  };
+
+  try {
+    closeExpiredPresenceSocket(socket, "stale-presence-expiry", {
+      deviceId: "device-safe-id",
+      socketConnectionGeneration: 7,
+    });
+    closeExpiredPresenceSocket(socket, "heartbeat-expiry", {
+      deviceId: "device-safe-id",
+      socketConnectionGeneration: 8,
+    });
+  } finally {
+    console.info = originalInfo;
+  }
+
+  assert.deepEqual(closes, [
+    { code: PRESENCE_EXPIRED_CLOSE_CODE, reason: "presence expired" },
+    { code: PRESENCE_EXPIRED_CLOSE_CODE, reason: "presence expired" },
+  ]);
+  const diagnostics = logs.map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.deepEqual(diagnostics.map((diagnostic) => diagnostic.event), [
+    "stale_presence_close_intent",
+    "heartbeat_expiry_close_intent",
+  ]);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => ({
+      closeCode: diagnostic.closeCode,
+      closeReasonCategory: diagnostic.closeReasonCategory,
+      closeAttempted: diagnostic.closeAttempted,
+    })),
+    [
+      {
+        closeCode: 1013,
+        closeReasonCategory: "stale_presence_retryable",
+        closeAttempted: true,
+      },
+      {
+        closeCode: 1013,
+        closeReasonCategory: "heartbeat_expired_retryable",
+        closeAttempted: true,
+      },
+    ],
+  );
+  assert.ok(diagnostics.every((diagnostic) => typeof diagnostic.timestamp === "string"));
+  const serialized = logs.join("\n");
+  assert.equal(serialized.includes("credential"), false);
+  assert.equal(serialized.includes("candidate:"), false);
+  assert.equal(serialized.includes("192.0.2."), false);
+  assert.equal(serialized.includes("v=0"), false);
 });
 
 test("websocket requires origin and first-frame device authentication", async () => {
@@ -609,9 +680,34 @@ test("browser session cookie authenticates viewer signaling without exposing the
   }
 });
 
-test("device revocation closes active websocket presence", async () => {
+test("device revocation closes active websocket presence with terminal policy status", async () => {
   const server = await buildApp(":memory:", 3600, "test", undefined, 600, 45);
   const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const viewerLogin = await server.app.inject({
+    method: "POST",
+    url: "/auth/request-login",
+    payload: { email: `revocation-viewer-${Date.now()}@example.com` },
+  });
+  const viewerVerification = await server.app.inject({
+    method: "POST",
+    url: "/auth/verify-login",
+    payload: { token: viewerLogin.json<{ developmentToken: string }>().developmentToken },
+  });
+  const viewerCookie = cookieValue(viewerVerification.headers["set-cookie"]);
+  const viewerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: viewerCookie },
+  });
+  server.authorization.grant(
+    ownerSession.json<{ user: { id: string } }>().user.id,
+    viewerSession.json<{ user: { id: string } }>().user.id,
+  );
   await server.app.listen({ host: "127.0.0.1", port: 0 });
   const address = server.app.server.address();
   assert.ok(address && typeof address !== "string");
@@ -619,14 +715,31 @@ test("device revocation closes active websocket presence", async () => {
     `ws://127.0.0.1:${address.port}/ws`,
     { origin: "http://localhost:5173" },
   );
+  const viewer = new WebSocket(`ws://127.0.0.1:${address.port}/ws`, {
+    origin: "http://localhost:5173",
+    headers: { cookie: viewerCookie },
+  });
+  const viewerAuth = nextMessage(viewer);
 
   try {
-    await waitForOpen(socket);
+    await Promise.all([waitForOpen(socket), waitForOpen(viewer)]);
+    const ownerAuth = nextMessage(socket);
     socket.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
-    await new Promise<void>((resolve) =>
-      socket.once("message", () => resolve()),
-    );
+    assert.equal((await ownerAuth).role, "owner");
+    assert.equal((await viewerAuth).role, "viewer");
+    const ownerSharingAck = nextMessage(socket);
+    const viewerSharingState = nextMessage(viewer);
+    socket.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    await Promise.all([ownerSharingAck, viewerSharingState]);
+    const initialViewerMessages = nextMessages(viewer, 2);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
+    const [, sessionCreated] = await initialViewerMessages;
+    assert.equal(sessionCreated?.type, "session_created");
+    const sessionId = sessionCreated?.session_id;
+    assert.equal((await nextMessage(socket)).type, "viewer_joined");
+
     const closed = waitForClose(socket);
+    const viewerSessionEnded = nextMessages(viewer, 2);
     const revoked = await server.app.inject({
       method: "DELETE",
       url: `/devices/${device.deviceId}`,
@@ -635,6 +748,15 @@ test("device revocation closes active websocket presence", async () => {
 
     assert.equal(revoked.statusCode, 204);
     assert.equal(await closed, 1008);
+    const revocationMessages = await viewerSessionEnded;
+    assert.ok(revocationMessages.some((message) =>
+      message.type === "device_sharing_state" &&
+      message.screen === false &&
+      message.camera === false));
+    assert.ok(revocationMessages.some((message) =>
+      message.type === "viewer_left" &&
+      message.session_id === sessionId &&
+      message.reason === "disconnected"));
 
     const offline = await server.app.inject({
       method: "GET",
@@ -652,6 +774,167 @@ test("device revocation closes active websocket presence", async () => {
     assert.equal(await waitForClose(reconnect), 1008);
   } finally {
     socket.close();
+    viewer.close();
+    await server.app.close();
+    server.close();
+  }
+});
+
+test("stale owner presence closes retryably and reattaches the original session for both peers", async () => {
+  const server = await buildApp(":memory:", 3600, "test", undefined, 600, 2);
+  const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const viewerLogin = await server.app.inject({
+    method: "POST",
+    url: "/auth/request-login",
+    payload: { email: `stale-presence-viewer-${Date.now()}@example.com` },
+  });
+  const viewerVerification = await server.app.inject({
+    method: "POST",
+    url: "/auth/verify-login",
+    payload: { token: viewerLogin.json<{ developmentToken: string }>().developmentToken },
+  });
+  const viewerCookie = cookieValue(viewerVerification.headers["set-cookie"]);
+  const viewerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: viewerCookie },
+  });
+  server.authorization.grant(
+    ownerSession.json<{ user: { id: string } }>().user.id,
+    viewerSession.json<{ user: { id: string } }>().user.id,
+  );
+  await server.app.listen({ host: "127.0.0.1", port: 0 });
+  const address = server.app.server.address();
+  assert.ok(address && typeof address !== "string");
+  const wsUrl = `ws://127.0.0.1:${address.port}/ws`;
+  const diagnosticLogs: string[] = [];
+  const originalInfo = console.info;
+  console.info = (...values: unknown[]) => {
+    for (const value of values) if (typeof value === "string") diagnosticLogs.push(value);
+  };
+  const owner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+  const viewer = new WebSocket(wsUrl, {
+    origin: "http://localhost:5173",
+    headers: { cookie: viewerCookie },
+  });
+  const sockets = [owner, viewer];
+  const viewerAuth = nextMessage(viewer);
+
+  try {
+    await Promise.all([waitForOpen(owner), waitForOpen(viewer)]);
+    const ownerAuth = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+    assert.equal((await viewerAuth).role, "viewer");
+
+    const ownerSharingAck = nextMessage(owner);
+    const viewerSharingState = nextMessage(viewer);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    await Promise.all([ownerSharingAck, viewerSharingState]);
+    const initialViewerMessages = nextMessages(viewer, 2);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
+    const [, sessionCreated] = await initialViewerMessages;
+    assert.equal(sessionCreated?.type, "session_created");
+    const originalSessionId = sessionCreated?.session_id;
+    assert.equal((await nextMessage(owner)).type, "viewer_joined");
+
+    assert.equal(await waitForClose(owner), PRESENCE_EXPIRED_CLOSE_CODE);
+
+    const replacementOwner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+    sockets.push(replacementOwner);
+    await waitForOpen(replacementOwner);
+    const replacementMessages = nextMessages(replacementOwner, 2);
+    const viewerRecovery = nextMessage(viewer);
+    replacementOwner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    const [authenticated, recovery] = await replacementMessages;
+    assert.equal(authenticated?.type, "authenticated");
+    assert.equal(recovery?.type, "session_recovery");
+    assert.equal(recovery?.session_id, originalSessionId);
+    assert.deepEqual(await viewerRecovery, recovery);
+
+    const diagnostics = diagnosticLogs.map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.ok(diagnostics.some((entry) =>
+      entry.event === "stale_presence_close_intent" &&
+      entry.closeCode === 1013 &&
+      entry.deviceId === device.deviceId));
+    assert.ok(diagnostics.some((entry) =>
+      entry.event === "owner-socket-disconnected" &&
+      entry.closeCode === 1013 &&
+      entry.sessionPreserved === true &&
+      entry.replacementSocketExists === false));
+    assert.ok(diagnostics.some((entry) =>
+      entry.event === "owner_session_reattachment" &&
+      entry.originalSessionId === originalSessionId &&
+      entry.reattachmentSucceeded === true));
+    assert.deepEqual(
+      diagnostics
+        .filter((entry) => entry.event === "session_recovery_notification_sent")
+        .map((entry) => ({ role: entry.targetRole, sent: entry.sent }))
+        .sort((left, right) => String(left.role).localeCompare(String(right.role))),
+      [{ role: "owner", sent: true }, { role: "viewer", sent: true }],
+    );
+    const serializedDiagnostics = diagnosticLogs.join("\n");
+    assert.equal(serializedDiagnostics.includes(device.refreshToken), false);
+    assert.equal(serializedDiagnostics.includes("candidate:"), false);
+    assert.equal(serializedDiagnostics.includes("192.0.2."), false);
+    assert.equal(serializedDiagnostics.includes("v=0"), false);
+  } finally {
+    console.info = originalInfo;
+    await Promise.all(sockets.map(terminateSocket));
+    await server.app.close();
+    server.close();
+  }
+});
+
+test("expired heartbeat closes retryably through the WebSocket handler", async () => {
+  let presenceNow = Date.now();
+  const originalDateNow = Date.now;
+  const serverPromise = (() => {
+    Date.now = () => presenceNow;
+    try {
+      return buildApp(":memory:", 3600, "test", undefined, 600, 600);
+    } finally {
+      Date.now = originalDateNow;
+    }
+  })();
+  const server = await serverPromise;
+  const device = await createDevice(server);
+  await server.app.listen({ host: "127.0.0.1", port: 0 });
+  const address = server.app.server.address();
+  assert.ok(address && typeof address !== "string");
+  const wsUrl = `ws://127.0.0.1:${address.port}/ws`;
+  const diagnosticLogs: string[] = [];
+  const originalInfo = console.info;
+  console.info = (...values: unknown[]) => {
+    for (const value of values) if (typeof value === "string") diagnosticLogs.push(value);
+  };
+  const owner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+  const sockets = [owner];
+
+  try {
+    await waitForOpen(owner);
+    const ownerAuth = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+
+    const ownerClosed = waitForClose(owner);
+    presenceNow += 600_001;
+    owner.send(JSON.stringify({ type: "heartbeat" }));
+    assert.equal(await ownerClosed, PRESENCE_EXPIRED_CLOSE_CODE);
+
+    const diagnostics = diagnosticLogs.map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.ok(diagnostics.some((entry) =>
+      entry.event === "heartbeat_expiry_close_intent" &&
+      entry.closeCode === PRESENCE_EXPIRED_CLOSE_CODE &&
+      entry.closeReasonCategory === "heartbeat_expired_retryable"));
+  } finally {
+    console.info = originalInfo;
+    await Promise.all(sockets.map(terminateSocket));
     await server.app.close();
     server.close();
   }
@@ -808,6 +1091,23 @@ test("signaling enforces offer/answer direction and routes valid messages", asyn
     assert.equal(serializedRelayLogs.includes("private-token"), false);
     assert.equal(serializedRelayLogs.includes("candidate:1"), false);
     assert.equal(serializedRelayLogs.includes("v=0"), false);
+    const allDiagnostics = diagnosticLogs.join("\n");
+    const transition = diagnosticLogs
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((entry) => entry.event === "sharing_state_transition" &&
+        entry.reason === "session-ended:disconnected");
+    assert.ok(transition);
+    assert.equal(transition.sessionId, sessionId);
+    assert.deepEqual(transition.newSharingState, { screen: false, camera: false });
+    const ended = diagnosticLogs
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((entry) => entry.event === "session_ended" && entry.sessionId === sessionId);
+    assert.equal(ended?.reason, "disconnected");
+    assert.equal(ended?.sharingStateCleared, true);
+    assert.equal(allDiagnostics.includes("private-token"), false);
+    assert.equal(allDiagnostics.includes("candidate:1"), false);
+    assert.equal(allDiagnostics.includes("192.0.2.44"), false);
+    assert.equal(allDiagnostics.includes("v=0"), false);
   } finally {
     console.info = originalInfo;
     owner.close();

@@ -153,6 +153,16 @@ test("repeated authentication and socket replacement keep one heartbeat per acti
   });
 
   const events: SocketEvent[] = [];
+  const diagnosticLogs: string[] = [];
+  const originalInfo = console.info;
+  const originalWarn = console.warn;
+  const originalDebug = console.debug;
+  const captureLog = (...values: unknown[]): void => {
+    for (const value of values) if (typeof value === "string") diagnosticLogs.push(value);
+  };
+  console.info = captureLog;
+  console.warn = captureLog;
+  console.debug = captureLog;
   const activeTimers = new Map<number, () => void>();
   let nextTimerId = 0;
   let scheduledIntervals = 0;
@@ -179,6 +189,8 @@ test("repeated authentication and socket replacement keep one heartbeat per acti
     await transport.connect();
     const [firstSocket] = await firstConnection;
     await waitForCondition(() => events.filter((event) => event.type === "open").length === 2);
+    assert.ok(events.some((event) =>
+      event.type === "authentication-started" && event.connectionGeneration === 1));
     assert.equal(scheduledIntervals, 1);
     assert.equal(activeTimers.size, 1);
 
@@ -205,6 +217,8 @@ test("repeated authentication and socket replacement keep one heartbeat per acti
     await transport.connect();
     const [replacementSocket] = await replacementConnection;
     await waitForCondition(() => events.filter((event) => event.type === "open").length === 4);
+    assert.ok(diagnosticLogs.some((line) => line.includes('"event":"reconnect_attempt_started"')));
+    assert.ok(diagnosticLogs.some((line) => line.includes('"event":"reconnect_attempt_succeeded"')));
     assert.equal(scheduledIntervals, 2);
     assert.equal(activeTimers.size, 1);
 
@@ -220,6 +234,9 @@ test("repeated authentication and socket replacement keep one heartbeat per acti
     await waitForCondition(() => activeTimers.size === 0);
     assert.equal(activeTimers.size, 0);
   } finally {
+    console.info = originalInfo;
+    console.warn = originalWarn;
+    console.debug = originalDebug;
     transport.close();
     server.clients.forEach((socket) => socket.terminate());
     await new Promise<void>((resolve, reject) => {

@@ -5,7 +5,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { WebSocket, WebSocketServer } from "ws";
 import type { AuthService } from "../auth/service.js";
 import { DeviceAuthError, DeviceService } from "../devices/service.js";
-import { PresenceService } from "./service.js";
+import { PresenceService, type PresenceConnectionCloseCause } from "./service.js";
 import { ViewerAuthorizationService } from "../authorization/service.js";
 import { ResumeSessionStore } from "./resume.js";
 import {
@@ -16,8 +16,48 @@ import {
 import { candidateTypeFromCandidate } from "../../../shared/src/webrtc.js";
 
 const AUTH_TIMEOUT_MS = 5_000;
+export const PRESENCE_EXPIRED_CLOSE_CODE = 1013;
 export const VIEWER_DISCONNECT_GRACE_MS = 180_000;
 export const SLEEP_RESUME_WINDOW_MS = 5 * 60_000;
+
+export type PresenceCloseIntentSource = "stale-presence-expiry" | "heartbeat-expiry";
+
+export function closeExpiredPresenceSocket(
+  socket: Pick<WebSocket, "readyState" | "close">,
+  source: PresenceCloseIntentSource,
+  details: {
+    deviceId?: string;
+    socketConnectionGeneration?: number;
+  } = {},
+): void {
+  const closeAttempted = socket.readyState === WebSocket.OPEN;
+  console.info(JSON.stringify({
+    source: "backend",
+    event: source === "stale-presence-expiry"
+      ? "stale_presence_close_intent"
+      : "heartbeat_expiry_close_intent",
+    timestamp: new Date().toISOString(),
+    ...details,
+    closeCode: PRESENCE_EXPIRED_CLOSE_CODE,
+    closeReasonCategory: source === "stale-presence-expiry"
+      ? "stale_presence_retryable"
+      : "heartbeat_expired_retryable",
+    closeAttempted,
+    socketReadyState: socket.readyState,
+  }));
+  if (closeAttempted) {
+    socket.close(PRESENCE_EXPIRED_CLOSE_CODE, "presence expired");
+  }
+}
+
+function closeReasonCategory(code: number): string {
+  if (code === PRESENCE_EXPIRED_CLOSE_CODE) return "stale_presence_retryable";
+  if (code === 1008) return "policy_or_authentication";
+  if (code === 1001) return "server_shutdown";
+  if (code === 1006) return "abnormal_transport_loss";
+  if (code === 1000) return "normal";
+  return "other";
+}
 
 function noStore(reply: FastifyReply): void {
   reply.header("cache-control", "no-store");
@@ -152,11 +192,21 @@ export async function registerPresenceRoutes(
   const resumeStore = new ResumeSessionStore();
   let serverClosing = false;
 
-  const closeConnection = (connectionId: string): void => {
+  const closeConnection = (
+    connectionId: string,
+    cause: PresenceConnectionCloseCause,
+  ): void => {
     const socket = sockets.get(connectionId);
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.close(1008, "device revoked");
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (cause === "stale") {
+      const connection = connections.get(socket);
+      closeExpiredPresenceSocket(socket, "stale-presence-expiry", {
+        ...(connection?.deviceId ? { deviceId: connection.deviceId } : {}),
+        socketConnectionGeneration: socketConnectionGenerations.get(socket),
+      });
     }
+    else if (cause === "revoked") socket.close(1008, "device revoked");
+    else socket.close(1001, "server shutting down");
   };
 
   const send = (socket: WebSocket, message: ServerMessage | ClientMessage): boolean => {
@@ -192,6 +242,28 @@ export async function registerPresenceRoutes(
       authorizedViewerCount: delivered,
     }));
   };
+  const setSharingState = (
+    deviceId: string,
+    state: { screen: boolean; camera: boolean },
+    reason: string,
+    socket?: WebSocket,
+    sessionId?: string,
+  ): void => {
+    const previous = shareStates.get(deviceId) ?? { screen: false, camera: false };
+    shareStates.set(deviceId, state);
+    if (previous.screen === state.screen && previous.camera === state.camera) return;
+    console.info(JSON.stringify({
+      source: "backend",
+      event: "sharing_state_transition",
+      timestamp: new Date().toISOString(),
+      deviceId,
+      sessionId: sessionId ?? sessionByDevice.get(deviceId),
+      previousSharingState: previous,
+      newSharingState: state,
+      reason,
+      ...(socket ? { socketConnectionGeneration: socketConnectionGenerations.get(socket) } : {}),
+    }));
+  };
   const endSession = (sessionId: string, reason: string, preserveSharingState = false): void => {
     const session = sessions.get(sessionId);
     if (!session) return;
@@ -204,11 +276,20 @@ export async function registerPresenceRoutes(
     if (!preserveSharingState) {
       const previousSharingState = shareStates.get(session.deviceId);
       const inactive = { screen: false, camera: false };
-      shareStates.set(session.deviceId, inactive);
+      setSharingState(session.deviceId, inactive, `session-ended:${reason}`, undefined, sessionId);
       if (previousSharingState?.screen || previousSharingState?.camera) {
         notifyAuthorizedViewers(session.ownerUserId, session.deviceId, inactive);
       }
     }
+    console.info(JSON.stringify({
+      source: "backend",
+      event: "session_ended",
+      timestamp: new Date().toISOString(),
+      deviceId: session.deviceId,
+      sessionId,
+      reason,
+      sharingStateCleared: !preserveSharingState,
+    }));
     const left = { type: "viewer_left" as const, session_id: sessionId, viewer_user_id: session.viewerUserId, reason };
     if (session.owner) send(session.owner.socket, left);
     if (session.viewer) send(session.viewer.socket, left);
@@ -313,29 +394,58 @@ export async function registerPresenceRoutes(
                 candidate.deviceId === connection.deviceId &&
                 candidate.socket !== socket,
             );
+            const previousOwnerSockets = new Set(previousOwners.map((candidate) => candidate.socket));
+            const recoverableSessions = [...sessions.values()].filter(
+              (recoverable) =>
+                recoverable.deviceId === connection.deviceId &&
+                !recoverable.sleepCapabilities &&
+                (!recoverable.owner || previousOwnerSockets.has(recoverable.owner.socket)),
+            );
             console.info(JSON.stringify({
               source: "backend",
               event: "owner-authenticated",
+              timestamp: new Date().toISOString(),
               deviceId: connection.deviceId,
+              socketConnectionGeneration: socketConnectionGenerations.get(socket),
               signalingState: "open",
               replacementSocketCount: previousOwners.length,
+              reattachmentAttempted: recoverableSessions.length > 0,
+              originalSessionIds: recoverableSessions.map((session) => session.id),
             }));
-            const previousOwnerSockets = new Set(previousOwners.map((candidate) => candidate.socket));
-            for (const recoverable of sessions.values()) {
-              if (
-                recoverable.deviceId !== connection.deviceId ||
-                recoverable.sleepCapabilities ||
-                (recoverable.owner && !previousOwnerSockets.has(recoverable.owner.socket))
-              ) continue;
+            if (recoverableSessions.length === 0) {
+              console.info(JSON.stringify({
+                source: "backend",
+                event: "owner_session_reattachment",
+                timestamp: new Date().toISOString(),
+                deviceId: connection.deviceId,
+                socketConnectionGeneration: socketConnectionGenerations.get(socket),
+                originalSessionId: null,
+                reattachmentSucceeded: false,
+              }));
+            }
+            for (const recoverable of recoverableSessions) {
               if (recoverable.ownerGraceTimer) clearTimeout(recoverable.ownerGraceTimer);
               recoverable.ownerGraceTimer = undefined;
               recoverable.ownerGraceExpiresAt = undefined;
               recoverable.owner = connection;
               console.info(JSON.stringify({
                 source: "backend",
+                event: "owner_session_reattachment",
+                timestamp: new Date().toISOString(),
+                deviceId: connection.deviceId,
+                socketConnectionGeneration: socketConnectionGenerations.get(socket),
+                originalSessionId: recoverable.id,
+                reattachmentSucceeded: true,
+              }));
+              console.info(JSON.stringify({
+                source: "backend",
                 event: "owner-session-recovered",
+                timestamp: new Date().toISOString(),
                 deviceId: connection.deviceId,
                 sessionId: recoverable.id,
+                originalSessionId: recoverable.id,
+                socketConnectionGeneration: socketConnectionGenerations.get(socket),
+                reattachmentSucceeded: true,
               }));
               notifySessionRecovery(recoverable);
             }
@@ -367,10 +477,18 @@ export async function registerPresenceRoutes(
           presence.heartbeat(connection.presenceId);
           send(socket, { type: "heartbeat_ack" });
         } catch {
-          socket.close(1008, "connection expired");
+          closeExpiredPresenceSocket(socket, "heartbeat-expiry", {
+            ...(connection.deviceId ? { deviceId: connection.deviceId } : {}),
+            socketConnectionGeneration: socketConnectionGenerations.get(socket),
+          });
         }
       } else if (type === "sharing_state" && connection.role === "owner" && connection.deviceId) {
-        shareStates.set(connection.deviceId, { screen: message.screen, camera: message.camera });
+        setSharingState(
+          connection.deviceId,
+          { screen: message.screen, camera: message.camera },
+          "owner-sharing-state-message",
+          socket,
+        );
         notifyAuthorizedViewers(connection.userId, connection.deviceId, {
           screen: message.screen,
           camera: message.camera,
@@ -719,19 +837,22 @@ export async function registerPresenceRoutes(
             session.sleepCapabilities.expiresAt > Date.now(),
         );
         let ownerSessionRecoverable = false;
+        let ownerSessionEnded = false;
         for (const [id, session] of [...sessions]) {
           if (session.owner?.socket === socket) {
-            if (session.sleepCapabilities && session.sleepCapabilities.expiresAt > Date.now()) {
+            if (code === 1008) {
+              endSession(id, "disconnected");
+              ownerSessionEnded = true;
+            } else if (session.sleepCapabilities && session.sleepCapabilities.expiresAt > Date.now()) {
               resumeStore.markDisconnected(session.id, "owner");
               session.owner = undefined;
-            } else if (code === 1008) {
-              endSession(id, "disconnected");
             } else {
               session.owner = undefined;
               ownerSessionRecoverable = true;
               console.info(JSON.stringify({
                 source: "backend",
                 event: "owner-session-recovery-started",
+                timestamp: new Date().toISOString(),
                 deviceId: session.deviceId,
                 sessionId: session.id,
                 recoveryGraceMs: networkRecoveryGraceMs,
@@ -777,6 +898,23 @@ export async function registerPresenceRoutes(
               candidate.socket !== socket &&
               candidate.socket.readyState === WebSocket.OPEN,
           );
+        const ownerSessionPreserved = !ownerSessionEnded &&
+          (ownerSessionRecoverable || sleepContinuityActive || Boolean(replacementOwnerConnected));
+        if (connection.role === "owner") {
+          console.info(JSON.stringify({
+            source: "backend",
+            event: "owner-socket-disconnected",
+            timestamp: new Date().toISOString(),
+            deviceId: connection.deviceId,
+            sessionIds: affectedSessionIds,
+            closeCode: code,
+            closeReasonCategory: closeReasonCategory(code),
+            socketConnectionGeneration: socketConnectionGenerations.get(socket),
+            replacementSocketExists: Boolean(replacementOwnerConnected),
+            sessionPreserved: ownerSessionPreserved,
+            sessionEnded: ownerSessionEnded,
+          }));
+        }
         if (
           connection.role === "owner" &&
           connection.deviceId &&
@@ -786,14 +924,29 @@ export async function registerPresenceRoutes(
         ) {
           const inactive = { screen: false, camera: false };
           const previous = shareStates.get(connection.deviceId);
-          shareStates.set(connection.deviceId, inactive);
+          setSharingState(
+            connection.deviceId,
+            inactive,
+            "owner-socket-disconnected",
+            socket,
+            affectedSessionIds[0],
+          );
           if (previous?.screen || previous?.camera) {
             notifyAuthorizedViewers(connection.userId, connection.deviceId, inactive);
           }
           console.info(JSON.stringify({
             source: "backend",
             event: "owner-disconnected-sharing-cleared",
+            timestamp: new Date().toISOString(),
             deviceId: connection.deviceId,
+            sessionIds: affectedSessionIds,
+            closeCode: code,
+            closeReasonCategory: closeReasonCategory(code),
+            socketConnectionGeneration: socketConnectionGenerations.get(socket),
+            replacementSocketExists: Boolean(replacementOwnerConnected),
+            sessionPreserved: ownerSessionPreserved,
+            sessionEnded: ownerSessionEnded,
+            reason: "owner-socket-disconnected",
             sharingState: inactive,
           }));
         }
@@ -804,6 +957,8 @@ export async function registerPresenceRoutes(
           ...(connection.deviceId ? { deviceId: connection.deviceId } : {}),
           sessionIds: affectedSessionIds,
           closeCode: code,
+          closeReasonCategory: closeReasonCategory(code),
+          socketConnectionGeneration: socketConnectionGenerations.get(socket),
         }));
         connections.delete(socket);
       }

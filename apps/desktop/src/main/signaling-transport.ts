@@ -6,6 +6,15 @@ import type { SocketEvent } from "../ipc-contract.js";
 type EventSink = (event: SocketEvent) => void;
 type HeartbeatScheduler = (callback: () => void, delayMs: number) => () => void;
 
+function closeReasonCategory(code: number): string {
+  if (code === 1008) return "policy_or_authentication";
+  if (code === 1013) return "retryable_service_unavailable";
+  if (code === 1000) return "normal";
+  if (code === 1001) return "server_shutdown";
+  if (code === 1006) return "abnormal_transport_loss";
+  return "other";
+}
+
 export interface DeviceCredentialLoader {
   load(): Promise<string | null>;
 }
@@ -23,6 +32,9 @@ export class MainSignalingTransport {
   private heartbeatAckCount = 0;
   private activeSessionId: string | undefined;
   private activeRecoveryAttemptId: string | undefined;
+  private hasStartedConnection = false;
+  private reconnectAttemptCount = 0;
+  private activeReconnectAttempt: number | undefined;
 
   get deviceId(): string | undefined { return this.authenticatedDeviceId; }
 
@@ -43,11 +55,38 @@ export class MainSignalingTransport {
   async connect(): Promise<void> {
     if (this.socket) return;
     if (this.connectInFlight) return this.connectInFlight;
+    const reconnectAttempt = this.hasStartedConnection
+      ? ++this.reconnectAttemptCount
+      : undefined;
+    if (reconnectAttempt !== undefined) {
+      this.activeReconnectAttempt = reconnectAttempt;
+      console.info(JSON.stringify({
+        source: "desktop-main",
+        event: "reconnect_attempt_started",
+        timestamp: new Date(this.now()).toISOString(),
+        attempt: reconnectAttempt,
+        socketConnectionGeneration: this.socketConnectionGeneration + 1,
+      }));
+    }
+    this.hasStartedConnection = true;
     const generation = this.generation;
     const pending = this.openSocket(generation);
     this.connectInFlight = pending;
     try {
       await pending;
+    } catch (error) {
+      if (reconnectAttempt !== undefined && this.activeReconnectAttempt === reconnectAttempt) {
+        console.warn(JSON.stringify({
+          source: "desktop-main",
+          event: "reconnect_attempt_failed",
+          timestamp: new Date(this.now()).toISOString(),
+          attempt: reconnectAttempt,
+          socketConnectionGeneration: this.socketConnectionGeneration + 1,
+          closeReasonCategory: "connection_attempt_failed",
+        }));
+        this.activeReconnectAttempt = undefined;
+      }
+      throw error;
     } finally {
       if (this.connectInFlight === pending) this.connectInFlight = undefined;
     }
@@ -68,6 +107,16 @@ export class MainSignalingTransport {
     this.socket = socket;
     socket.once("open", () => {
       if (this.socket !== socket) return;
+      this.emit({
+        type: "authentication-started",
+        connectionGeneration: socketConnectionGeneration,
+      });
+      console.info(JSON.stringify({
+        source: "desktop-main",
+        event: "owner_authentication_started",
+        timestamp: new Date(this.now()).toISOString(),
+        socketConnectionGeneration,
+      }));
       socket.send(JSON.stringify({ type: "auth", token }));
     });
     socket.on("message", (raw) => {
@@ -103,6 +152,18 @@ export class MainSignalingTransport {
           socketConnectionGeneration,
           signalingState: "open",
         }));
+        if (this.activeReconnectAttempt !== undefined) {
+          console.info(JSON.stringify({
+            source: "desktop-main",
+            event: "reconnect_attempt_succeeded",
+            timestamp: new Date(this.now()).toISOString(),
+            deviceId: this.authenticatedDeviceId,
+            attempt: this.activeReconnectAttempt,
+            socketConnectionGeneration,
+          }));
+          this.activeReconnectAttempt = undefined;
+        }
+        this.hasStartedConnection = true;
         this.emit({ type: "open", connectionGeneration: socketConnectionGeneration });
         if (!this.stopHeartbeat) {
           this.stopHeartbeat = this.scheduleHeartbeat(() => {
@@ -196,6 +257,7 @@ export class MainSignalingTransport {
         socketConnectionGeneration,
         signalingState: "closed",
         closeCode: code,
+        closeReasonCategory: closeReasonCategory(code),
         authenticated: this.authenticated,
         heartbeatSentCount: this.heartbeatSentCount,
         heartbeatAckCount: this.heartbeatAckCount,
@@ -203,6 +265,19 @@ export class MainSignalingTransport {
           ? this.now() - this.lastHeartbeatAckAt
           : undefined,
       }));
+      if (this.activeReconnectAttempt !== undefined) {
+        console.warn(JSON.stringify({
+          source: "desktop-main",
+          event: "reconnect_attempt_failed",
+          timestamp: new Date(this.now()).toISOString(),
+          deviceId: this.authenticatedDeviceId,
+          attempt: this.activeReconnectAttempt,
+          socketConnectionGeneration,
+          closeCode: code,
+          closeReasonCategory: closeReasonCategory(code),
+        }));
+        this.activeReconnectAttempt = undefined;
+      }
       this.cleanup(socket);
       this.emit({ type: "close", code, connectionGeneration: socketConnectionGeneration });
     });

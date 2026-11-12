@@ -1,6 +1,7 @@
 import type { WebRtcConfiguration } from "../../../shared/src/webrtc.js";
 
 export type SocketEvent =
+  | { type: "authentication-started"; connectionGeneration: number }
   | { type: "open"; connectionGeneration?: number }
   | { type: "message"; data: string }
   | { type: "close"; code?: number; connectionGeneration?: number }
