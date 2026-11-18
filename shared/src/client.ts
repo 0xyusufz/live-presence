@@ -30,6 +30,15 @@ export type ClientSignalingDiagnostic = {
   event:
     | "websocket_closed"
     | "reconnect_attempt_started"
+    | "reconnect_scheduled"
+    | "client_start_requested"
+    | "socket_adapter_created"
+    | "socket_connect_invoked"
+    | "socket_open_received"
+    | "socket_authentication_received"
+    | "socket_close_received"
+    | "socket_reference_cleared"
+    | "publication_attempted_without_socket"
     | "websocket_reconnected"
     | "owner_authentication_completed"
     | "session_recovery_received"
@@ -98,6 +107,8 @@ export type DesktopDiagnostic = {
   reason?: string;
   signalingState?: "connecting" | "open" | "closed" | "not-connected";
   sharingState?: { screen: boolean; camera: boolean };
+  rendererConnectionGeneration?: number | null;
+  publicationOutcome?: "socket_not_open" | "send_rejected" | "sent";
   sent?: boolean;
   category?: WebRtcFailureCategory | "signaling" | "timeout";
   message?: string;
@@ -121,6 +132,8 @@ export interface SignalingSocket {
   readyState: number;
   connectionGeneration?: number;
   authenticationManaged?: boolean;
+  authenticatedOnOpen?: boolean;
+  authenticatedDeviceId?: string;
   connect?: () => void;
   send(data: string): void | Promise<void>;
   close(): void;
@@ -131,6 +144,19 @@ export interface SignalingSocket {
 }
 
 export type SignalingSocketFactory = () => SignalingSocket;
+function bestEffortDiagnostic<T>(
+  callback?: (diagnostic: T) => void,
+): ((diagnostic: T) => void) | undefined {
+  if (!callback) return undefined;
+  return (diagnostic) => {
+    try {
+      callback(diagnostic);
+    } catch {
+      // Diagnostic sinks are best-effort and must not interrupt signaling.
+    }
+  };
+}
+
 export type ClientScheduler = {
   now: () => number;
   random: () => number;
@@ -202,6 +228,8 @@ export abstract class WebRtcClient {
   protected socketConnectionGeneration = 0;
   protected recoveryAttemptId: string | undefined;
   protected readonly pendingIceCandidatesByNegotiation = new Map<string, unknown[]>();
+  private readonly authenticationInFlightSockets = new WeakSet<SignalingSocket>();
+  private authenticationInFlightWithoutSocket = false;
   private readonly reconnectOptions: Required<Omit<ReconnectOptions, "scheduler">>;
   protected readonly clientScheduler: ClientScheduler;
   onRemoteTrack: ((track: WebRtcTrack, mid: string | null, kind?: "screen" | "camera") => void) | undefined;
@@ -249,10 +277,27 @@ export abstract class WebRtcClient {
     this.setLifecycle(this.peer && this.sessionId ? "RECONNECTING" : "CONNECTING");
     const socket = this.socketFactory();
     this.socketConnectionGeneration = socket.connectionGeneration ?? this.socketConnectionGeneration + 1;
+    this.reportClientDiagnostic("socket_adapter_created", {
+      reason: "shared client created signaling socket adapter",
+    });
     this.socket = socket;
     this.signalingAuthenticated = false;
     socket.onopen = () => {
       if (this.socket !== socket || this.terminal || this.closing) return;
+      this.reportClientDiagnostic("socket_open_received", {
+        reason: "signaling socket open callback received",
+      });
+      if (socket.authenticatedOnOpen) {
+        void this.completeAuthentication(
+          socket,
+          "owner",
+          "authenticated main-process transport reused",
+          socket.authenticatedDeviceId,
+        ).catch((error: unknown) => {
+          if (this.socket === socket && !this.terminal && !this.closing) this.fail(error);
+        });
+        return;
+      }
       if (!socket.authenticationManaged) {
         if (!token) {
           this.fail(new Error("Signaling credential is unavailable"), "signaling");
@@ -280,12 +325,18 @@ export abstract class WebRtcClient {
     };
     socket.onerror = () => {
       if (this.socket !== socket) return;
-      socket.close();
+      if (!socket.authenticationManaged) socket.close();
     };
     socket.onclose = (event) => {
       if (this.socket !== socket) return;
+      this.reportClientDiagnostic("socket_close_received", {
+        reason: `socket close code ${event?.code ?? "unknown"}`,
+      });
       this.socket = undefined;
       this.signalingAuthenticated = false;
+      this.reportClientDiagnostic("socket_reference_cleared", {
+        reason: "current signaling socket closed",
+      });
       const preservePeer = this.shouldPreservePeerOnSocketClose();
       if (!preservePeer) this.closePeer();
       this.clearStableTimer();
@@ -304,6 +355,9 @@ export abstract class WebRtcClient {
         }
       }
     };
+    this.reportClientDiagnostic("socket_connect_invoked", {
+      reason: "shared client invoked signaling socket connect",
+    });
     socket.connect?.();
   }
 
@@ -391,32 +445,12 @@ export abstract class WebRtcClient {
   protected async handleMessage(message: ServerMessage, sourceSocket?: SignalingSocket): Promise<void> {
     if (this.terminal || this.closing) return;
     if (message.type === "authenticated") {
-      if (message.role === "owner") this.ownerDeviceId = message.device_id;
-      await this.onAuthenticated(sourceSocket);
-      if (
-        this.terminal ||
-        this.closing ||
-        (sourceSocket && this.socket !== sourceSocket)
-      ) return;
-      this.signalingAuthenticated = true;
-      this.startStableTimer();
-      this.onSignalingAuthenticated();
-      if (message.role === "owner") {
-        this.reportClientDiagnostic("owner_authentication_completed", {
-          reason: "authenticated message processed by shared signaling client",
-          messageType: "authenticated",
-        });
-        if (this.socketConnectionGeneration > 1) {
-          this.reportClientDiagnostic("websocket_reconnected", {
-            reason: "replacement signaling socket authenticated",
-            messageType: "authenticated",
-          });
-        }
-      }
-      if (this.peer?.state === "connected") {
-        this.completeRecovery();
-        this.setLifecycle("CONNECTED");
-      }
+      await this.completeAuthentication(
+        sourceSocket,
+        message.role,
+        "authenticated message received from signaling server",
+        message.device_id,
+      );
       return;
     }
 
@@ -559,6 +593,67 @@ export abstract class WebRtcClient {
     }
   }
 
+  private async completeAuthentication(
+    sourceSocket: SignalingSocket | undefined,
+    role: "owner" | "viewer",
+    reason: string,
+    deviceId?: string,
+  ): Promise<void> {
+    if (
+      this.terminal ||
+      this.closing ||
+      (sourceSocket && this.socket !== sourceSocket)
+    ) return;
+    if (role === "owner" && deviceId) this.ownerDeviceId = deviceId;
+    const reusedAuthenticatedTransport = sourceSocket?.authenticatedOnOpen === true;
+    if (
+      this.signalingAuthenticated ||
+      (sourceSocket
+        ? this.authenticationInFlightSockets.has(sourceSocket)
+        : this.authenticationInFlightWithoutSocket)
+    ) return;
+    if (sourceSocket) this.authenticationInFlightSockets.add(sourceSocket);
+    else this.authenticationInFlightWithoutSocket = true;
+    try {
+      await this.onAuthenticated(sourceSocket);
+      if (
+        this.terminal ||
+        this.closing ||
+        (sourceSocket && this.socket !== sourceSocket)
+      ) return;
+      this.reportClientDiagnostic("socket_authentication_received", {
+        reason,
+        ...(deviceId ? { messageType: "authenticated" } : {}),
+      });
+      this.signalingAuthenticated = true;
+      this.startStableTimer();
+      this.onSignalingAuthenticated();
+      if (role === "owner") {
+        this.reportClientDiagnostic("owner_authentication_completed", {
+          reason: reusedAuthenticatedTransport
+            ? "authenticated main-process transport reused"
+            : "authenticated message processed by shared signaling client",
+          ...(deviceId ? { messageType: "authenticated" } : {}),
+        });
+        if (this.socketConnectionGeneration > 1) {
+          this.reportClientDiagnostic("websocket_reconnected", {
+            reason: reusedAuthenticatedTransport
+              ? "authenticated main-process transport reused"
+              : "replacement signaling socket authenticated",
+            ...(deviceId ? { messageType: "authenticated" } : {}),
+          });
+        }
+      }
+      if (this.peer?.state === "connected") {
+        this.completeRecovery();
+        this.setLifecycle("CONNECTED");
+      }
+    } finally {
+      if (sourceSocket) this.authenticationInFlightSockets.delete(sourceSocket);
+      else this.authenticationInFlightWithoutSocket = false;
+    }
+  }
+
   private queueIceCandidate(negotiationId: string, candidate: unknown): void {
     let queued = this.pendingIceCandidatesByNegotiation.get(negotiationId);
     if (!queued) {
@@ -643,6 +738,10 @@ export abstract class WebRtcClient {
     );
     const jittered = exponential * (0.5 + this.clientScheduler.random());
     this.reconnectAttempts += 1;
+    this.reportClientDiagnostic("reconnect_scheduled", {
+      attempt: this.reconnectAttempts,
+      reason: `signaling reconnect scheduled after ${Math.round(jittered)}ms`,
+    });
     this.reconnectTimer = this.clientScheduler.setTimeout(() => {
       this.reconnectTimer = undefined;
       if (!this.closing && !this.terminal) {
@@ -730,20 +829,24 @@ export abstract class WebRtcClient {
     event: ClientSignalingDiagnostic["event"],
     fields: Partial<Omit<ClientSignalingDiagnostic, "event" | "timestamp">> = {},
   ): void {
-    this.onClientDiagnostic({
-      event,
-      timestamp: new Date().toISOString(),
-      ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
-      ...(this.sessionId ? { sessionId: this.sessionId } : {}),
-      ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
-      peerGeneration: this.peerGeneration,
-      negotiationId: this.peer?.negotiationId,
-      socketConnectionGeneration: this.socketConnectionGeneration,
-      peerState: this.peer?.state,
-      iceState: this.peer?.diagnostic.iceConnectionState,
-      lifecycle: this.lifecycleValue,
-      ...fields,
-    });
+    try {
+      this.onClientDiagnostic({
+        event,
+        timestamp: new Date().toISOString(),
+        ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+        ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+        ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
+        peerGeneration: this.peerGeneration,
+        negotiationId: this.peer?.negotiationId,
+        socketConnectionGeneration: this.socketConnectionGeneration,
+        peerState: this.peer?.state,
+        iceState: this.peer?.diagnostic.iceConnectionState,
+        lifecycle: this.lifecycleValue,
+        ...fields,
+      });
+    } catch {
+      // Diagnostics are best-effort and must not interrupt signaling.
+    }
   }
 
   private clearRecoveryTimer(): void {
@@ -835,7 +938,12 @@ export type DesktopClientOptions = {
   refreshPresence?: () => Promise<void>;
   onTerminalError?: (error: Error) => void;
   onDiagnostic?: (diagnostic: DesktopDiagnostic) => void;
-  onSharingStateConfirmed?: (state: { deviceId: string; screen: boolean; camera: boolean }) => void;
+  onSharingStateConfirmed?: (state: {
+    deviceId: string;
+    screen: boolean;
+    camera: boolean;
+    rendererConnectionGeneration: number | null;
+  }) => void;
 };
 
 export class DesktopWebRtcClient extends WebRtcClient {
@@ -851,7 +959,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
     this.onOwnerSessionEnded = options.onOwnerSessionEnded;
     this.refreshPresence = options.refreshPresence;
     this.onTerminalError = options.onTerminalError;
-    this.onDiagnostic = options.onDiagnostic;
+    this.onDiagnostic = bestEffortDiagnostic(options.onDiagnostic);
     this.onSharingStateConfirmed = options.onSharingStateConfirmed;
   }
 
@@ -867,7 +975,12 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private readonly refreshPresence?: () => Promise<void>;
   private readonly onTerminalError?: (error: Error) => void;
   private readonly onDiagnostic?: (diagnostic: DesktopDiagnostic) => void;
-  private readonly onSharingStateConfirmed?: (state: { deviceId: string; screen: boolean; camera: boolean }) => void;
+  private readonly onSharingStateConfirmed?: (state: {
+    deviceId: string;
+    screen: boolean;
+    camera: boolean;
+    rendererConnectionGeneration: number | null;
+  }) => void;
   private sharingState = { screen: false, camera: false };
   private confirmedSharingState: { screen: boolean; camera: boolean } | undefined;
   private pendingSharingResumed = false;
@@ -881,6 +994,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private queuedRecoveryEvent = false;
   private pendingIceRecovery = false;
   private restartOfferGeneration: number | undefined;
+  private recoveryTimeoutHandled = false;
 
   protected override onPeerState(state: PeerState): void {
     if (this.terminal || this.closing) return;
@@ -1061,6 +1175,16 @@ export class DesktopWebRtcClient extends WebRtcClient {
 
   protected override onSocketClosed(code?: number): void {
     this.awaitingControlPlaneRecovery = Boolean(this.peer && this.sessionId);
+    if (this.awaitingControlPlaneRecovery) {
+      this.pendingIceRecovery = true;
+      if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
+      this.iceRecoveryTimer = undefined;
+      this.restartOperationId += 1;
+      this.iceRestartInFlight = false;
+      this.clearRestartResponseTimer();
+      this.peer?.markRestartOfferFailed();
+      this.restartOfferGeneration = undefined;
+    }
     this.onRecoveryDiagnostic("signaling_disconnected");
     this.onDiagnostic?.({
       event: "signaling",
@@ -1086,6 +1210,8 @@ export class DesktopWebRtcClient extends WebRtcClient {
       lifecycle: this.lifecycle,
       deviceId: message.device_id,
       signalingState: this.getSignalingState(),
+      socketConnectionGeneration: this.socketConnectionGeneration,
+      rendererConnectionGeneration: this.socket?.connectionGeneration ?? null,
       sharingState: this.confirmedSharingState,
       sent: true,
       message: "Backend confirmed sharing state",
@@ -1094,6 +1220,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
       deviceId: message.device_id,
       screen: message.screen,
       camera: message.camera,
+      rendererConnectionGeneration: this.socket?.connectionGeneration ?? null,
     });
     if (
       this.peer &&
@@ -1175,38 +1302,67 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private async publishSharingState(): Promise<void> {
     const socket = this.socket;
     if (!socket || socket.readyState !== 1) {
-      this.reportSharingState(false, "Owner signaling socket is not open; state will be sent after authentication");
+      if (!socket) {
+        this.reportClientDiagnostic("publication_attempted_without_socket", {
+          reason: "sharing-state publication attempted without a socket reference",
+        });
+      }
+      this.reportSharingState(
+        "socket_not_open",
+        "Owner signaling socket is not open; state will be sent after authentication",
+        socket,
+      );
       return;
     }
     try {
       await this.sendAndWait({ type: "sharing_state", ...this.sharingState });
-      this.reportSharingState(true, "Sharing state accepted by the main signaling transport");
+      this.reportSharingState("sent", "Sharing state accepted by the main signaling transport", socket);
     } catch (error) {
-      this.reportSharingState(false, error instanceof Error ? error.message : "Sharing-state send failed");
+      this.reportSharingState(
+        "send_rejected",
+        error instanceof Error ? error.message : "Sharing-state send failed",
+        socket,
+      );
       throw error;
     }
   }
 
-  private reportSharingState(sent: boolean, message: string): void {
-    this.onDiagnostic?.({
-      event: "sharing-state",
-      lifecycle: this.lifecycle,
-      ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
-      signalingState: this.getSignalingState(),
-      sharingState: { ...this.sharingState },
-      sent,
-      message,
-    });
+  private reportSharingState(
+    publicationOutcome: "socket_not_open" | "send_rejected" | "sent",
+    message: string,
+    socket: SignalingSocket | undefined,
+  ): void {
+    try {
+      this.onDiagnostic?.({
+        event: "sharing-state",
+        lifecycle: this.lifecycle,
+        ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+        signalingState: this.getSignalingState(),
+        socketConnectionGeneration: socket?.connectionGeneration ?? this.socketConnectionGeneration,
+        rendererConnectionGeneration: socket?.connectionGeneration ?? null,
+        sharingState: { ...this.sharingState },
+        publicationOutcome,
+        sent: publicationOutcome === "sent",
+        message,
+      });
+    } catch {
+      // Diagnostics are best-effort and must not interrupt signaling.
+    }
   }
 
   protected override onSessionEnded(reason: string): void {
-    if (
-      reason === "viewer_grace_expired" ||
-      reason === "authorization_revoked" ||
-      reason === "recovery_timeout"
-    ) {
+    if (reason === "viewer_grace_expired" || reason === "authorization_revoked") {
       this.onOwnerSessionEnded?.(reason);
     }
+  }
+
+  protected override onRecoveryTimeout(_error: Error): void {
+    if (this.recoveryTimeoutHandled) return;
+    this.recoveryTimeoutHandled = true;
+    this.pendingSharingResumed = false;
+    void this.stopSharingSession()
+      .then(() => this.onOwnerSessionEnded?.("recovery_timeout"))
+      .catch(() => this.onOwnerSessionEnded?.("recovery_timeout"));
   }
 
   protected override shouldPreservePeerOnSocketClose(): boolean {
@@ -1224,6 +1380,9 @@ export class DesktopWebRtcClient extends WebRtcClient {
     }
     await this.publishSharingState();
     if (this.terminal || this.closing || (sourceSocket && this.socket !== sourceSocket)) return;
+    if (this.recoveryTimeoutHandled && !this.sharingState.screen) {
+      this.setLifecycle("IDLE");
+    }
     if (this.resume && this.resume.expiresAt > this.clientScheduler.now()) {
       this.resumeRequestId ??= crypto.randomUUID();
       this.send({
@@ -1338,20 +1497,23 @@ export class DesktopWebRtcClient extends WebRtcClient {
         this.peer !== peer ||
         this.peerGeneration !== generation ||
         this.terminal ||
-        this.closing ||
-        !this.signalingAuthenticated
+        this.closing
       ) return;
+      if (!this.signalingAuthenticated || this.socket?.readyState !== 1) {
+        this.pendingIceRecovery = true;
+        return;
+      }
       if (this.iceRestartInFlight || this.restartOfferGeneration === generation || peer.restartOfferPending) return;
       this.reportClientDiagnostic("recovery_attempt_started", {
         attempt: this.iceRestartAttempts + 1,
         reason,
       });
-      this.iceRestartAttempts += 1;
+      const restartAttempt = this.iceRestartAttempts + 1;
       const operationId = ++this.restartOperationId;
       this.iceRestartInFlight = true;
       const refreshesIceConfiguration = Boolean(this.loadIceServers || this.loadManagedIceServers);
       this.onRecoveryDiagnostic(
-        `ice_restart_started_${this.iceRestartAttempts}`,
+        `ice_restart_started_${restartAttempt}`,
         undefined,
         undefined,
         reason,
@@ -1365,7 +1527,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
           ...(this.sessionId ? { sessionId: this.sessionId } : {}),
           ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
           peerGeneration: generation,
-          attempt: this.iceRestartAttempts,
+          attempt: restartAttempt,
           reason,
         });
       }
@@ -1386,7 +1548,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
             ...(this.sessionId ? { sessionId: this.sessionId } : {}),
             ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
             peerGeneration: generation,
-            attempt: this.iceRestartAttempts,
+            attempt: restartAttempt,
           });
         }
         if (this.socket?.readyState !== 1 || !this.signalingAuthenticated) {
@@ -1394,6 +1556,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
           this.pendingIceRecovery = true;
           return false;
         }
+        this.iceRestartAttempts = restartAttempt;
         return peer.createOffer({ iceRestart: true }).then(() => true);
       }).then((offerCreated) => {
         if (
@@ -1438,6 +1601,10 @@ export class DesktopWebRtcClient extends WebRtcClient {
           this.terminal ||
           this.closing
         ) return;
+        const signalingAvailable = this.socket?.readyState === 1 && this.signalingAuthenticated;
+        if (signalingAvailable && this.iceRestartAttempts < restartAttempt) {
+          this.iceRestartAttempts = restartAttempt;
+        }
         this.iceRestartInFlight = false;
         this.onRecoveryDiagnostic(
           `ice_restart_failed_${this.iceRestartAttempts}`,
@@ -1445,7 +1612,10 @@ export class DesktopWebRtcClient extends WebRtcClient {
           undefined,
           "restart offer or ICE configuration failed",
         );
-        if (this.socket?.readyState !== 1 || !this.signalingAuthenticated) return;
+        if (!signalingAvailable) {
+          this.pendingIceRecovery = true;
+          return;
+        }
         if (this.iceRestartAttempts < 2) {
           this.scheduleIceRecovery(true, false, "restart-offer-failed");
         } else {
@@ -1514,6 +1684,9 @@ export class DesktopWebRtcClient extends WebRtcClient {
   }
 
   async start(reconnecting = false): Promise<void> {
+    this.reportClientDiagnostic("client_start_requested", {
+      reason: reconnecting ? "reconnect start requested" : "initial start requested",
+    });
     if (this.startInFlight) return this.startInFlight;
     this.startInFlight = this.startInternal(reconnecting);
     try {
@@ -1614,6 +1787,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
   setSharingState(screen: boolean, camera: boolean): Promise<void> {
     if (camera && !screen) throw new Error("camera sharing requires an active screen track");
     this.sharingState = { screen, camera };
+    if (screen) this.recoveryTimeoutHandled = false;
     if (!screen) {
       this.resume = undefined;
       this.resumeRequestId = undefined;
@@ -1781,7 +1955,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
     this.deviceId = options.deviceId;
     this.loadIceServers = options.loadIceServers;
     this.refreshPresence = options.refreshPresence;
-    this.onDiagnostic = options.onDiagnostic;
+    this.onDiagnostic = bestEffortDiagnostic(options.onDiagnostic);
     this.onTerminalError = options.onTerminalError;
     this.onViewerSessionEnded = options.onSessionEnded;
     this.onSharingState = options.onSharingState;

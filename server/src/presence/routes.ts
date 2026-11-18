@@ -22,6 +22,14 @@ export const SLEEP_RESUME_WINDOW_MS = 5 * 60_000;
 
 export type PresenceCloseIntentSource = "stale-presence-expiry" | "heartbeat-expiry";
 
+export function isLatestOwnerSocket<T extends object>(
+  deviceId: string,
+  socket: T,
+  latestOwnerSockets: ReadonlyMap<string, T>,
+): boolean {
+  return latestOwnerSockets.get(deviceId) === socket;
+}
+
 export function closeExpiredPresenceSocket(
   socket: Pick<WebSocket, "readyState" | "close">,
   source: PresenceCloseIntentSource,
@@ -186,6 +194,7 @@ export async function registerPresenceRoutes(
     }
   };
   const connections = new Map<WebSocket, Connection>();
+  const latestOwnerSockets = new Map<string, WebSocket>();
   const sessions = new Map<string, Session>();
   const sessionByDevice = new Map<string, string>();
   const shareStates = new Map<string, { screen: boolean; camera: boolean }>();
@@ -388,6 +397,7 @@ export async function registerPresenceRoutes(
           clearTimeout(authTimer);
           send(socket, { type: "authenticated", role: connection.role, ...(connection.deviceId ? { device_id: connection.deviceId } : {}) });
           if (connection.role === "owner" && connection.deviceId) {
+            latestOwnerSockets.set(connection.deviceId, socket);
             const previousOwners = [...connections.values()].filter(
               (candidate) =>
                 candidate.role === "owner" &&
@@ -483,6 +493,25 @@ export async function registerPresenceRoutes(
           });
         }
       } else if (type === "sharing_state" && connection.role === "owner" && connection.deviceId) {
+        const replacementOwner = !isLatestOwnerSocket(
+          connection.deviceId,
+          socket,
+          latestOwnerSockets,
+        );
+        const attachedSessionId = sessionByDevice.get(connection.deviceId);
+        if (replacementOwner) {
+          console.info(JSON.stringify({
+            source: "backend",
+            event: "stale-owner-sharing-state-ignored",
+            timestamp: new Date().toISOString(),
+            deviceId: connection.deviceId,
+            sessionId: attachedSessionId,
+            socketConnectionGeneration: socketConnectionGenerations.get(socket),
+            replacementSocketExists: true,
+            sharingState: { screen: message.screen, camera: message.camera },
+          }));
+          return;
+        }
         setSharingState(
           connection.deviceId,
           { screen: message.screen, camera: message.camera },
@@ -960,6 +989,13 @@ export async function registerPresenceRoutes(
           closeReasonCategory: closeReasonCategory(code),
           socketConnectionGeneration: socketConnectionGenerations.get(socket),
         }));
+        if (
+          connection.role === "owner" &&
+          connection.deviceId &&
+          latestOwnerSockets.get(connection.deviceId) === socket
+        ) {
+          latestOwnerSockets.delete(connection.deviceId);
+        }
         connections.delete(socket);
       }
     });

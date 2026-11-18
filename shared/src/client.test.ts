@@ -12,6 +12,9 @@ import {
   type ClientScheduler,
 } from "./client.js";
 import { parseServerMessage } from "./protocol.js";
+import { stopOwnerCapture } from "../../apps/desktop/src/renderer/sharing-status.js";
+import { createSignalingSocket } from "../../apps/desktop/src/renderer/signaling-socket.js";
+import type { LivePresenceBridge, SocketEvent } from "../../apps/desktop/src/ipc-contract.js";
 import type {
   WebRtcDiagnostic,
   WebRtcPeer,
@@ -116,6 +119,7 @@ class MockConnection implements WebRtcPeerConnection {
 
 class MockSocket implements SignalingSocket {
   readyState = 0;
+  connectionGeneration?: number;
   authenticationManaged?: boolean;
   peer: MockSocket | undefined;
   sent: string[] = [];
@@ -514,6 +518,7 @@ test("desktop reconnects with jittered exponential backoff and stable reset", as
   const scheduler = new ManualScheduler();
   const sockets: MockSocket[] = [];
   const connections: MockConnection[] = [];
+  const diagnostics: DesktopDiagnostic[] = [];
   const client = new DesktopWebRtcClient({
     socketFactory: () => {
       const socket = new MockSocket();
@@ -527,6 +532,7 @@ test("desktop reconnects with jittered exponential backoff and stable reset", as
     },
     loadRefreshCredential: async () => "credential",
     reconnect: { scheduler, maxAttempts: 4 },
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
   });
 
   await client.start();
@@ -534,6 +540,10 @@ test("desktop reconnects with jittered exponential backoff and stable reset", as
   sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }) });
   await new Promise((resolve) => setImmediate(resolve));
   sockets[0]!.close();
+  assert.equal(
+    diagnostics.some((diagnostic) => diagnostic.event === "reconnect_scheduled"),
+    true,
+  );
   assert.equal(scheduler.runNext(), 1_500);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(sockets.length, 2);
@@ -548,6 +558,246 @@ test("desktop reconnects with jittered exponential backoff and stable reset", as
   assert.equal(scheduler.runNext(), 60_000);
   sockets[2]!.close();
   assert.equal(scheduler.runNext(), 1_500);
+});
+
+test("a superseded pending renderer adapter clears the shared socket and reconnects", async () => {
+  const scheduler = new ManualScheduler();
+  const connects: Array<ReturnType<typeof deferred<number>>> = [];
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const rendererDiagnostics: Array<Record<string, unknown>> = [];
+  const clientDiagnostics: DesktopDiagnostic[] = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > = {
+    connectSignaling: () => {
+      const request = deferred<number>();
+      connects.push(request);
+      return request.promise;
+    },
+    sendSignaling: async () => {},
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {
+        const index = listeners.indexOf(callback);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+  };
+  const adapters: SignalingSocket[] = [];
+  const client = new DesktopWebRtcClient({
+    socketFactory: () => {
+      const socket = createSignalingSocket(bridge, (_level, event) => rendererDiagnostics.push(event));
+      adapters.push(socket);
+      return socket;
+    },
+    peerFactory: () => new MockConnection(),
+    managedAuthentication: true,
+    reconnect: { scheduler, maxAttempts: 2 },
+    onDiagnostic: (diagnostic) => clientDiagnostics.push(diagnostic),
+  });
+
+  await client.start();
+  assert.equal(clientDiagnostics.some((item) => item.event === "client_start_requested"), true);
+  assert.equal(clientDiagnostics.some((item) => item.event === "socket_adapter_created"), true);
+  assert.equal(clientDiagnostics.some((item) => item.event === "socket_connect_invoked"), true);
+  assert.equal(connects.length, 1);
+  const replacement = createSignalingSocket(bridge, (_level, event) => rendererDiagnostics.push(event));
+  replacement.connect?.();
+  assert.equal(connects.length, 2);
+
+  connects[0]!.resolve(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(adapters[0]!.readyState, 3);
+  assert.equal(clientDiagnostics.some((item) => item.event === "socket_reference_cleared"), true);
+  assert.equal(clientDiagnostics.some((item) => item.event === "reconnect_scheduled"), true);
+  assert.equal(
+    rendererDiagnostics.some((item) =>
+      item.event === "renderer_connection_generation_association_rejected"),
+    true,
+  );
+
+  client.setSharingState(true, false);
+  assert.equal(
+    clientDiagnostics.some((item) =>
+      item.event === "publication_attempted_without_socket"),
+    true,
+  );
+  scheduler.runNext();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    clientDiagnostics.some((item) => item.event === "reconnect_attempt_started"),
+    true,
+  );
+  assert.equal(connects.length, 3);
+
+  connects[2]!.resolve(3);
+  await new Promise((resolve) => setImmediate(resolve));
+  connects[1]!.resolve(2);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(adapters[1]!.connectionGeneration, 3);
+  assert.equal(adapters[1]!.readyState, 0);
+  assert.equal(adapters[0]!.readyState, 3);
+
+  client.close();
+  replacement.close();
+});
+
+test("an authenticated main-transport reuse authenticates the new renderer adapter on open", async () => {
+  const pending = deferred<number>();
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const sends: Array<{ data: string; generation: number }> = [];
+  const diagnostics: DesktopDiagnostic[] = [];
+  const confirmations: Array<{ deviceId: string; screen: boolean; camera: boolean }> = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > = {
+    connectSignaling: () => pending.promise,
+    sendSignaling: async (data, generation) => { sends.push({ data, generation }); },
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {
+        const index = listeners.indexOf(callback);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+  };
+  const client = new DesktopWebRtcClient({
+    socketFactory: () => createSignalingSocket(bridge, () => {}),
+    peerFactory: () => new MockConnection(),
+    managedAuthentication: true,
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    onSharingStateConfirmed: ({ deviceId, screen, camera }) =>
+      confirmations.push({ deviceId, screen, camera }),
+  });
+  client.setSharingState(true, false);
+
+  await client.start();
+  pending.resolve(42);
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[0]!({
+    type: "open",
+    connectionGeneration: 42,
+    authenticatedTransportReuse: true,
+    deviceId: "00000000-0000-0000-0000-000000000042",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(sends, [{
+    data: JSON.stringify({ type: "sharing_state", screen: true, camera: false }),
+    generation: 42,
+  }]);
+  assert.equal(
+    diagnostics.some((diagnostic) =>
+      diagnostic.event === "socket_authentication_received" &&
+      diagnostic.reason === "authenticated main-process transport reused"),
+    true,
+  );
+  assert.equal(
+    diagnostics.some((diagnostic) =>
+      diagnostic.event === "owner_authentication_completed" &&
+      diagnostic.reason === "authenticated main-process transport reused"),
+    true,
+  );
+
+  listeners[0]!({
+    type: "message",
+    connectionGeneration: 42,
+    data: JSON.stringify({
+      type: "sharing_state_updated",
+      device_id: "00000000-0000-0000-0000-000000000042",
+      screen: true,
+      camera: false,
+    }),
+  });
+  assert.deepEqual(confirmations, [{
+    deviceId: "00000000-0000-0000-0000-000000000042",
+    screen: true,
+    camera: false,
+  }]);
+  assert.notEqual(client.lifecycle, "FAILED");
+
+  client.close();
+});
+
+test("open followed by authenticated message does not duplicate pending authentication work", async () => {
+  const pendingAuthenticationWork = deferred<void>();
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const sentMessages: Array<Record<string, unknown>> = [];
+  const diagnostics: DesktopDiagnostic[] = [];
+  let refreshPresenceCalls = 0;
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > = {
+    connectSignaling: async () => 43,
+    sendSignaling: async (data) => {
+      sentMessages.push(JSON.parse(data) as Record<string, unknown>);
+    },
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {
+        const index = listeners.indexOf(callback);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+  };
+  const client = new DesktopWebRtcClient({
+    socketFactory: () => createSignalingSocket(bridge, () => {}),
+    peerFactory: () => new MockConnection(),
+    managedAuthentication: true,
+    refreshPresence: () => {
+      refreshPresenceCalls += 1;
+      return pendingAuthenticationWork.promise;
+    },
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+  });
+  client.setSharingState(true, false);
+
+  try {
+    await client.start();
+    await new Promise((resolve) => setImmediate(resolve));
+    listeners[0]!({
+      type: "open",
+      connectionGeneration: 43,
+      authenticatedTransportReuse: true,
+      deviceId: "00000000-0000-0000-0000-000000000043",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    listeners[0]!({
+      type: "message",
+      connectionGeneration: 43,
+      data: JSON.stringify({
+        type: "authenticated",
+        role: "owner",
+        device_id: "00000000-0000-0000-0000-000000000043",
+      }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(refreshPresenceCalls, 1);
+    pendingAuthenticationWork.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(sentMessages, [{
+      type: "sharing_state",
+      screen: true,
+      camera: false,
+    }]);
+    assert.equal(
+      diagnostics.filter((diagnostic) => diagnostic.event === "owner_authentication_completed").length,
+      1,
+    );
+  } finally {
+    pendingAuthenticationWork.resolve();
+    client.close();
+  }
 });
 
 test("stale socket callbacks cannot affect a newer authenticated connection", async () => {
@@ -748,9 +998,15 @@ test("idle owner presence reconnects after signaling loss and remains credential
 test("sharing activation reports only socket delivery until backend acknowledgement", async () => {
   const scheduler = new ManualScheduler();
   const socket = new MockSocket();
+  socket.connectionGeneration = 1;
   socket.authenticationManaged = true;
   const diagnostics: DesktopDiagnostic[] = [];
-  const confirmations: Array<{ deviceId: string; screen: boolean; camera: boolean }> = [];
+  const confirmations: Array<{
+    deviceId: string;
+    screen: boolean;
+    camera: boolean;
+    rendererConnectionGeneration: number | null;
+  }> = [];
   const client = new DesktopWebRtcClient({
     socketFactory: () => socket,
     peerFactory: () => new MockConnection(),
@@ -763,9 +1019,18 @@ test("sharing activation reports only socket delivery until backend acknowledgem
   client.setSharingState(true, false);
   assert.equal(diagnostics.at(-1)?.event, "sharing-state");
   assert.equal(diagnostics.at(-1)?.sent, false);
+  assert.equal(diagnostics.at(-1)?.publicationOutcome, "socket_not_open");
+  assert.equal(diagnostics.at(-1)?.signalingState, "not-connected");
+  assert.equal(diagnostics.at(-1)?.socketConnectionGeneration, 0);
+  assert.equal(diagnostics.at(-1)?.rendererConnectionGeneration, null);
   assert.equal(confirmations.length, 0);
 
   await client.start();
+  await client.setSharingState(true, false);
+  assert.equal(diagnostics.at(-1)?.publicationOutcome, "socket_not_open");
+  assert.equal(diagnostics.at(-1)?.signalingState, "connecting");
+  assert.equal(diagnostics.at(-1)?.socketConnectionGeneration, 1);
+  assert.equal(diagnostics.at(-1)?.rendererConnectionGeneration, 1);
   socket.open();
   socket.onmessage?.({
     data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "00000000-0000-0000-0000-000000000001" }),
@@ -779,6 +1044,14 @@ test("sharing activation reports only socket delivery until backend acknowledgem
   assert.equal(
     diagnostics.filter((diagnostic) => diagnostic.event === "sharing-state").at(-1)?.sent,
     true,
+  );
+  assert.equal(
+    diagnostics.filter((diagnostic) => diagnostic.event === "sharing-state").at(-1)?.publicationOutcome,
+    "sent",
+  );
+  assert.equal(
+    diagnostics.filter((diagnostic) => diagnostic.event === "sharing-state").at(-1)?.socketConnectionGeneration,
+    1,
   );
   assert.equal(confirmations.length, 0);
 
@@ -794,12 +1067,53 @@ test("sharing activation reports only socket delivery until backend acknowledgem
     deviceId: "00000000-0000-0000-0000-000000000001",
     screen: true,
     camera: false,
+    rendererConnectionGeneration: 1,
   }]);
 
   socket.disconnect();
+  assert.equal(diagnostics.some((diagnostic) => diagnostic.event === "socket_close_received"), true);
+  assert.equal(diagnostics.some((diagnostic) => diagnostic.event === "socket_reference_cleared"), true);
+  assert.equal(diagnostics.some((diagnostic) => diagnostic.event === "reconnect_scheduled"), true);
   client.setSharingState(true, false);
+  assert.equal(
+    diagnostics.some((diagnostic) => diagnostic.event === "publication_attempted_without_socket"),
+    true,
+  );
   assert.equal(diagnostics.at(-1)?.sent, false);
+  assert.equal(diagnostics.at(-1)?.publicationOutcome, "socket_not_open");
   assert.equal(confirmations.length, 1);
+  client.close();
+});
+
+test("diagnostic callback failures do not interrupt authenticated signaling", async () => {
+  const socket = new MockSocket();
+  socket.authenticationManaged = true;
+  const client = new DesktopWebRtcClient({
+    socketFactory: () => socket,
+    peerFactory: () => new MockConnection(),
+    managedAuthentication: true,
+    onDiagnostic: () => { throw new Error("diagnostic sink failed"); },
+  });
+  client.setSharingState(true, false);
+
+  await client.start();
+  socket.open();
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "authenticated",
+      role: "owner",
+      device_id: "00000000-0000-0000-0000-000000000001",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)!), {
+    type: "sharing_state",
+    screen: true,
+    camera: false,
+  });
+  assert.equal(client.lifecycle, "CONNECTING");
   client.close();
 });
 
@@ -1411,6 +1725,7 @@ async function connectedDesktop(
     isSharingActive?: () => boolean;
     prepareOwnerPeer?: (peer: WebRtcPeer) => Promise<void>;
     peerFactory?: () => MockConnection;
+    onOwnerSessionEnded?: (reason: string) => void;
   },
 ) {
   const sockets: MockSocket[] = [];
@@ -1433,6 +1748,7 @@ async function connectedDesktop(
     isSharingActive: configuration?.isSharingActive,
     onTerminalError,
     onDiagnostic: configuration?.onDiagnostic,
+    onOwnerSessionEnded: configuration?.onOwnerSessionEnded,
     prepareOwnerPeer: configuration?.prepareOwnerPeer,
   });
   await client.start();
@@ -1499,6 +1815,54 @@ test("desktop retries an ICE restart offer failure once without replacing the pe
   assert.equal(peerConnection.offerCalls, 3);
   assert.equal(peerConnection.closed, false);
   assert.equal(client.lifecycle, "RECONNECTING");
+  client.close();
+});
+
+test("desktop resumes a pending ICE restart after signaling reauthentication", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const diagnostics: DesktopDiagnostic[] = [];
+  const screen = { readyState: "live" };
+  const camera = { readyState: "live" };
+  const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    {
+      isSharingActive: () => true,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      prepareOwnerPeer: async (peer) => {
+        await peer.replaceTrack("screen", screen);
+        await peer.replaceTrack("camera", camera);
+      },
+    },
+  );
+  await client.setSharingState(true, true);
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+  socket.disconnect(1013);
+  assert.equal(peerConnection.closed, false);
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sockets.length, 2);
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.closed, false);
+  assert.equal(peerConnection.offerCalls, 2);
+  assert.equal(peerConnection.replaceCalls[0]?.track, screen);
+  assert.equal(peerConnection.replaceCalls[1]?.track, camera);
+  assert.ok(diagnostics.some((diagnostic) =>
+    diagnostic.event === "recovery_attempt_started" && diagnostic.attempt === 1));
+  assert.ok(sockets[1]!.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "offer" &&
+      message.session_id === "00000000-0000-0000-0000-000000000002";
+  }));
   client.close();
 });
 
@@ -1575,17 +1939,22 @@ test("desktop refreshes ICE servers and applies the new configuration before res
   client.close();
 });
 
-test("desktop retries restart failure but waits for the bounded recovery deadline", async () => {
+test("desktop retires sharing at the recovery deadline without terminalizing signaling", async () => {
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();
   const terminalErrors: Error[] = [];
   const diagnostics: DesktopDiagnostic[] = [];
-  const { client, connection: peerConnection } = await connectedDesktop(
+  const endedReasons: string[] = [];
+  const { client, socket, connection: peerConnection } = await connectedDesktop(
     scheduler,
     connection,
     (error) => terminalErrors.push(error),
-    { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+    {
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      onOwnerSessionEnded: (reason) => endedReasons.push(reason),
+    },
   );
+  await client.setSharingState(true, false);
   connection.failOfferCount = 2;
   peerConnection.connectionState = "failed";
   peerConnection.onconnectionstatechange?.();
@@ -1597,12 +1966,99 @@ test("desktop retries restart failure but waits for the bounded recovery deadlin
   assert.equal(terminalErrors.length, 0);
   assert.equal(client.lifecycle, "RECONNECTING");
   assert.equal(scheduler.runNext(), NETWORK_RECOVERY_TIMEOUT_MS);
-  assert.match(terminalErrors[0]?.message ?? "", /network recovery timed out after 180 seconds/);
-  assert.equal(client.lifecycle, "FAILED");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.lifecycle, "IDLE");
+  assert.equal(peerConnection.closed, true);
+  assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  assert.ok(socket.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "sharing_state" && message.screen === false && message.camera === false;
+  }));
+  assert.equal(terminalErrors.length, 0);
   assert.ok(diagnostics.some((diagnostic) =>
     diagnostic.event === "recovery_timed_out" &&
     diagnostic.sessionId === "00000000-0000-0000-0000-000000000002" &&
     diagnostic.peerGeneration !== undefined));
+  client.close();
+});
+
+test("recovery timeout stops approved tracks and reauthenticates in idle without recapturing", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const cleanupActions: string[] = [];
+  const screenTrack = {
+    readyState: "live",
+    stopped: false,
+    stop() { this.stopped = true; this.readyState = "ended"; },
+  };
+  const cameraTrack = {
+    readyState: "live",
+    stopped: false,
+    stop() { this.stopped = true; this.readyState = "ended"; },
+  };
+  let ownerPeerPreparations = 0;
+  let cleanupCompletion: Promise<boolean> | undefined;
+  const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    {
+      isSharingActive: () => screenTrack.readyState === "live",
+      prepareOwnerPeer: async () => { ownerPeerPreparations += 1; },
+      onOwnerSessionEnded: (reason) => {
+        assert.equal(reason, "recovery_timeout");
+        cleanupCompletion = stopOwnerCapture(
+          screenTrack,
+          cameraTrack,
+          async () => { cleanupActions.push("camera-intent-false"); },
+          async () => { cleanupActions.push("screen-active-false"); },
+          () => cleanupActions.push("cleanup-acknowledged"),
+        );
+      },
+    },
+  );
+  await client.setSharingState(true, true);
+  const initialPreparations = ownerPeerPreparations;
+  socket.disconnect(1013);
+  assert.equal(peerConnection.closed, false);
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(cleanupCompletion);
+  assert.equal(await cleanupCompletion, false);
+
+  assert.equal(peerConnection.closed, true);
+  assert.equal(screenTrack.stopped, true);
+  assert.equal(cameraTrack.stopped, true);
+  assert.deepEqual(cleanupActions.sort(), [
+    "camera-intent-false",
+    "cleanup-acknowledged",
+    "screen-active-false",
+  ]);
+  assert.equal(client.lifecycle, "CLOSED");
+  assert.equal(client.failure, undefined);
+  assert.equal(sockets.length, 1);
+
+  scheduler.runNext();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sockets.length, 2);
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(client.lifecycle, "IDLE");
+  assert.equal(client.failure, undefined);
+  assert.equal(ownerPeerPreparations, initialPreparations);
+  assert.equal(sockets[1]!.sent.filter((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "sharing_state" && message.screen === false && message.camera === false;
+  }).length, 1);
+  assert.equal(sockets[1]!.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "offer";
+  }), false);
   client.close();
 });
 
@@ -2050,6 +2506,7 @@ test("closing the control plane cancels pending ICE restart activity", async () 
 test("desktop reconnects after retryable stale-presence closure and retains live approved tracks", async () => {
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();
+  const diagnostics: DesktopDiagnostic[] = [];
   const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
   const cameraTrack: WebRtcTrack = { kind: "video", readyState: "live" };
   const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
@@ -2062,6 +2519,7 @@ test("desktop reconnects after retryable stale-presence closure and retains live
         await peer.replaceTrack("screen", screenTrack);
         await peer.replaceTrack("camera", cameraTrack);
       },
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
     },
   );
   await client.setSharingState(true, true);
@@ -2085,6 +2543,16 @@ test("desktop reconnects after retryable stale-presence closure and retains live
     { index: 0, track: screenTrack },
     { index: 1, track: cameraTrack },
   ]);
+  assert.deepEqual(
+    sockets[1]!.sent.map((message) => JSON.parse(message) as Record<string, unknown>)
+      .find((message) => message.type === "sharing_state"),
+    { type: "sharing_state", screen: true, camera: true },
+  );
+  assert.equal(
+    diagnostics.filter((diagnostic) =>
+      diagnostic.event === "sharing-state" && diagnostic.publicationOutcome === "sent").length >= 1,
+    true,
+  );
   client.close();
 });
 

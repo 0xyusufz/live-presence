@@ -7,16 +7,18 @@ const bridge: LivePresenceBridge = {
   indicatorReady: () => ipcRenderer.invoke("capture:indicator-ready") as Promise<boolean>,
   saveCredential: (value) => ipcRenderer.invoke("credential:save", value) as Promise<void>,
   getServerUrl: () => ipcRenderer.invoke("config:server-url") as Promise<string>,
-  connectSignaling: () => ipcRenderer.invoke("signaling:connect") as Promise<void>,
-  sendSignaling: (value) => ipcRenderer.invoke("signaling:send", value) as Promise<void>,
-  closeSignaling: () => ipcRenderer.send("signaling:close"),
+  connectSignaling: (correlationId) =>
+    ipcRenderer.invoke("signaling:connect", correlationId) as Promise<number>,
+  sendSignaling: (value, connectionGeneration) =>
+    ipcRenderer.invoke("signaling:send", value, connectionGeneration) as Promise<void>,
+  closeSignaling: (connectionGeneration) => ipcRenderer.send("signaling:close", connectionGeneration),
   onSocketEvent: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, value: SocketEvent) => callback(value);
     ipcRenderer.on("signaling:event", listener);
     return () => ipcRenderer.removeListener("signaling:event", listener);
   },
   loadIceServers: () => ipcRenderer.invoke("ice:load") as Promise<WebRtcConfiguration>,
-  beginScreenCapture: () => ipcRenderer.send("capture:screen-pending"),
+  beginScreenCapture: (attemptId) => ipcRenderer.send("capture:screen-pending", attemptId),
   getPickerSources: () => ipcRenderer.invoke("picker:list") as Promise<Array<{ id: string; name: string }>>,
   selectPickerSource: (id) => ipcRenderer.send("picker:select", id),
   cancelPicker: () => ipcRenderer.send("picker:cancel"),
@@ -26,6 +28,7 @@ const bridge: LivePresenceBridge = {
   acknowledgeCleanup: () => ipcRenderer.send("capture:cleanup-ack"),
   reportSleepMarker: (accepted) => ipcRenderer.send("system:sleep-marker-result", accepted),
   notifySharingResumed: () => ipcRenderer.send("notification:sharing-resumed"),
+  reportCaptureDiagnostic: (event, details = {}) => ipcRenderer.send("capture:diagnostic", event, details),
   stopFromIndicator: () => ipcRenderer.send("indicator:stop"),
   onAppEvent: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, value: AppEvent) => callback(value);

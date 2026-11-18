@@ -13,8 +13,11 @@ import { extname, join } from "node:path";
 import { parseClientMessage } from "../../../shared/src/protocol.js";
 import { mimeType, resolveAssetPath } from "./main/app-protocol.js";
 import { SafeStorageCredentialStore } from "./main/credential-store.js";
+import { CaptureDiagnostics, isCaptureAttemptId } from "./main/capture-diagnostics.js";
 import { DisplayCapturePicker } from "./main/display-capture.js";
 import { MainSignalingTransport } from "./main/signaling-transport.js";
+import { createSignalingConnectHandler } from "./main/signaling-connect-handler.js";
+import { WindowRestorer } from "./main/window-restoration.js";
 import type { AppEvent, SocketEvent } from "./ipc-contract.js";
 
 protocol.registerSchemesAsPrivileged([
@@ -43,10 +46,22 @@ let stopping = false;
 let quittingAfterCleanup = false;
 let sleepMarkerAcknowledged = false;
 let systemSuspended = false;
+let activeCaptureAttemptId: string | undefined;
+let indicatorCreation: Promise<void> | undefined;
 
 const credentials = new SafeStorageCredentialStore(app.getPath("userData"));
-const picker = new DisplayCapturePicker();
+const captureDiagnostics = new CaptureDiagnostics(() => join(app.getPath("userData"), "screen-capture.log"));
+const picker = new DisplayCapturePicker(undefined, (level, event, details) => {
+  captureDiagnostics.log(event, { level, ...details });
+}, () => activeCaptureAttemptId);
 let transport: MainSignalingTransport | undefined;
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+const mainWindowRestorer = new WindowRestorer(() => mainWindow, createMainWindow);
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", restoreApplicationWindow);
+}
 
 function emitAppEvent(event: AppEvent): void {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("app:event", event);
@@ -172,10 +187,38 @@ async function createIndicator(): Promise<void> {
   window.webContents.on("render-process-gone", () => {
     if (shareActive || capturePending) void stopSharing("indicator-crashed", true);
   });
-  await window.loadURL("app://bundle/indicator");
+  try {
+    await window.loadURL("app://bundle/indicator");
+  } catch (error) {
+    if (indicatorWindow === window) {
+      indicatorWindow = undefined;
+      indicatorReady = false;
+    }
+    if (!window.isDestroyed()) window.destroy();
+    throw error;
+  }
   indicatorReady = true;
   window.hide();
   emitAppEvent({ type: "indicator-ready", ready: true });
+}
+
+async function ensureIndicator(): Promise<void> {
+  if (indicatorCreation) return indicatorCreation;
+  if (indicatorWindow && !indicatorWindow.isDestroyed() && indicatorReady) return;
+
+  const creation = createIndicator();
+  indicatorCreation = creation;
+  try {
+    await creation;
+  } finally {
+    if (indicatorCreation === creation) indicatorCreation = undefined;
+  }
+}
+
+function restoreApplicationWindow(): void {
+  void mainWindowRestorer.restore()
+    .then(ensureIndicator)
+    .catch(() => console.error("Could not restore the application window."));
 }
 
 function showIndicator(): boolean {
@@ -206,6 +249,7 @@ function forceRendererTermination(): void {
   indicatorWindow = undefined;
   shareActive = false;
   capturePending = false;
+  activeCaptureAttemptId = undefined;
   cameraIntent = false;
   app.exit(1);
 }
@@ -219,6 +263,7 @@ async function stopSharing(reason: string, quitAfter = false): Promise<void> {
   quittingAfterCleanup ||= quitAfter;
   const needsRendererCleanup = shareActive || capturePending;
   capturePending = false;
+  activeCaptureAttemptId = undefined;
   cameraIntent = false;
   picker.cancel();
   if (!needsRendererCleanup && !quittingAfterCleanup) {
@@ -274,6 +319,12 @@ function validateWebOrigin(value: string): string {
 }
 
 function installIpcHandlers(): void {
+  ipcMain.on("capture:diagnostic", (event, name: unknown, details: unknown) => {
+    if (!mainSender(event) || typeof name !== "string" || name.length > 100 ||
+      name === "owner_signaling_transport" ||
+      typeof details !== "object" || details === null || Array.isArray(details)) return;
+    captureDiagnostics.log(name, details);
+  });
   ipcMain.handle("credential:exists", async (event) => {
     if (!mainSender(event)) throw new Error("invalid IPC sender");
     return credentials.has();
@@ -290,18 +341,42 @@ function installIpcHandlers(): void {
     if (!mainSender(event)) throw new Error("invalid IPC sender");
     return validateApiUrl(API_URL);
   });
-  ipcMain.handle("signaling:connect", async (event) => {
-    if (!mainSender(event)) throw new Error("invalid IPC sender");
-    transport ??= new MainSignalingTransport(
-      validateApiUrl(API_URL),
-      validateWebOrigin(WEB_ORIGIN),
-      credentials,
-      emitSocketEvent,
-    );
-    await transport.connect();
-  });
-  ipcMain.handle("signaling:send", (event, raw: unknown) => {
-    if (!mainSender(event) || typeof raw !== "string" || raw.length > 128 * 1024) {
+  ipcMain.handle("signaling:connect", createSignalingConnectHandler({
+    isSenderAllowed: mainSender,
+    getTransport: () => transport,
+    setTransport: (value) => { transport = value; },
+    createTransport: () => {
+      const instance = new MainSignalingTransport(
+        validateApiUrl(API_URL),
+        validateWebOrigin(WEB_ORIGIN),
+        credentials,
+        emitSocketEvent,
+      );
+      instance.setDiagnosticLogger((level, entry) => {
+        captureDiagnostics.log("owner_signaling_transport", {
+          ...entry,
+          transportEvent: entry.event,
+          level,
+        });
+      });
+      return instance;
+    },
+    isAuthenticatedReuse: (instance) => instance.hasAuthenticatedOpenSocket,
+    connect: (instance) => instance.connect(),
+    log: (diagnostic) => {
+      captureDiagnostics.log("owner_signaling_transport", {
+        transportEvent: diagnostic.event,
+        correlationId: diagnostic.correlationId ?? undefined,
+        level: diagnostic.level,
+        connectErrorName: diagnostic.connectErrorName,
+        connectErrorCategory: diagnostic.connectErrorCategory,
+        connectErrorMessage: diagnostic.connectErrorMessage,
+      });
+    },
+  }));
+  ipcMain.handle("signaling:send", (event, raw: unknown, connectionGeneration: unknown) => {
+    if (!mainSender(event) || typeof raw !== "string" || raw.length > 128 * 1024 ||
+      typeof connectionGeneration !== "number" || !Number.isSafeInteger(connectionGeneration)) {
       console.warn(JSON.stringify({
         source: "desktop-main",
         event: "signaling-ipc-rejected",
@@ -321,7 +396,7 @@ function installIpcHandlers(): void {
         throw new Error("signaling message is invalid or not allowed");
       }
       if (!transport) throw new Error("owner signaling transport is unavailable");
-      transport?.send(JSON.stringify(parsed));
+      transport?.send(JSON.stringify(parsed), connectionGeneration);
       return;
     } catch (error) {
       console.warn(JSON.stringify({
@@ -346,10 +421,27 @@ function installIpcHandlers(): void {
       throw error;
     }
   });
-  ipcMain.on("signaling:close", (event) => {
+  ipcMain.on("signaling:close", (event, connectionGeneration: unknown) => {
     if (!mainSender(event)) return;
-    transport?.close();
-    transport = undefined;
+    if (typeof connectionGeneration !== "number" || !Number.isSafeInteger(connectionGeneration)) {
+      console.warn(JSON.stringify({
+        source: "desktop-main",
+        event: "signaling_close_ipc",
+        timestamp: new Date().toISOString(),
+        requestedGeneration: null,
+        matchedActiveConnection: false,
+        reason: "invalid_generation",
+      }));
+      return;
+    }
+    const matchedActiveConnection = transport?.close(connectionGeneration, "renderer_ipc") ?? false;
+    console.info(JSON.stringify({
+      source: "desktop-main",
+      event: "signaling_close_ipc",
+      timestamp: new Date().toISOString(),
+      requestedGeneration: connectionGeneration,
+      matchedActiveConnection,
+    }));
   });
   ipcMain.handle("ice:load", async (event) => {
     if (!mainSender(event)) throw new Error("invalid IPC sender");
@@ -361,11 +453,13 @@ function installIpcHandlers(): void {
     );
     return transport.loadIceServers();
   });
-  ipcMain.on("capture:screen-pending", (event) => {
-    if (!mainSender(event) || !indicatorReady || shareActive || capturePending) {
+  ipcMain.on("capture:screen-pending", (event, attemptId: unknown) => {
+    if (!mainSender(event) || !isCaptureAttemptId(attemptId) ||
+      !indicatorReady || shareActive || capturePending) {
       emitAppEvent({ type: "stop-sharing", reason: "indicator-not-ready" });
       return;
     }
+    activeCaptureAttemptId = attemptId;
     capturePending = true;
     startWatchdog();
     console.info(JSON.stringify({
@@ -383,6 +477,7 @@ function installIpcHandlers(): void {
     if (!active) {
       shareActive = false;
       capturePending = false;
+      activeCaptureAttemptId = undefined;
       cameraIntent = false;
       hideIndicator();
       return;
@@ -393,6 +488,11 @@ function installIpcHandlers(): void {
     }
     capturePending = false;
     shareActive = true;
+    captureDiagnostics.log("screen_capture_activation_confirmed_by_main", {
+      attemptId: activeCaptureAttemptId,
+      screen: true,
+      camera: false,
+    });
     console.info(JSON.stringify({
       source: "desktop-main",
       event: "screen-capture-confirmed",
@@ -464,7 +564,7 @@ function installPermissions(): void {
   });
 }
 
-async function createMainWindow(): Promise<void> {
+async function createMainWindow(): Promise<BrowserWindow> {
   const window = new BrowserWindow({
     ...windowOptions(920, 680),
     minWidth: 620,
@@ -501,8 +601,14 @@ async function createMainWindow(): Promise<void> {
     }
     if (!shareActive && indicatorWindow && !indicatorWindow.isDestroyed()) indicatorWindow.close();
   });
-  await window.loadURL("app://bundle/");
-  window.show();
+  try {
+    await window.loadURL("app://bundle/");
+    return window;
+  } catch (error) {
+    if (mainWindow === window) mainWindow = undefined;
+    if (!window.isDestroyed()) window.destroy();
+    throw error;
+  }
 }
 
 app.on("before-quit", (event) => {
@@ -516,12 +622,13 @@ app.on("before-quit", (event) => {
 });
 
 app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return;
   await installAppProtocol();
   installIpcHandlers();
   picker.install();
   installPermissions();
-  await createMainWindow();
-  await createIndicator();
+  await mainWindowRestorer.restore();
+  await ensureIndicator();
 
   setInterval(() => {
     if (!systemSuspended && (shareActive || capturePending) &&
@@ -550,11 +657,8 @@ app.whenReady().then(async () => {
     sleepMarkerAcknowledged = false;
   });
   app.on("activate", () => {
-    if (!mainWindow || mainWindow.isDestroyed()) {
-      void createMainWindow().then(async () => {
-        if (!indicatorWindow || indicatorWindow.isDestroyed()) await createIndicator();
-      });
-    }
+    if (!hasSingleInstanceLock) return;
+    restoreApplicationWindow();
   });
 }).catch((error: unknown) => {
   console.error("Desktop startup failed", error);

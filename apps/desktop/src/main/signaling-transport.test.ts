@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { once } from "node:events";
+import type { Duplex } from "node:stream";
 import { test } from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
 import { MainSignalingTransport } from "./signaling-transport.js";
@@ -39,6 +41,14 @@ async function waitForCondition(condition: () => boolean): Promise<void> {
   }
 }
 
+async function waitForDiagnostic(
+  diagnostics: Array<Record<string, unknown>>,
+  eventName: string,
+): Promise<Record<string, unknown>> {
+  await waitForCondition(() => diagnostics.some((entry) => entry.event === eventName));
+  return diagnostics.find((entry) => entry.event === eventName)!;
+}
+
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -46,6 +56,64 @@ function deferred<T>(): {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((complete) => { resolve = complete; });
   return { promise, resolve };
+}
+
+async function createDelayedUpgradeServer(
+  authenticate: boolean,
+  connectFirstUpgrade = false,
+): Promise<{
+  server: ReturnType<typeof createServer>;
+  webSocketServer: WebSocketServer;
+  url: string;
+  getUpgradeCount: () => number;
+  destroyUpgradeSockets: () => void;
+}> {
+  const server = createServer();
+  const webSocketServer = new WebSocketServer({ noServer: true });
+  const upgradeSockets = new Set<Duplex>();
+  let upgradeCount = 0;
+  let connectionCount = 0;
+  server.on("upgrade", (request, socket, head) => {
+    upgradeCount += 1;
+    upgradeSockets.add(socket);
+    socket.once("close", () => upgradeSockets.delete(socket));
+    if (upgradeCount === 1 && !connectFirstUpgrade) return;
+    webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+      webSocketServer.emit("connection", webSocket, request);
+    });
+  });
+  if (authenticate) {
+    webSocketServer.on("connection", (socket: WebSocket) => {
+      connectionCount += 1;
+      const isFirstConnection = connectionCount === 1;
+      if (isFirstConnection && connectFirstUpgrade) {
+        socket.close = () => socket;
+      }
+      socket.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (message.type === "auth" && !(isFirstConnection && connectFirstUpgrade)) {
+          socket.send(JSON.stringify({
+            type: "authenticated",
+            role: "owner",
+            device_id: "00000000-0000-0000-0000-000000000001",
+          }));
+        }
+      });
+    });
+  }
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  return {
+    server,
+    webSocketServer,
+    url: `http://127.0.0.1:${address.port}`,
+    getUpgradeCount: () => upgradeCount,
+    destroyUpgradeSockets: () => {
+      for (const socket of upgradeSockets) socket.destroy();
+    },
+  };
 }
 
 test("owner transport shares one authenticated connection, heartbeats, and closes cleanly", async () => {
@@ -97,6 +165,14 @@ test("owner transport shares one authenticated connection, heartbeats, and close
     const opened = await waitForEvent(events, "open");
     assert.equal(opened.type, "open");
     if (opened.type === "open") assert.equal(opened.connectionGeneration, 1);
+    const eventCountBeforeReuse = events.length;
+    assert.equal(await transport.connect(), 1);
+    const reusedOpen = events.slice(eventCountBeforeReuse).find((event) => event.type === "open");
+    assert.ok(reusedOpen);
+    if (reusedOpen?.type === "open") {
+      assert.equal(reusedOpen.authenticatedTransportReuse, true);
+      assert.equal(reusedOpen.deviceId, "00000000-0000-0000-0000-000000000001");
+    }
     assert.equal(connectionCount, 1);
 
     transport.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }));
@@ -454,6 +530,668 @@ test("owner transport does not open a socket without a saved credential", async 
     assert.equal(connectionCount, 0);
   } finally {
     transport.close();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+});
+
+test("owner authentication timeout closes retryably and permits a fresh connection", async () => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  let connectionCount = 0;
+  server.on("connection", (socket: WebSocket) => {
+    connectionCount += 1;
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+      if (message.type === "auth" && connectionCount > 1) {
+        socket.send(JSON.stringify({
+          type: "authenticated",
+          role: "owner",
+          device_id: "00000000-0000-0000-0000-000000000001",
+        }));
+      }
+    });
+  });
+  const events: SocketEvent[] = [];
+  const transport = new MainSignalingTransport(
+    `http://127.0.0.1:${address.port}`,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    20,
+  );
+
+  try {
+    await transport.connect();
+    const closed = await waitForEvent(events, "close", 1_000);
+    assert.equal(closed.type, "close");
+    if (closed.type === "close") {
+      assert.equal(closed.code, 1013);
+      assert.equal(closed.connectionGeneration, 1);
+    }
+
+    const replacementConnection = once(server, "connection");
+    assert.equal(await transport.connect(), 2);
+    await replacementConnection;
+    await waitForCondition(() =>
+      events.some((event) => event.type === "open" && event.connectionGeneration === 2));
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+  } finally {
+    transport.close();
+    server.clients.forEach((socket) => socket.terminate());
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+});
+
+test("a WebSocket stuck in CONNECTING is retired at the connection setup deadline", async () => {
+  const { server, webSocketServer, url, destroyUpgradeSockets } =
+    await createDelayedUpgradeServer(false);
+  const events: SocketEvent[] = [];
+  const transport = new MainSignalingTransport(
+    url,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    100,
+  );
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    const closed = await waitForEvent(events, "close", 1_000);
+    assert.equal(closed.type, "close");
+    if (closed.type === "close") {
+      assert.equal(closed.code, 1013);
+      assert.equal(closed.connectionGeneration, 1);
+    }
+    assert.equal(events.some((event) => event.type === "open"), false);
+  } finally {
+    transport.close();
+    webSocketServer.clients.forEach((socket) => socket.terminate());
+    destroyUpgradeSockets();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+});
+
+test("a fresh connection succeeds after a CONNECTING socket times out", async () => {
+  const { server, webSocketServer, url, getUpgradeCount, destroyUpgradeSockets } =
+    await createDelayedUpgradeServer(true);
+  const events: SocketEvent[] = [];
+  const transport = new MainSignalingTransport(
+    url,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    100,
+  );
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    const firstClose = await waitForEvent(events, "close", 1_000);
+    assert.equal(firstClose.type, "close");
+    if (firstClose.type === "close") assert.equal(firstClose.code, 1013);
+
+    assert.equal(await transport.connect(), 2);
+    await waitForCondition(() =>
+      events.some((event) => event.type === "open" && event.connectionGeneration === 2));
+    assert.equal(getUpgradeCount(), 2);
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+  } finally {
+    transport.close();
+    webSocketServer.clients.forEach((socket) => socket.terminate());
+    destroyUpgradeSockets();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
+  }
+});
+
+test("late events from a timed-out socket cannot affect its authenticated replacement", async () => {
+  const { server, webSocketServer, url, getUpgradeCount, destroyUpgradeSockets } =
+    await createDelayedUpgradeServer(true, true);
+  const events: SocketEvent[] = [];
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const transport = new MainSignalingTransport(
+    url,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    100,
+    20,
+    undefined,
+    (_level, entry) => diagnostics.push(entry),
+  );
+  let retiredSocket: WebSocket | undefined;
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    await waitForCondition(() => getUpgradeCount() === 1);
+    retiredSocket = (transport as unknown as { socket?: WebSocket }).socket;
+    assert.ok(retiredSocket);
+
+    const retiredClose = await waitForEvent(events, "close", 1_000);
+    assert.equal(retiredClose.type, "close");
+    if (retiredClose.type === "close") {
+      assert.equal(retiredClose.code, 1013);
+      assert.equal(retiredClose.connectionGeneration, 1);
+    }
+    assert.equal(await transport.connect(), 2);
+    await waitForCondition(() =>
+      events.some((event) => event.type === "open" && event.connectionGeneration === 2));
+    await waitForDiagnostic(diagnostics, "authentication_accepted");
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+
+    await waitForCondition(() =>
+      retiredSocket!.listenerCount("error") === 0 &&
+      retiredSocket!.listenerCount("close") === 0);
+    assert.equal(retiredSocket.readyState, WebSocket.CLOSED);
+    assert.equal(retiredSocket.listenerCount("open"), 0);
+    assert.equal(retiredSocket.listenerCount("message"), 0);
+
+    const eventCountBeforeLateEvents = events.length;
+    const diagnosticCountBeforeLateEvents = diagnostics.length;
+    retiredSocket.emit("open");
+    retiredSocket.emit("message", Buffer.from(JSON.stringify({
+      type: "authenticated",
+      role: "owner",
+      device_id: "00000000-0000-0000-0000-000000000002",
+    })), false);
+    retiredSocket.emit("close", 1013, Buffer.from("late close"));
+
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+    assert.equal(events.length, eventCountBeforeLateEvents);
+    assert.equal(diagnostics.length, diagnosticCountBeforeLateEvents);
+    assert.equal(
+      diagnostics.some((entry) =>
+        entry.event === "connection_attempt_ended" &&
+        entry.attemptId === 1 &&
+        entry.outcome === "setup_timeout"),
+      true,
+    );
+    assert.equal(
+      events.filter((event) => event.type === "open" && event.connectionGeneration === 2).length,
+      1,
+    );
+    assert.equal(
+      events.some((event) => event.type === "open" && event.connectionGeneration === 1),
+      false,
+    );
+    assert.equal(
+      events.some((event) =>
+        event.type === "message" && event.connectionGeneration === 1),
+      false,
+    );
+    assert.equal(
+      events.some((event) => event.type === "close" && event.connectionGeneration === 2),
+      false,
+    );
+    assert.equal(
+      (transport as unknown as { socket?: WebSocket }).socket?.readyState,
+      WebSocket.OPEN,
+    );
+  } finally {
+    transport.close();
+    webSocketServer.clients.forEach((socket) => socket.terminate());
+    retiredSocket?.terminate();
+    destroyUpgradeSockets();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
+  }
+});
+
+test("WebSocket construction failures end the attempt with safe diagnostics", async () => {
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const failure = Object.assign(
+    new Error("connect ECONNREFUSED 192.0.2.10:3000 Bearer abcdefghijklmnopqrstuvwxyz"),
+    { code: "ECONNREFUSED" },
+  );
+  const transport = new MainSignalingTransport(
+    "http://localhost:3000",
+    "http://localhost:5173",
+    { load: async () => "sensitive-device-credential" },
+    () => undefined,
+    15_000,
+    undefined,
+    undefined,
+    100,
+    100,
+    () => { throw failure; },
+    (_level, entry) => diagnostics.push(entry),
+  );
+
+  await assert.rejects(transport.connect(), /ECONNREFUSED/);
+  assert.equal(transport.deviceId, undefined);
+  assert.deepEqual(
+    diagnostics.filter((entry) => [
+      "connection_attempt_started",
+      "credential_loading_started",
+      "credential_loading_completed",
+      "websocket_construction_started",
+      "websocket_construction_failed",
+      "connection_attempt_ended",
+    ].includes(String(entry.event))).map((entry) => entry.event),
+    [
+      "connection_attempt_started",
+      "credential_loading_started",
+      "credential_loading_completed",
+      "websocket_construction_started",
+      "websocket_construction_failed",
+      "connection_attempt_ended",
+    ],
+  );
+  const logged = JSON.stringify(diagnostics);
+  assert.equal(logged.includes("sensitive-device-credential"), false);
+  assert.equal(logged.includes("192.0.2.10"), false);
+  assert.equal(logged.includes("abcdefghijklmnopqrstuvwxyz"), false);
+  assert.equal(
+    diagnostics.find((entry) => entry.event === "websocket_construction_failed")?.errorCode,
+    "ECONNREFUSED",
+  );
+  assert.equal(
+    diagnostics.find((entry) => entry.event === "websocket_construction_failed")?.errorMessage,
+    "connection refused",
+  );
+  transport.close();
+});
+
+test("a WebSocket error before open is retained in diagnostics and ends the attempt", async () => {
+  const server = createServer();
+  server.on("upgrade", (_request, socket) => socket.destroy());
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const events: SocketEvent[] = [];
+  const transport = new MainSignalingTransport(
+    `http://127.0.0.1:${address.port}`,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    1_000,
+    100,
+    undefined,
+    (_level, entry) => diagnostics.push(entry),
+  );
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    const error = await waitForDiagnostic(diagnostics, "websocket_error");
+    const closed = await waitForDiagnostic(diagnostics, "websocket_close");
+    assert.equal(error.stage, "websocket_open");
+    assert.equal(closed.expected, false);
+    assert.equal(transport.deviceId, undefined);
+    assert.equal(events.some((event) => event.type === "close" && event.connectionGeneration === 1), true);
+    assert.equal(
+      diagnostics.some((entry) =>
+        entry.event === "connection_attempt_ended" &&
+        entry.attemptId === 1 &&
+        entry.outcome === "websocket_closed"),
+      true,
+    );
+  } finally {
+    transport.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("an unexpected HTTP response before open is diagnosed without response contents", async () => {
+  const server = createServer();
+  server.on("upgrade", (_request, socket) => {
+    socket.end("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nX-Diagnostic-Test: private-value\r\n\r\n");
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const events: SocketEvent[] = [];
+  const transport = new MainSignalingTransport(
+    `http://127.0.0.1:${address.port}`,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    1_000,
+    100,
+    undefined,
+    (_level, entry) => diagnostics.push(entry),
+  );
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    const response = await waitForDiagnostic(diagnostics, "websocket_unexpected_response");
+    await waitForDiagnostic(diagnostics, "websocket_close");
+    assert.equal(response.statusCode, 503);
+    assert.equal(response.statusClass, "5xx");
+    assert.equal(response.responseMetadata, "headers_and_body_omitted");
+    assert.equal(transport.deviceId, undefined);
+    assert.equal(events.some((event) => event.type === "open"), false);
+    assert.equal(JSON.stringify(diagnostics).includes("private-value"), false);
+    assert.equal(
+      diagnostics.some((entry) =>
+        entry.event === "connection_attempt_ended" &&
+        entry.attemptId === 1 &&
+        entry.outcome === "websocket_closed"),
+      true,
+    );
+  } finally {
+    transport.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("setup timeout preserves an earlier WebSocket error diagnostic", async () => {
+  const { server, webSocketServer, url, destroyUpgradeSockets } =
+    await createDelayedUpgradeServer(false);
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const events: SocketEvent[] = [];
+  const transport = new MainSignalingTransport(
+    url,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    100,
+    100,
+    undefined,
+    (_level, entry) => diagnostics.push(entry),
+  );
+  let socket: WebSocket | undefined;
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    await waitForCondition(() => server.listening);
+    socket = (transport as unknown as { socket?: WebSocket }).socket;
+    assert.ok(socket);
+    socket.emit("error", Object.assign(new Error("connect ECONNRESET 198.51.100.4:443"), {
+      code: "ECONNRESET",
+    }));
+
+    const error = await waitForDiagnostic(diagnostics, "websocket_error");
+    const timeout = await waitForDiagnostic(diagnostics, "connection_setup_timeout");
+    assert.equal(error.errorCode, "ECONNRESET");
+    assert.equal(JSON.stringify(error).includes("198.51.100.4"), false);
+    assert.equal(timeout.stage, "websocket_open");
+    assert.equal(timeout.closeCode, 1013);
+    assert.equal(transport.deviceId, undefined);
+    assert.equal(events.some((event) =>
+      event.type === "close" && event.code === 1013 && event.connectionGeneration === 1), true);
+    await waitForCondition(() => socket!.readyState === WebSocket.CLOSED);
+    assert.equal(
+      diagnostics.some((entry) =>
+        entry.event === "connection_attempt_ended" &&
+        entry.attemptId === 1 &&
+        entry.outcome === "setup_timeout"),
+      true,
+    );
+  } finally {
+    transport.close();
+    webSocketServer.clients.forEach((client) => client.terminate());
+    destroyUpgradeSockets();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => error ? reject(error) : resolve()));
+    await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
+  }
+});
+
+test("authentication send failure retires the socket and permits a clean replacement", async () => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  server.on("connection", (socket: WebSocket) => {
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+      if (message.type === "auth") {
+        socket.send(JSON.stringify({
+          type: "authenticated",
+          role: "owner",
+          device_id: "00000000-0000-0000-0000-000000000001",
+        }));
+      }
+    });
+  });
+
+  const events: SocketEvent[] = [];
+  const diagnostics: Array<Record<string, unknown>> = [];
+  let createdSockets = 0;
+  let failedSocket: WebSocket | undefined;
+  const transport = new MainSignalingTransport(
+    `http://127.0.0.1:${address.port}`,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    1_000,
+    100,
+    (url, options) => {
+      const socket = new WebSocket(url, options);
+      if (++createdSockets === 1) {
+        failedSocket = socket;
+        const originalSend = socket.send.bind(socket);
+        Object.defineProperty(socket, "send", {
+          value: (...args: Parameters<WebSocket["send"]>) => {
+            const data = args[0];
+            if (typeof data === "string" && JSON.parse(data).type === "auth") {
+              throw Object.assign(new Error("authentication send failed"), { code: "EPIPE" });
+            }
+            return originalSend(...args);
+          },
+        });
+      }
+      return socket;
+    },
+    (_level, entry) => diagnostics.push(entry),
+  );
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    await waitForEvent(events, "close", 1_000);
+    assert.equal(failedSocket?.readyState, WebSocket.CLOSED);
+    assert.equal(transport.deviceId, undefined);
+    assert.equal(
+      diagnostics.some((entry) =>
+        entry.event === "authentication_message_send_failed" &&
+        entry.attemptId === 1 &&
+        entry.errorCode === "EPIPE"),
+      true,
+    );
+    assert.equal(
+      diagnostics.some((entry) =>
+        entry.event === "connection_attempt_ended" &&
+        entry.attemptId === 1 &&
+        entry.outcome === "websocket_closed"),
+      true,
+    );
+    assert.equal(JSON.stringify(diagnostics).includes("test-device-credential"), false);
+
+    assert.equal(await transport.connect(), 2);
+    await waitForCondition(() =>
+      events.some((event) => event.type === "open" && event.connectionGeneration === 2));
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+
+    const eventCount = events.length;
+    const diagnosticCount = diagnostics.length;
+    failedSocket!.emit("open");
+    failedSocket!.emit("message", Buffer.from(JSON.stringify({
+      type: "authenticated",
+      role: "owner",
+      device_id: "00000000-0000-0000-0000-000000000002",
+    })), false);
+    failedSocket!.emit("close", 1008, Buffer.from("stale close"));
+
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+    assert.equal(events.length, eventCount);
+    assert.equal(diagnostics.length, diagnosticCount);
+    assert.equal(
+      (transport as unknown as { socket?: WebSocket }).socket?.readyState,
+      WebSocket.OPEN,
+    );
+  } finally {
+    transport.close();
+    failedSocket?.terminate();
+    server.clients.forEach((socket) => socket.terminate());
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+});
+
+test("a throwing diagnostic logger cannot interrupt authentication, close, or retry", async () => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  let sharingStateReceived = false;
+  server.on("connection", (socket: WebSocket) => {
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+      if (message.type === "auth") {
+        socket.send(JSON.stringify({
+          type: "authenticated",
+          role: "owner",
+          device_id: "00000000-0000-0000-0000-000000000001",
+        }));
+      } else if (message.type === "sharing_state") {
+        sharingStateReceived = true;
+      }
+    });
+  });
+
+  const events: SocketEvent[] = [];
+  const transport = new MainSignalingTransport(
+    `http://127.0.0.1:${address.port}`,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+    15_000,
+    undefined,
+    undefined,
+    1_000,
+    100,
+    undefined,
+    () => { throw new Error("diagnostic sink failed"); },
+  );
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    await waitForCondition(() =>
+      events.some((event) => event.type === "open" && event.connectionGeneration === 1));
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+    transport.send(JSON.stringify({ type: "sharing_state", screen: true, camera: false }), 1);
+    await waitForCondition(() => sharingStateReceived);
+
+    assert.equal(transport.close(1), true);
+    assert.equal(await transport.connect(), 2);
+    await waitForCondition(() =>
+      events.some((event) => event.type === "open" && event.connectionGeneration === 2));
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+  } finally {
+    transport.close();
+    server.clients.forEach((socket) => socket.terminate());
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+});
+
+test("stale signaling generations cannot send or close the replacement connection", async () => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  server.on("connection", (socket: WebSocket) => {
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+      if (message.type === "auth") {
+        socket.send(JSON.stringify({
+          type: "authenticated",
+          role: "owner",
+          device_id: "00000000-0000-0000-0000-000000000001",
+        }));
+      }
+    });
+  });
+  const events: SocketEvent[] = [];
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const transport = new MainSignalingTransport(
+    `http://127.0.0.1:${address.port}`,
+    "http://localhost:5173",
+    { load: async () => "test-device-credential" },
+    (event) => events.push(event),
+  );
+  transport.setDiagnosticLogger((_level, entry) => diagnostics.push(entry));
+
+  try {
+    assert.equal(await transport.connect(), 1);
+    await waitForEvent(events, "open");
+    assert.equal(transport.close(1), true);
+    assert.equal(await transport.connect(), 2);
+    await waitForCondition(() =>
+      events.some((event) => event.type === "open" && event.connectionGeneration === 2));
+    transport.send(JSON.stringify({ type: "sharing_state", screen: true, camera: false }), 2);
+    const sent = diagnostics.find((entry) => entry.event === "sharing_state_transport_sent");
+    assert.equal(sent?.publicationOutcome, "sent");
+    assert.equal(sent?.webSocketReadyState, "open");
+    assert.equal(sent?.authenticated, true);
+    assert.equal(sent?.activeConnectionGeneration, 2);
+    assert.equal(sent?.requestedConnectionGeneration, 2);
+
+    assert.throws(() =>
+      transport.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }), 1),
+    /generation is stale/);
+    const rejected = diagnostics.filter((entry) => entry.event === "signaling_send_rejected").at(-1);
+    assert.equal(rejected?.publicationOutcome, "send_rejected");
+    assert.equal(rejected?.transportReason, "stale_generation");
+    assert.equal(rejected?.webSocketReadyState, "open");
+    assert.equal(rejected?.authenticated, true);
+    assert.equal(rejected?.activeConnectionGeneration, 2);
+    assert.equal(rejected?.requestedConnectionGeneration, 1);
+    assert.equal(transport.close(1), false);
+    assert.equal(transport.deviceId, "00000000-0000-0000-0000-000000000001");
+    transport.close(2);
+  } finally {
+    transport.close();
+    server.clients.forEach((socket) => socket.terminate());
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });

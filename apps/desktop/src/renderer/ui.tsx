@@ -9,12 +9,26 @@ import { createBrowserPeer } from "./webrtc-adapter.js";
 import {
   acquireLiveScreenTrack,
   confirmLiveScreenCapture,
+  inspectScreenVideoTracks,
   sharingStatus,
-  stopCapturedTracks,
+  stopOwnerCapture,
 } from "./sharing-status.js";
+import { createSignalingSocket } from "./signaling-socket.js";
+import { sharingStateSendEvent } from "./capture-diagnostic-events.js";
+import {
+  displayCaptureFailureCategory,
+  displayCaptureFailureMessage,
+} from "../capture-utils.js";
+import type {
+  CaptureDiagnosticCategory,
+  CaptureDiagnosticDetails,
+  CaptureDiagnosticErrorCode,
+  CaptureDiagnosticEvent,
+} from "../ipc-contract.js";
 
 type Capture = {
   generation: number;
+  attemptId?: string;
   screen?: MediaStreamTrack;
   camera?: MediaStreamTrack;
   cameraPending?: boolean;
@@ -25,61 +39,53 @@ type Capture = {
 };
 
 function makeSocket(): SignalingSocket {
-  let readyState = 0;
-  let unsubscribe: (() => void) | undefined;
-  const socket: SignalingSocket = {
-    get readyState() { return readyState; },
-    authenticationManaged: true,
-    onopen: null,
-    onmessage: null,
-    onclose: null,
-    onerror: null,
-    connect: () => {
-      unsubscribe ??= window.livePresence.onSocketEvent((event) => {
-        if (event.type === "authentication-started") {
-          console.info(JSON.stringify({
-            source: "desktop-renderer",
-            event: "owner_authentication_started",
-            timestamp: new Date().toISOString(),
-            socketConnectionGeneration: event.connectionGeneration,
-          }));
-        } else if (event.type === "open") {
-          readyState = 1;
-          socket.connectionGeneration = event.connectionGeneration;
-          console.info(JSON.stringify({
-            source: "desktop-renderer",
-            event: "owner_authentication_completed",
-            timestamp: new Date().toISOString(),
-            socketConnectionGeneration: event.connectionGeneration,
-          }));
-          socket.onopen?.();
-        } else if (event.type === "message") {
-          socket.onmessage?.({ data: event.data });
-        } else if (event.type === "close") {
-          readyState = 3;
-          socket.onclose?.({ code: event.code });
-          unsubscribe?.();
-          unsubscribe = undefined;
-        } else if (event.type === "error") {
-          socket.onerror?.();
-        }
-      });
-      void window.livePresence.connectSignaling().catch(() => socket.onerror?.());
-    },
-    send: (data) => window.livePresence.sendSignaling(data).catch((error) => {
-        socket.onerror?.();
-        throw error;
-      }),
-    close: () => {
-      if (readyState === 3) return;
-      readyState = 3;
-      unsubscribe?.();
-      unsubscribe = undefined;
-      window.livePresence.closeSignaling();
-      socket.onclose?.({ code: 1000 });
-    },
-  };
-  return socket;
+  return createSignalingSocket(window.livePresence);
+}
+
+function reportCaptureDiagnostic(
+  event: CaptureDiagnosticEvent,
+  details: CaptureDiagnosticDetails = {},
+  attemptId?: string,
+): void {
+  try {
+    window.livePresence.reportCaptureDiagnostic(event, {
+      ...details,
+      ...(attemptId ? { attemptId } : {}),
+    });
+  } catch {
+    // Diagnostic IPC must not affect media capture.
+  }
+}
+
+function diagnosticFailureCategory(error: unknown): CaptureDiagnosticCategory {
+  const category = displayCaptureFailureCategory(error);
+  switch (category) {
+    case "video_stream_not_provided":
+    case "permission_or_consent_denied":
+    case "no_capture_source":
+    case "capture_cancelled":
+    case "capture_failed":
+      return category;
+    default:
+      return "unknown";
+  }
+}
+
+function diagnosticErrorCode(error: unknown): CaptureDiagnosticErrorCode {
+  if (!(error instanceof Error)) return "unknown";
+  switch (error.name) {
+    case "AbortError":
+    case "NotAllowedError":
+    case "NotFoundError":
+    case "TypeError":
+    case "SecurityError":
+    case "InvalidStateError":
+    case "Error":
+    case "DOMException":
+      return error.name;
+    default:
+      return "unknown";
+  }
 }
 
 export function DesktopApp(): JSX.Element {
@@ -173,10 +179,30 @@ function ShareWindow(): JSX.Element {
             reason === "recovery_timeout"
               ? "Network recovery timed out; sharing was stopped."
               : "Viewer session ended; sharing was stopped.",
+            reason !== "recovery_timeout",
           );
         }
       },
       onDiagnostic: (diagnostic) => {
+        const sharingStateEvent = sharingStateSendEvent(
+          diagnostic.event,
+          diagnostic.publicationOutcome,
+        );
+        if (sharingStateEvent) {
+          reportCaptureDiagnostic(
+            sharingStateEvent,
+            {
+              screen: diagnostic.sharingState?.screen ?? false,
+              camera: diagnostic.sharingState?.camera ?? false,
+              sent: diagnostic.sent ?? false,
+              publicationOutcome: diagnostic.publicationOutcome,
+              signalingState: diagnostic.signalingState,
+              rendererConnectionGeneration: diagnostic.rendererConnectionGeneration,
+              stage: "signaling_send",
+            },
+            capture.current.attemptId,
+          );
+        }
         const recoveryLifecycleEvent =
           diagnostic.event === "recovery_started" ||
           diagnostic.event === "session_recovery_received" ||
@@ -192,6 +218,7 @@ function ShareWindow(): JSX.Element {
           signalingState: diagnostic.signalingState,
           sharingState: diagnostic.sharingState,
           sent: diagnostic.sent,
+          publicationOutcome: diagnostic.publicationOutcome,
           category: diagnostic.category,
           recoveryAttemptId: diagnostic.recoveryAttemptId,
           recoveryPhase: diagnostic.recoveryPhase,
@@ -217,7 +244,14 @@ function ShareWindow(): JSX.Element {
             : {}),
         }));
       },
-      onSharingStateConfirmed: ({ deviceId, screen, camera }) => {
+      onSharingStateConfirmed: ({ deviceId, screen, camera, rendererConnectionGeneration }) => {
+        reportCaptureDiagnostic("sharing_state_update_confirmed", {
+          screen,
+          camera,
+          sent: true,
+          rendererConnectionGeneration,
+          stage: "backend_acknowledgement",
+        }, capture.current.attemptId);
         console.info(JSON.stringify({
           source: "desktop-renderer",
           event: "sharing-state-confirmed",
@@ -306,26 +340,30 @@ function ShareWindow(): JSX.Element {
     };
   }, []);
 
-  async function stopCurrent(reason?: string): Promise<void> {
+  async function stopCurrent(reason?: string, stopClient = true): Promise<void> {
     const current = capture.current;
     current.generation += 1;
+    current.attemptId = undefined;
     current.cameraPending = false;
     current.preparingScreen = false;
-    try { void current.client?.stopSharingSession().catch(() => undefined); } catch { /* the socket may already be closed */ }
+    if (stopClient) {
+      try { void current.client?.stopSharingSession().catch(() => undefined); } catch { /* the socket may already be closed */ }
+    }
     const screen = current.screen;
     const camera = current.camera;
     current.screen = undefined;
     current.camera = undefined;
-    stopCapturedTracks(screen, camera);
     setScreenSharing(false);
     setCameraSharing(false);
     setState("IDLE");
-    const cleanupResults = await Promise.allSettled([
-      window.livePresence.setCameraIntent(false),
-      window.livePresence.setScreenActive(false),
-    ]);
-    window.livePresence.acknowledgeCleanup();
-    if (cleanupResults.some((result) => result.status === "rejected")) {
+    const cleanupFailed = await stopOwnerCapture(
+      screen,
+      camera,
+      () => window.livePresence.setCameraIntent(false),
+      () => window.livePresence.setScreenActive(false),
+      () => window.livePresence.acknowledgeCleanup(),
+    );
+    if (cleanupFailed) {
       setMessage(reason
         ? `${reason} Local media stopped; main-process cleanup is being enforced.`
         : "Local media stopped; main-process cleanup is being enforced.");
@@ -357,6 +395,8 @@ function ShareWindow(): JSX.Element {
   function startScreenShare(): void {
     if (screenSharing || capture.current.screen) return;
     const generation = ++capture.current.generation;
+    const attemptId = crypto.randomUUID();
+    capture.current.attemptId = attemptId;
     capture.current.preparingScreen = true;
     capture.current.failed = false;
     capture.current.failureHandled = false;
@@ -370,28 +410,115 @@ function ShareWindow(): JSX.Element {
       sharingState: { screen: false, camera: false },
       sent: false,
     }));
-    window.livePresence.beginScreenCapture();
+    reportCaptureDiagnostic("screen_capture_requested", {
+      screen: false,
+      camera: false,
+      stage: "local_user_action",
+    }, attemptId);
+    window.livePresence.beginScreenCapture(attemptId);
+    reportCaptureDiagnostic("screen_display_media_request_started", {
+      screen: false,
+      camera: false,
+      stage: "display_media_request",
+    }, attemptId);
     let request: Promise<MediaStream>;
     try {
       request = navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-    } catch {
-      void stopCurrent("Screen sharing could not be started.");
+    } catch (error) {
+      reportCaptureDiagnostic("screen_display_media_request_failed", {
+        stage: "display_media_request",
+        errorCategory: "display_media_failed",
+        errorCode: diagnosticErrorCode(error),
+      }, attemptId);
+      void stopCurrent("Screen sharing could not be started.")
+        .catch(() => setMessage("Screen sharing could not be started; local cleanup was requested."));
       return;
     }
-    void finishScreenShare(request, generation);
+    void finishScreenShare(request, generation, attemptId).catch(async (error: unknown) => {
+      reportCaptureDiagnostic("screen_sharing_activation_failed", {
+        stage: "capture_operation",
+        errorCategory: "capture_unexpected_failure",
+        errorCode: diagnosticErrorCode(error),
+      }, attemptId);
+      if (capture.current.generation !== generation) return;
+      await stopCurrent("Screen sharing could not be completed.").catch(() => undefined);
+      setMessage("Screen sharing could not be completed. Local media cleanup was requested.");
+    });
   }
 
-  async function finishScreenShare(request: Promise<MediaStream>, generation: number): Promise<void> {
+  async function finishScreenShare(
+    request: Promise<MediaStream>,
+    generation: number,
+    attemptId: string,
+  ): Promise<void> {
     let screen: MediaStreamTrack;
+    let stream: MediaStream;
     try {
-      screen = await acquireLiveScreenTrack(() => request);
-    } catch {
+      stream = await request;
+    } catch (error) {
+      reportCaptureDiagnostic("screen_stream_acquisition_failed", {
+        stage: "get_display_media",
+        errorCategory: diagnosticFailureCategory(error),
+        errorCode: diagnosticErrorCode(error),
+      }, attemptId);
       if (capture.current.generation === generation) {
-        await stopCurrent("Screen sharing was canceled or unavailable.");
+        const category = displayCaptureFailureCategory(error);
+        console.warn(JSON.stringify({
+          source: "desktop-renderer",
+          event: "screen-capture-failed",
+          timestamp: new Date().toISOString(),
+          category,
+        }));
+        const message = displayCaptureFailureMessage(error);
+        await stopCurrent(message).catch(() => setMessage(message));
+      }
+      return;
+    }
+
+    try {
+      const inspection = inspectScreenVideoTracks(stream);
+      reportCaptureDiagnostic("screen_stream_acquisition_succeeded", {
+        stage: "get_display_media",
+        trackCount: inspection.videoTracks.length,
+        readyState: inspection.readyState,
+        enabled: inspection.enabled,
+        muted: inspection.muted,
+      }, attemptId);
+      screen = await acquireLiveScreenTrack(() => Promise.resolve(stream));
+      reportCaptureDiagnostic("screen_live_track_validation_succeeded", {
+        stage: "live_track_validation",
+        trackCount: inspection.videoTracks.length,
+        readyState: screen.readyState,
+        enabled: screen.enabled,
+        muted: screen.muted,
+      }, attemptId);
+    } catch (error) {
+      reportCaptureDiagnostic("screen_live_track_validation_failed", {
+        stage: "live_track_validation",
+        errorCategory: "live_track_validation_failed",
+        errorCode: diagnosticErrorCode(error),
+      }, attemptId);
+      if (capture.current.generation === generation) {
+        const category = displayCaptureFailureCategory(error);
+        console.warn(JSON.stringify({
+          source: "desktop-renderer",
+          event: "screen-capture-failed",
+          timestamp: new Date().toISOString(),
+          category,
+        }));
+        const message = displayCaptureFailureMessage(error);
+        await stopCurrent(message).catch(() => setMessage(message));
       }
       return;
     }
     if (capture.current.generation !== generation) {
+      reportCaptureDiagnostic("screen_track_unavailable", {
+        stage: "post_acquisition",
+        reason: "capture_generation_changed",
+        readyState: screen.readyState,
+        enabled: screen.enabled,
+        muted: screen.muted,
+      }, attemptId);
       screen.stop();
       return;
     }
@@ -399,10 +526,31 @@ function ShareWindow(): JSX.Element {
     capture.current.preparingScreen = false;
     setScreenSharing(true);
     screen.addEventListener("ended", () => {
+      reportCaptureDiagnostic("screen_track_ended", {
+        stage: "track_lifecycle",
+        readyState: screen.readyState,
+        enabled: screen.enabled,
+        muted: screen.muted,
+        reason: "ended_event",
+      }, attemptId);
       if (capture.current.screen === screen) void stopCurrent("The screen capture ended.");
+    }, { once: true });
+    screen.addEventListener("mute", () => {
+      reportCaptureDiagnostic("screen_track_became_unavailable", {
+        stage: "track_lifecycle",
+        readyState: screen.readyState,
+        enabled: screen.enabled,
+        muted: screen.muted,
+        reason: "track_muted",
+      }, attemptId);
     }, { once: true });
 
     try {
+      reportCaptureDiagnostic("sharing_state_activation_requested", {
+        screen: true,
+        camera: false,
+        stage: "before_main_capture_confirmation",
+      }, attemptId);
       await confirmLiveScreenCapture(screen, () => window.livePresence.setScreenActive(true));
       console.info(JSON.stringify({
         source: "desktop-renderer",
@@ -413,16 +561,35 @@ function ShareWindow(): JSX.Element {
         sent: false,
       }));
       if (capture.current.generation !== generation || screen.readyState !== "live") {
+        reportCaptureDiagnostic("screen_track_unavailable", {
+          stage: "post_main_confirmation",
+          reason: capture.current.generation !== generation ? "capture_generation_changed" : "track_not_live",
+          readyState: screen.readyState,
+          enabled: screen.enabled,
+          muted: screen.muted,
+        }, attemptId);
         await stopCurrent("The screen capture ended before sharing could start.");
         return;
       }
       const client = ensureOwnerClient();
+      reportCaptureDiagnostic("sharing_state_activation_requested", {
+        screen: true,
+        camera: false,
+        stage: "before_signaling_update",
+      }, attemptId);
       await client.setSharingState(true, false);
       setState("CONNECTING");
       if (capture.current.generation !== generation) return;
       setState(client.lifecycle);
     } catch (error) {
       if (capture.current.generation === generation) {
+        reportCaptureDiagnostic("screen_sharing_activation_failed", {
+          stage: "sharing_state_activation",
+          screen: false,
+          camera: false,
+          errorCategory: "sharing_activation_failed",
+          errorCode: diagnosticErrorCode(error),
+        }, attemptId);
         console.error(JSON.stringify({
           source: "desktop-renderer",
           event: "screen-sharing-activation-failed",
@@ -431,7 +598,8 @@ function ShareWindow(): JSX.Element {
           sharingState: { screen: false, camera: false },
           sent: false,
           category: "capture-or-signaling",
-          originalError: error instanceof Error ? error.message : "unknown error",
+          errorCategory: "sharing_activation_failed",
+          errorCode: diagnosticErrorCode(error),
         }));
         await stopCurrent("Sharing could not connect.");
       }

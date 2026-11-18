@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   acquireLiveScreenTrack,
   confirmLiveScreenCapture,
+  inspectScreenVideoTracks,
   sharingStatus,
   stopCapturedTracks,
 } from "./sharing-status.js";
@@ -54,4 +55,41 @@ test("failed display capture cannot proceed to the active-confirmation boundary"
     activeConfirmationCalls += 1;
   });
   assert.equal(activeConfirmationCalls, 1);
+});
+
+test("successful display capture confirms only a live video track and stops unused tracks", async () => {
+  const stopped: string[] = [];
+  const screen = {
+    readyState: "live",
+    stop: () => stopped.push("screen"),
+  } as unknown as MediaStreamTrack;
+  const audio = { stop: () => stopped.push("audio") } as unknown as MediaStreamTrack;
+  const stream = {
+    getVideoTracks: () => [screen],
+    getTracks: () => [screen, audio],
+  } as unknown as MediaStream;
+  const acquired = await acquireLiveScreenTrack(async () => stream);
+  assert.equal(acquired, screen);
+  assert.deepEqual(stopped, ["audio"]);
+
+  let activeConfirmationCalls = 0;
+  await confirmLiveScreenCapture(acquired, async () => {
+    activeConfirmationCalls += 1;
+  });
+  assert.equal(activeConfirmationCalls, 1);
+});
+
+test("screen video-track inspection exceptions remain available to the validation failure path", () => {
+  const enumerationError = new Error("track enumeration failed");
+  assert.throws(() => inspectScreenVideoTracks({
+    getVideoTracks: () => { throw enumerationError; },
+  } as unknown as MediaStream), enumerationError);
+
+  const stateError = new Error("track state unavailable");
+  const track = Object.defineProperty({}, "readyState", {
+    get: () => { throw stateError; },
+  }) as MediaStreamTrack;
+  assert.throws(() => inspectScreenVideoTracks({
+    getVideoTracks: () => [track],
+  } as unknown as MediaStream), stateError);
 });

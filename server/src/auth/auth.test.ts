@@ -113,6 +113,69 @@ test("browser login flow uses POST verification and invalidates logout", async (
   }
 });
 
+test("development login response token authenticates the browser session", async () => {
+  const server = await buildApp(":memory:", 3600, "development");
+  try {
+    const response = await server.app.inject({
+      method: "POST",
+      url: "/auth/request-login",
+      payload: { email: "local@example.com" },
+    });
+    assert.equal(response.statusCode, 202);
+    const developmentToken = response.json<{ developmentToken: string }>().developmentToken;
+    assert.equal(typeof developmentToken, "string");
+
+    const verification = await server.app.inject({
+      method: "POST",
+      url: "/auth/verify-login",
+      payload: { token: developmentToken },
+    });
+    assert.equal(verification.statusCode, 200);
+    assert.match(verification.headers["set-cookie"] as string, new RegExp(`^${SESSION_COOKIE}=`));
+    assert.match(verification.headers["set-cookie"] as string, /HttpOnly/i);
+
+    const cookie = cookieValue(verification.headers["set-cookie"]);
+    const session = await server.app.inject({
+      method: "GET",
+      url: "/auth/session",
+      headers: { cookie },
+    });
+    assert.equal(session.statusCode, 200);
+    assert.equal(session.json<{ user: { email: string } }>().user.email, "local@example.com");
+  } finally {
+    await server.app.close();
+    server.close();
+  }
+});
+
+test("login requests reject missing credentials and rate-limit repeated attempts", async () => {
+  const server = await buildApp(":memory:", 3600);
+  try {
+    const missing = await server.app.inject({
+      method: "POST",
+      url: "/auth/request-login",
+      payload: {},
+    });
+    assert.equal(missing.statusCode, 400);
+    assert.deepEqual(missing.json(), { error: "valid email is required" });
+
+    let response: Awaited<ReturnType<typeof server.app.inject>> | undefined;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      response = await server.app.inject({
+        method: "POST",
+        url: "/auth/request-login",
+        payload: { email: `rate-limit-${attempt}@example.com` },
+        remoteAddress: "127.0.0.3",
+      });
+    }
+    assert.equal(response?.statusCode, 429);
+    assert.deepEqual(response?.json(), { error: "too many requests" });
+  } finally {
+    await server.app.close();
+    server.close();
+  }
+});
+
 test("verification never places the raw token in a URL", async () => {
   const server = await buildApp(":memory:");
 

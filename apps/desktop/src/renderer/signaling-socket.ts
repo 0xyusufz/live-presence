@@ -1,0 +1,272 @@
+import type { SignalingSocket } from "../../../../shared/src/client.js";
+import type { LivePresenceBridge, SocketEvent } from "../ipc-contract.js";
+import { readSignalingConnectFailureCategory } from "../main/signaling-connect-handler.js";
+
+type SignalingBridge = Pick<
+  LivePresenceBridge,
+  "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+>;
+type DiagnosticLogger = (level: "info" | "warn" | "error", entry: Record<string, unknown>) => void;
+
+let nextRendererAttemptId = 0;
+const rendererOwnerByBridge = new WeakMap<SignalingBridge, number>();
+
+function closeReasonCategory(code: number): string {
+  if (code === 1008) return "policy_or_authentication";
+  if (code === 1013) return "retryable_service_unavailable";
+  if (code === 1000) return "normal";
+  if (code === 1006) return "abnormal_transport_loss";
+  return "other";
+}
+
+function isAuthenticationMessage(data: unknown): boolean {
+  if (typeof data !== "string") return false;
+  try {
+    const message = JSON.parse(data) as { type?: unknown };
+    return message.type === "authenticated";
+  } catch {
+    return false;
+  }
+}
+
+export function createSignalingSocket(
+  bridge: SignalingBridge,
+  diagnosticLogger: DiagnosticLogger = (level, entry) => {
+    console[level](JSON.stringify(entry));
+  },
+): SignalingSocket {
+  let readyState = 0;
+  let connectionGeneration: number | undefined;
+  let associationReady = false;
+  let connectStarted = false;
+  let localClosed = false;
+  let closeDelivered = false;
+  let attemptEnded = false;
+  let rendererAttemptId: number | undefined;
+  let connectCorrelationId: string | undefined;
+  let unsubscribe: (() => void) | undefined;
+  const pendingEvents: SocketEvent[] = [];
+
+  const log = (
+    level: "info" | "warn" | "error",
+    event: string,
+    details: Record<string, unknown> = {},
+  ): void => {
+    try {
+      diagnosticLogger(level, {
+        source: "desktop-renderer",
+        event,
+        timestamp: new Date().toISOString(),
+        ...(rendererAttemptId === undefined ? {} : { rendererAttemptId }),
+        ...details,
+      });
+    } catch {
+      // Diagnostics are best-effort and must not interrupt signaling.
+    }
+  };
+
+  const endAttempt = (outcome: string, generation = connectionGeneration): void => {
+    if (attemptEnded) return;
+    attemptEnded = true;
+    log("info", "renderer_connection_attempt_ended", {
+      socketConnectionGeneration: generation ?? null,
+      outcome,
+    });
+  };
+
+  const isCurrentRendererOwner = (): boolean =>
+    rendererAttemptId !== undefined &&
+    rendererOwnerByBridge.get(bridge) === rendererAttemptId;
+
+  log("info", "renderer_socket_adapter_created");
+
+  const socket: SignalingSocket = {
+    get readyState() { return readyState; },
+    get connectionGeneration() { return connectionGeneration; },
+    authenticationManaged: true,
+    onopen: null,
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+    connect: () => {
+      log("info", "renderer_socket_connect_invoked", {
+        socketConnectionGeneration: connectionGeneration ?? null,
+        alreadyStarted: connectStarted,
+        locallyClosed: localClosed,
+      });
+      if (connectStarted || localClosed) return;
+      connectStarted = true;
+      connectCorrelationId = crypto.randomUUID();
+      rendererAttemptId = ++nextRendererAttemptId;
+      rendererOwnerByBridge.set(bridge, rendererAttemptId);
+      log("info", "renderer_connection_attempt_started");
+      log("info", "renderer_signaling_connect_requested", {
+        correlationId: connectCorrelationId,
+      });
+      const handleEvent = (event: SocketEvent): void => {
+        if (localClosed || !isCurrentRendererOwner()) return;
+        if (!associationReady) {
+          pendingEvents.push(event);
+          return;
+        }
+        if (event.connectionGeneration !== connectionGeneration) return;
+
+        if (event.type === "authentication-started") {
+          log("info", "owner_authentication_started", {
+            socketConnectionGeneration: event.connectionGeneration,
+          });
+        } else if (event.type === "open") {
+          readyState = 1;
+          socket.authenticatedOnOpen =
+            event.authenticatedTransportReuse === true && typeof event.deviceId === "string";
+          socket.authenticatedDeviceId = socket.authenticatedOnOpen ? event.deviceId : undefined;
+          log("info", "renderer_socket_open_received", {
+            socketConnectionGeneration: event.connectionGeneration,
+            authenticatedTransportReuse: socket.authenticatedOnOpen,
+          });
+          endAttempt("open", event.connectionGeneration);
+          socket.onopen?.();
+        } else if (event.type === "message") {
+          if (isAuthenticationMessage(event.data)) {
+            log("info", "renderer_authentication_received", {
+              socketConnectionGeneration: event.connectionGeneration,
+            });
+          }
+          socket.onmessage?.({ data: event.data });
+        } else if (event.type === "close") {
+          closeDelivered = true;
+          readyState = 3;
+          log("warn", "renderer_socket_close_received", {
+            socketConnectionGeneration: event.connectionGeneration,
+            closeCode: event.code,
+            closeReasonCategory: closeReasonCategory(event.code ?? 1006),
+          });
+          log("warn", "renderer_signaling_socket_closed", {
+            socketConnectionGeneration: event.connectionGeneration,
+            closeCode: event.code,
+            closeReasonCategory: closeReasonCategory(event.code ?? 1006),
+          });
+          endAttempt("socket_closed", event.connectionGeneration);
+          socket.onclose?.({ code: event.code });
+          unsubscribe?.();
+          unsubscribe = undefined;
+        } else if (event.type === "error") {
+          socket.onerror?.();
+        }
+      };
+
+      unsubscribe = bridge.onSocketEvent(handleEvent);
+      void bridge.connectSignaling(connectCorrelationId).then((generation) => {
+        if (!isCurrentRendererOwner()) {
+          log("warn", "renderer_connection_generation_association_rejected", {
+            socketConnectionGeneration: generation,
+            reason: "renderer adapter was superseded before association",
+          });
+          log("warn", "renderer_stale_connection_resolution_ignored", {
+            socketConnectionGeneration: generation,
+          });
+          pendingEvents.length = 0;
+          closeLocally(1006, "superseded_before_connection_association");
+          return;
+        }
+        if (localClosed) {
+          log("warn", "renderer_connection_generation_association_rejected", {
+            socketConnectionGeneration: generation,
+            reason: "renderer adapter closed before association",
+          });
+          log("warn", "renderer_connection_closed_while_connect_pending", {
+            socketConnectionGeneration: generation,
+          });
+          if (isCurrentRendererOwner()) {
+            bridge.closeSignaling(generation);
+            log("info", "renderer_close_dispatched", {
+              socketConnectionGeneration: generation,
+              deferredUntilConnectionGeneration: true,
+            });
+          } else {
+            log("info", "renderer_stale_close_skipped", {
+              socketConnectionGeneration: generation,
+              deferredUntilConnectionGeneration: true,
+            });
+          }
+          return;
+        }
+        connectionGeneration = generation;
+        associationReady = true;
+        log("info", "renderer_connection_generation_associated", {
+          socketConnectionGeneration: generation,
+        });
+        const queued = pendingEvents.splice(0);
+        for (const event of queued) handleEvent(event);
+      }).catch((error: unknown) => {
+        const connectFailureCategory = readSignalingConnectFailureCategory(error) ?? "unknown";
+        log("error", "renderer_connection_generation_association_rejected", {
+          socketConnectionGeneration: connectionGeneration ?? null,
+          reason: "connect_signaling_rejected",
+          correlationId: connectCorrelationId,
+          connectFailureCategory,
+        });
+        if (localClosed) {
+          endAttempt("closed_while_connect_pending");
+          return;
+        }
+        log("error", "renderer_connection_attempt_failed", {
+          outcome: "connect_signaling_rejected",
+          correlationId: connectCorrelationId,
+          connectFailureCategory,
+        });
+        socket.onerror?.();
+        if (!closeDelivered && readyState !== 3) closeLocally(1006, "connect_failed");
+      });
+    },
+    send: (data) => {
+      if (!isCurrentRendererOwner()) {
+        return Promise.reject(new Error("signaling socket is no longer the active renderer owner"));
+      }
+      if (localClosed || closeDelivered) {
+        return Promise.reject(new Error("signaling socket is closed"));
+      }
+      if (connectionGeneration === undefined) {
+        return Promise.reject(new Error("signaling generation is unavailable"));
+      }
+      return bridge.sendSignaling(data, connectionGeneration).catch((error) => {
+        socket.onerror?.();
+        throw error;
+      });
+    },
+    close: () => {
+      if (localClosed) return;
+      localClosed = true;
+      log("info", "renderer_close_requested", {
+        socketConnectionGeneration: connectionGeneration ?? null,
+        connectPending: connectStarted && connectionGeneration === undefined,
+      });
+      if (connectionGeneration !== undefined) {
+        if (isCurrentRendererOwner()) {
+          bridge.closeSignaling(connectionGeneration);
+          log("info", "renderer_close_dispatched", {
+            socketConnectionGeneration: connectionGeneration,
+          });
+        } else {
+          log("info", "renderer_stale_close_skipped", {
+            socketConnectionGeneration: connectionGeneration,
+          });
+        }
+      }
+      closeLocally(1000, "renderer_close");
+    },
+  };
+
+  function closeLocally(code: number, outcome: string): void {
+    if (closeDelivered) return;
+    closeDelivered = true;
+    readyState = 3;
+    endAttempt(outcome);
+    pendingEvents.length = 0;
+    unsubscribe?.();
+    unsubscribe = undefined;
+    socket.onclose?.({ code });
+  }
+
+  return socket;
+}
