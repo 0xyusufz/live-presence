@@ -10,12 +10,14 @@ import {
 } from "electron";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join } from "node:path";
-import { parseClientMessage } from "../../../shared/src/protocol.js";
+import { parseClientMessage, parseServerMessage } from "../../../shared/src/protocol.js";
 import { mimeType, resolveAssetPath } from "./main/app-protocol.js";
 import { SafeStorageCredentialStore } from "./main/credential-store.js";
 import { CaptureDiagnostics, isCaptureAttemptId } from "./main/capture-diagnostics.js";
 import { DisplayCapturePicker } from "./main/display-capture.js";
 import { MainSignalingTransport } from "./main/signaling-transport.js";
+import { SignalingPeerGeneration } from "./main/signaling-peer-generation.js";
+import { registerSignalingIpcHandlers } from "./main/signaling-ipc-handlers.js";
 import { createSignalingConnectHandler } from "./main/signaling-connect-handler.js";
 import { WindowRestorer } from "./main/window-restoration.js";
 import type { AppEvent, SocketEvent } from "./ipc-contract.js";
@@ -55,6 +57,7 @@ const picker = new DisplayCapturePicker(undefined, (level, event, details) => {
   captureDiagnostics.log(event, { level, ...details });
 }, () => activeCaptureAttemptId);
 let transport: MainSignalingTransport | undefined;
+const signalingPeerGeneration = new SignalingPeerGeneration();
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 const mainWindowRestorer = new WindowRestorer(() => mainWindow, createMainWindow);
 if (!hasSingleInstanceLock) {
@@ -69,6 +72,15 @@ function emitAppEvent(event: AppEvent): void {
 }
 
 function emitSocketEvent(event: SocketEvent): void {
+  if (event.type === "message") {
+    const message = parseServerMessage(JSON.parse(event.data));
+    if (
+      message?.type === "viewer_rejoined" ||
+      (message?.type === "viewer_left" && message.reason !== "temporary_disconnect")
+    ) {
+      signalingPeerGeneration.invalidate();
+    }
+  }
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("signaling:event", event);
 }
 
@@ -239,6 +251,7 @@ function hideIndicator(): void {
 }
 
 function forceRendererTermination(): void {
+  signalingPeerGeneration.invalidate();
   transport?.close();
   transport = undefined;
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -260,6 +273,7 @@ async function stopSharing(reason: string, quitAfter = false): Promise<void> {
     return;
   }
   stopping = true;
+  signalingPeerGeneration.invalidate();
   quittingAfterCleanup ||= quitAfter;
   const needsRendererCleanup = shareActive || capturePending;
   capturePending = false;
@@ -374,31 +388,21 @@ function installIpcHandlers(): void {
       });
     },
   }));
-  ipcMain.handle("signaling:send", (event, raw: unknown, connectionGeneration: unknown) => {
-    if (!mainSender(event) || typeof raw !== "string" || raw.length > 128 * 1024 ||
-      typeof connectionGeneration !== "number" || !Number.isSafeInteger(connectionGeneration)) {
-      console.warn(JSON.stringify({
-        source: "desktop-main",
-        event: "signaling-ipc-rejected",
-        deviceId: transport?.deviceId,
-        signalingState: transport?.deviceId ? "open" : "not-connected",
-        sent: false,
-        category: "ipc-validation",
-        originalError: "invalid IPC sender or payload",
-      }));
-      throw new Error("invalid signaling IPC request");
-    }
-    try {
-      const parsed = parseClientMessage(JSON.parse(raw));
-      if (!parsed || parsed.type === "auth" || parsed.type === "share_request" ||
-        parsed.type === "share_request_cancel" || parsed.type === "share_request_decision" ||
-        parsed.type === "create_session" || parsed.type === "answer") {
-        throw new Error("signaling message is invalid or not allowed");
-      }
-      if (!transport) throw new Error("owner signaling transport is unavailable");
-      transport?.send(JSON.stringify(parsed), connectionGeneration);
-      return;
-    } catch (error) {
+  registerSignalingIpcHandlers({
+    handle: (channel, handler) => {
+      ipcMain.handle(channel, (event, ...args) => handler(event, ...args));
+    },
+    on: (channel, listener) => {
+      ipcMain.on(channel, (event, ...args) => listener(event, ...args));
+    },
+  }, {
+    isSenderAllowed: (event) =>
+      mainSender(event as Electron.IpcMainEvent | Electron.IpcMainInvokeEvent),
+    getTransport: () => transport,
+    isSharingActive: () => shareActive,
+    isStopping: () => stopping,
+    peerGeneration: signalingPeerGeneration,
+    onSendRejected: (raw, error) => {
       console.warn(JSON.stringify({
         source: "desktop-main",
         event: "signaling-ipc-rejected",
@@ -406,7 +410,7 @@ function installIpcHandlers(): void {
         signalingState: transport?.deviceId ? "open" : "not-connected",
         sharingState: (() => {
           try {
-            const parsed = parseClientMessage(JSON.parse(raw));
+            const parsed = typeof raw === "string" ? parseClientMessage(JSON.parse(raw)) : undefined;
             return parsed?.type === "sharing_state"
               ? { screen: parsed.screen, camera: parsed.camera }
               : undefined;
@@ -418,30 +422,16 @@ function installIpcHandlers(): void {
         category: "signaling-send",
         originalError: error instanceof Error ? error.message : "unknown signaling send error",
       }));
-      throw error;
-    }
-  });
-  ipcMain.on("signaling:close", (event, connectionGeneration: unknown) => {
-    if (!mainSender(event)) return;
-    if (typeof connectionGeneration !== "number" || !Number.isSafeInteger(connectionGeneration)) {
-      console.warn(JSON.stringify({
+    },
+    onClose: (connectionGeneration, matchedActiveConnection) => {
+      console.info(JSON.stringify({
         source: "desktop-main",
         event: "signaling_close_ipc",
         timestamp: new Date().toISOString(),
-        requestedGeneration: null,
-        matchedActiveConnection: false,
-        reason: "invalid_generation",
+        requestedGeneration: connectionGeneration,
+        matchedActiveConnection,
       }));
-      return;
-    }
-    const matchedActiveConnection = transport?.close(connectionGeneration, "renderer_ipc") ?? false;
-    console.info(JSON.stringify({
-      source: "desktop-main",
-      event: "signaling_close_ipc",
-      timestamp: new Date().toISOString(),
-      requestedGeneration: connectionGeneration,
-      matchedActiveConnection,
-    }));
+    },
   });
   ipcMain.handle("ice:load", async (event) => {
     if (!mainSender(event)) throw new Error("invalid IPC sender");
@@ -475,6 +465,7 @@ function installIpcHandlers(): void {
   ipcMain.handle("capture:screen-active", async (event, active: unknown) => {
     if (!mainSender(event) || typeof active !== "boolean") throw new Error("invalid IPC request");
     if (!active) {
+      signalingPeerGeneration.invalidate();
       shareActive = false;
       capturePending = false;
       activeCaptureAttemptId = undefined;

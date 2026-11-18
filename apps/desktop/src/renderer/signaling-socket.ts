@@ -5,7 +5,10 @@ import { readSignalingConnectFailureCategory } from "../main/signaling-connect-h
 type SignalingBridge = Pick<
   LivePresenceBridge,
   "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
->;
+> & Partial<Pick<
+  LivePresenceBridge,
+  "registerSignalingPeerGeneration" | "clearSignalingPeerGeneration"
+>>;
 type DiagnosticLogger = (level: "info" | "warn" | "error", entry: Record<string, unknown>) => void;
 
 let nextRendererAttemptId = 0;
@@ -44,6 +47,10 @@ export function createSignalingSocket(
   let attemptEnded = false;
   let rendererAttemptId: number | undefined;
   let connectCorrelationId: string | undefined;
+  let connectPromise: Promise<number> | undefined;
+  let activePeerGeneration: number | undefined;
+  let activePeerRegistrationId: string | undefined;
+  let peerGenerationUpdates: Promise<void> = Promise.resolve();
   let unsubscribe: (() => void) | undefined;
   const pendingEvents: SocketEvent[] = [];
 
@@ -156,7 +163,8 @@ export function createSignalingSocket(
       };
 
       unsubscribe = bridge.onSocketEvent(handleEvent);
-      void bridge.connectSignaling(connectCorrelationId).then((generation) => {
+      connectPromise = bridge.connectSignaling(connectCorrelationId);
+      void connectPromise.then((generation) => {
         if (!isCurrentRendererOwner()) {
           log("warn", "renderer_connection_generation_association_rejected", {
             socketConnectionGeneration: generation,
@@ -219,7 +227,51 @@ export function createSignalingSocket(
         if (!closeDelivered && readyState !== 3) closeLocally(1006, "connect_failed");
       });
     },
-    send: (data) => {
+    setPeerGeneration: (peerGeneration, sessionId) => {
+      if (!Number.isSafeInteger(peerGeneration) || peerGeneration < 0) {
+        return Promise.reject(new Error("invalid signaling peer generation"));
+      }
+      if (!isCurrentRendererOwner() || localClosed || closeDelivered) {
+        return Promise.reject(new Error("signaling socket is no longer active"));
+      }
+      activePeerGeneration = peerGeneration;
+      const previousRegistrationId = activePeerRegistrationId;
+      activePeerRegistrationId = undefined;
+      const registration = peerGenerationUpdates.catch(() => undefined).then(async () => {
+        if (previousRegistrationId) {
+          if (!bridge.clearSignalingPeerGeneration) {
+            throw new Error("signaling peer cleanup is unavailable");
+          }
+          await bridge.clearSignalingPeerGeneration(previousRegistrationId);
+        }
+        if (sessionId === undefined) return;
+        if (!bridge.registerSignalingPeerGeneration) {
+          throw new Error("signaling peer registration is unavailable");
+        }
+        const opening = connectPromise;
+        if (!opening) throw new Error("signaling connection is not starting");
+        const generation = await opening;
+        if (localClosed || !isCurrentRendererOwner() || activePeerGeneration !== peerGeneration) {
+          throw new Error("signaling peer generation was superseded");
+        }
+        const registrationId = await bridge.registerSignalingPeerGeneration(sessionId, generation);
+        if (localClosed || !isCurrentRendererOwner() || activePeerGeneration !== peerGeneration) {
+          if (!bridge.clearSignalingPeerGeneration) {
+            throw new Error("signaling peer cleanup is unavailable");
+          }
+          await bridge.clearSignalingPeerGeneration(registrationId);
+          throw new Error("signaling peer generation was superseded");
+        }
+        activePeerRegistrationId = registrationId;
+      });
+      peerGenerationUpdates = registration;
+      void registration.catch(() => undefined);
+      return registration;
+    },
+    send: (data, peerGeneration, isCurrent) => {
+      if (isCurrent && !isCurrent()) {
+        return Promise.reject(new Error("signaling message belongs to a superseded peer"));
+      }
       if (!isCurrentRendererOwner()) {
         return Promise.reject(new Error("signaling socket is no longer the active renderer owner"));
       }
@@ -229,7 +281,25 @@ export function createSignalingSocket(
       if (connectionGeneration === undefined) {
         return Promise.reject(new Error("signaling generation is unavailable"));
       }
-      return bridge.sendSignaling(data, connectionGeneration).catch((error) => {
+      const generation = connectionGeneration;
+      const send = async (): Promise<void> => {
+        if (peerGeneration !== undefined) {
+          await peerGenerationUpdates;
+          if (activePeerGeneration !== peerGeneration) {
+            throw new Error("signaling message belongs to a superseded peer");
+          }
+          if (!activePeerRegistrationId) {
+            throw new Error("signaling peer registration is unavailable");
+          }
+          if (isCurrent && !isCurrent()) {
+            throw new Error("signaling message belongs to a superseded peer");
+          }
+        }
+        await bridge.sendSignaling(data, generation, peerGeneration === undefined
+          ? undefined
+          : activePeerRegistrationId);
+      };
+      return send().catch((error) => {
         socket.onerror?.();
         throw error;
       });

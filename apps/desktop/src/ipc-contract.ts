@@ -242,7 +242,9 @@ export type LivePresenceBridge = {
   saveCredential(value: string): Promise<void>;
   getServerUrl(): Promise<string>;
   connectSignaling(correlationId?: string): Promise<number>;
-  sendSignaling(value: string, connectionGeneration: number): Promise<void>;
+  sendSignaling(value: string, connectionGeneration: number, peerRegistrationId?: string): Promise<void>;
+  registerSignalingPeerGeneration(sessionId: string, connectionGeneration: number): Promise<string>;
+  clearSignalingPeerGeneration(peerRegistrationId: string): Promise<void>;
   closeSignaling(connectionGeneration: number): void;
   onSocketEvent(callback: (event: SocketEvent) => void): () => void;
   loadIceServers(): Promise<WebRtcConfiguration>;

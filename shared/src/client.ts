@@ -135,7 +135,8 @@ export interface SignalingSocket {
   authenticatedOnOpen?: boolean;
   authenticatedDeviceId?: string;
   connect?: () => void;
-  send(data: string): void | Promise<void>;
+  send(data: string, peerGeneration?: number, isCurrent?: () => boolean): void | Promise<void>;
+  setPeerGeneration?(peerGeneration: number, sessionId?: string): void | Promise<void>;
   close(): void;
   onopen: (() => void) | null;
   onmessage: ((event: { data: unknown }) => void) | null;
@@ -359,17 +360,30 @@ export abstract class WebRtcClient {
       reason: "shared client invoked signaling socket connect",
     });
     socket.connect?.();
+    if (this.peer) this.updatePeerGeneration(socket, this.peerGeneration, this.sessionId);
   }
 
   protected send(message: ClientMessage): void {
     if (!this.socket || this.socket.readyState !== 1) throw new Error("signaling socket is not open");
-    const result = this.socket.send(JSON.stringify(message));
-    if (result && typeof result.then === "function") void result.catch(() => undefined);
+    const socket = this.socket;
+    const result = socket.send(JSON.stringify(message));
+    if (result && typeof result.then === "function") {
+      void result.catch((error: unknown) => {
+        if (this.socket === socket && !this.terminal && !this.closing) this.fail(error, "signaling");
+      });
+    }
   }
 
-  protected async sendAndWait(message: ClientMessage): Promise<void> {
-    if (!this.socket || this.socket.readyState !== 1) throw new Error("signaling socket is not open");
-    await this.socket.send(JSON.stringify(message));
+  protected async sendAndWait(
+    message: ClientMessage,
+    peerGeneration?: number,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    const socket = this.socket;
+    if (!isCurrent()) throw new Error("WebRTC peer was superseded before signaling");
+    if (!socket || socket.readyState !== 1) throw new Error("signaling socket is not open");
+    await socket.send(JSON.stringify(message), peerGeneration, isCurrent);
+    if (!isCurrent()) throw new Error("WebRTC peer was superseded during signaling");
   }
 
   protected createPeer(
@@ -378,30 +392,72 @@ export abstract class WebRtcClient {
     configuration?: WebRtcConfiguration,
     initialNegotiationTimeoutMs: number | null = INITIAL_NEGOTIATION_TIMEOUT_MS,
     negotiationId?: string,
+    preserveRecovery = false,
   ): WebRtcPeer {
-    this.closePeer();
-    const peer = new WebRtcPeer(
+    this.closePeer(preserveRecovery);
+    const generation = this.peerGeneration;
+    let peer!: WebRtcPeer;
+    peer = new WebRtcPeer(
       role,
       sessionId,
       () => this.peerFactory(configuration),
-      (message) => this.send(message),
+      (message, isPeerCurrent = () => true) =>
+        this.sendAndWait(message, generation, () =>
+          isPeerCurrent() &&
+          this.peer === peer &&
+          this.peerGeneration === generation &&
+          !this.terminal &&
+          !this.closing),
       negotiationId,
     );
-    peer.setStateListener((state) => this.onPeerState(state));
+    peer.setStateListener((state) => {
+      if (this.peer === peer && this.peerGeneration === generation) this.onPeerState(state);
+    });
     peer.setDiagnosticListener((diagnostic) => this.onPeerDiagnostic({
       ...diagnostic,
-      peerGeneration: this.peerGeneration,
+      peerGeneration: generation,
       ...(this.recoveryAttemptId ? { recoveryAttemptId: this.recoveryAttemptId } : {}),
       socketConnectionGeneration: this.socketConnectionGeneration,
     }));
-    peer.setFailureListener((error) => this.fail(error));
-    peer.setRemoteTrackListener((track, mid, kind) => this.onRemoteTrack?.(track, mid, kind));
+    peer.setFailureListener((error) => {
+      if (this.peer === peer && this.peerGeneration === generation) this.onPeerFailure(error);
+    });
+    peer.setRemoteTrackListener((track, mid, kind) => {
+      if (this.peer === peer && this.peerGeneration === generation) this.onRemoteTrack?.(track, mid, kind);
+    });
     this.peer = peer;
     this.sessionId = sessionId;
+    this.updatePeerGeneration(this.socket, generation, sessionId);
     if (initialNegotiationTimeoutMs !== null) {
       this.startInitialNegotiationTimeout(peer, initialNegotiationTimeoutMs);
     }
     return peer;
+  }
+
+  protected onPeerFailure(error: Error): void {
+    this.fail(error);
+  }
+
+  private updatePeerGeneration(
+    socket: SignalingSocket | undefined,
+    generation: number,
+    sessionId?: string,
+  ): void {
+    if (!socket?.setPeerGeneration || socket.readyState === 3) return;
+    try {
+      void Promise.resolve(socket.setPeerGeneration(generation, sessionId)).catch((error: unknown) => {
+        if (
+          this.socket === socket &&
+          this.peerGeneration === generation &&
+          !this.terminal &&
+          !this.closing
+        ) this.fail(error, "signaling");
+      });
+    } catch (error) {
+      if (this.socket === socket && this.peerGeneration === generation && !this.terminal && !this.closing) {
+        this.fail(error, "signaling");
+      }
+    }
   }
 
   protected startInitialNegotiationTimeout(
@@ -782,7 +838,7 @@ export abstract class WebRtcClient {
     this.stableTimer = undefined;
   }
 
-  private clearInitialNegotiationTimer(): void {
+  protected clearInitialNegotiationTimer(): void {
     if (this.initialNegotiationTimer !== undefined) {
       this.clientScheduler.clearTimeout(this.initialNegotiationTimer);
     }
@@ -796,13 +852,14 @@ export abstract class WebRtcClient {
     this.clearStableTimer();
     this.recoveryTimer = this.clientScheduler.setTimeout(() => {
       this.recoveryTimer = undefined;
-      if (!this.peer || this.terminal || this.closing) return;
+      if (this.terminal || this.closing) return;
       this.onRecoveryDiagnostic("timed_out");
       this.onRecoveryTimeout(
         new Error(`network recovery timed out after ${this.reconnectOptions.recoveryTimeoutMs / 1000} seconds`),
       );
     }, this.reconnectOptions.recoveryTimeoutMs);
     this.recoveryAttemptId = crypto.randomUUID();
+    this.onRecoveryStarted();
     this.onRecoveryDiagnostic("started");
   }
 
@@ -820,6 +877,8 @@ export abstract class WebRtcClient {
     _sessionId?: string,
     _reason?: string,
   ): void {}
+
+  protected onRecoveryStarted(): void {}
 
   protected onClientDiagnostic(_diagnostic: ClientSignalingDiagnostic): void {}
 
@@ -854,10 +913,15 @@ export abstract class WebRtcClient {
     this.recoveryTimer = undefined;
   }
 
-  protected closePeer(): void {
+  protected hasRecoveryDeadline(): boolean {
+    return this.recoveryTimer !== undefined;
+  }
+
+  protected closePeer(preserveRecovery = false): void {
     this.peerGeneration += 1;
+    this.updatePeerGeneration(this.socket, this.peerGeneration);
     this.clearInitialNegotiationTimer();
-    this.clearRecoveryTimer();
+    if (!preserveRecovery) this.clearRecoveryTimer();
     this.pendingIceCandidatesByNegotiation.clear();
     this.peer?.close();
     this.peer = undefined;
@@ -931,6 +995,7 @@ export type DesktopClientOptions = {
   loadManagedIceServers?: () => Promise<WebRtcConfiguration>;
   managedAuthentication?: boolean;
   isSharingActive?: () => boolean;
+  getSharingGeneration?: () => number;
   prepareOwnerPeer?: (peer: WebRtcPeer) => Promise<void>;
   onSharingResumed?: () => void;
   onOwnerSessionEnded?: (reason: string) => void;
@@ -954,6 +1019,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
     this.loadManagedIceServers = options.loadManagedIceServers;
     this.managedAuthentication = options.managedAuthentication ?? false;
     this.isSharingActive = options.isSharingActive ?? (() => true);
+    this.getSharingGeneration = options.getSharingGeneration;
     this.prepareOwnerPeer = options.prepareOwnerPeer;
     this.onSharingResumed = options.onSharingResumed;
     this.onOwnerSessionEnded = options.onOwnerSessionEnded;
@@ -968,6 +1034,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private readonly loadManagedIceServers?: () => Promise<WebRtcConfiguration>;
   private readonly managedAuthentication: boolean;
   private readonly isSharingActive: () => boolean;
+  private readonly getSharingGeneration?: () => number;
   private readonly prepareOwnerPeer?: (peer: WebRtcPeer) => Promise<void>;
   private readonly onSharingResumed?: () => void;
   private readonly onOwnerSessionEnded?: (reason: string) => void;
@@ -995,12 +1062,35 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private pendingIceRecovery = false;
   private restartOfferGeneration: number | undefined;
   private recoveryTimeoutHandled = false;
+  private pendingViewerRejoin: {
+    sessionId: string;
+    socket: SignalingSocket;
+    peer: WebRtcPeer;
+    peerGeneration: number;
+    attempt: number;
+    sharingGeneration?: number;
+  } | undefined;
+  private viewerRejoinHandled = false;
+  private viewerRejoinAttempt = 0;
+  private viewerRejoinInProgress = false;
+  private recoveryReplacementPeer: WebRtcPeer | undefined;
 
   protected override onPeerState(state: PeerState): void {
     if (this.terminal || this.closing) return;
     if (state === "connected" && this.pendingSharingResumed) {
       this.pendingSharingResumed = false;
       this.onSharingResumed?.();
+    }
+    if (
+      this.peer === this.recoveryReplacementPeer &&
+      this.hasRecoveryDeadline() &&
+      (state === "disconnected" || state === "failed")
+    ) {
+      if (state === "failed") {
+        this.closePeer(true);
+        this.setLifecycle("RECONNECTING");
+      }
+      return;
     }
     if (
       this.lifecycle === "NEGOTIATING" &&
@@ -1160,7 +1250,15 @@ export class DesktopWebRtcClient extends WebRtcClient {
     this.onTerminalError?.(error);
   }
 
+  protected override onRecoveryStarted(): void {
+    if (this.peer === this.recoveryReplacementPeer) this.clearInitialNegotiationTimer();
+  }
+
   protected override onRecoveryCompleted(): void {
+    if (this.peer === this.recoveryReplacementPeer) {
+      this.recoveryReplacementPeer = undefined;
+      this.viewerRejoinHandled = false;
+    }
     if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
     this.iceRecoveryTimer = undefined;
     this.clearRestartResponseTimer();
@@ -1171,9 +1269,16 @@ export class DesktopWebRtcClient extends WebRtcClient {
     this.queuedRecoveryEvent = false;
     this.pendingIceRecovery = false;
     this.awaitingControlPlaneRecovery = false;
+    this.pendingViewerRejoin = undefined;
+    this.viewerRejoinAttempt += 1;
   }
 
   protected override onSocketClosed(code?: number): void {
+    if (this.viewerRejoinHandled) {
+      this.pendingViewerRejoin = undefined;
+      this.viewerRejoinHandled = false;
+      this.viewerRejoinAttempt += 1;
+    }
     this.awaitingControlPlaneRecovery = Boolean(this.peer && this.sessionId);
     if (this.awaitingControlPlaneRecovery) {
       this.pendingIceRecovery = true;
@@ -1195,6 +1300,15 @@ export class DesktopWebRtcClient extends WebRtcClient {
       category: "signaling",
       message: `Owner signaling socket closed (code ${code ?? "unknown"})`,
     });
+  }
+
+  protected override onPeerFailure(error: Error): void {
+    if (this.peer === this.recoveryReplacementPeer && this.hasRecoveryDeadline()) {
+      this.closePeer(true);
+      this.setLifecycle("RECONNECTING");
+      return;
+    }
+    this.fail(error);
   }
 
   protected override onServerMessage(message: ServerMessage): boolean {
@@ -1351,6 +1465,11 @@ export class DesktopWebRtcClient extends WebRtcClient {
   }
 
   protected override onSessionEnded(reason: string): void {
+    if (reason === "temporary_disconnect") {
+      this.pendingViewerRejoin = undefined;
+      this.viewerRejoinHandled = false;
+      this.viewerRejoinAttempt += 1;
+    }
     if (reason === "viewer_grace_expired" || reason === "authorization_revoked") {
       this.onOwnerSessionEnded?.(reason);
     }
@@ -1420,6 +1539,13 @@ export class DesktopWebRtcClient extends WebRtcClient {
   }
 
   private drainPendingRecovery(): void {
+    if (this.pendingViewerRejoin) {
+      if (this.iceRestartInFlight || this.viewerRejoinInProgress) return;
+      const request = this.pendingViewerRejoin;
+      this.pendingViewerRejoin = undefined;
+      void this.replacePeerForViewerRejoin(request);
+      return;
+    }
     if (
       !this.signalingAuthenticated ||
       !this.peer ||
@@ -1593,6 +1719,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
             this.drainPendingRecovery();
           }
         }, 8_000);
+        this.drainPendingRecovery();
       }).catch(() => {
         if (
           this.peer !== peer ||
@@ -1664,23 +1791,182 @@ export class DesktopWebRtcClient extends WebRtcClient {
     if (this.peer?.state !== "connected") this.drainPendingRecovery();
   }
 
-  protected override closePeer(): void {
+  protected override closePeer(preserveRecovery = false): void {
+    if (!preserveRecovery) this.recoveryReplacementPeer = undefined;
     if (this.iceRecoveryTimer !== undefined) this.clientScheduler.clearTimeout(this.iceRecoveryTimer);
     this.iceRecoveryTimer = undefined;
     this.clearRestartResponseTimer();
-    this.iceRestartAttempts = 0;
+    if (!preserveRecovery) this.iceRestartAttempts = 0;
     this.iceRestartInFlight = false;
     this.restartOperationId += 1;
     this.restartOfferGeneration = undefined;
-    this.lastSessionRecoveryId = undefined;
+    if (!preserveRecovery) this.lastSessionRecoveryId = undefined;
     this.queuedRecoveryEvent = false;
     this.pendingIceRecovery = false;
     this.awaitingControlPlaneRecovery = false;
-    super.closePeer();
+    if (!preserveRecovery) {
+      this.pendingViewerRejoin = undefined;
+      this.viewerRejoinHandled = false;
+      this.viewerRejoinAttempt += 1;
+    }
+    super.closePeer(preserveRecovery);
   }
 
   override close(): void {
     super.close();
+  }
+
+  private queueViewerRejoin(
+    message: Extract<ServerMessage, { type: "viewer_rejoined" }>,
+    socket: SignalingSocket,
+  ): void {
+    if (
+      this.viewerRejoinHandled ||
+      this.socket !== socket ||
+      !this.signalingAuthenticated ||
+      socket.readyState !== 1 ||
+      message.session_id !== this.sessionId ||
+      !this.peer ||
+      !this.sharingState.screen ||
+      !this.isSharingActive()
+    ) return;
+    this.viewerRejoinHandled = true;
+    const attempt = ++this.viewerRejoinAttempt;
+    this.pendingViewerRejoin = {
+      sessionId: message.session_id,
+      socket,
+      peer: this.peer,
+      peerGeneration: this.peerGeneration,
+      attempt,
+      ...(this.getSharingGeneration
+        ? { sharingGeneration: this.getSharingGeneration() }
+        : {}),
+    };
+    this.drainPendingRecovery();
+  }
+
+  private canContinueViewerRejoin(request: NonNullable<typeof this.pendingViewerRejoin>): boolean {
+    return !this.terminal &&
+      !this.closing &&
+      this.socket === request.socket &&
+      this.signalingAuthenticated &&
+      request.socket.readyState === 1 &&
+      this.viewerRejoinAttempt === request.attempt &&
+      this.sharingState.screen &&
+      this.isSharingActive() &&
+      (request.sharingGeneration === undefined ||
+        this.getSharingGeneration?.() === request.sharingGeneration);
+  }
+
+  private async replacePeerForViewerRejoin(
+    request: NonNullable<typeof this.pendingViewerRejoin>,
+  ): Promise<void> {
+    if (this.viewerRejoinInProgress) {
+      this.pendingViewerRejoin = request;
+      return;
+    }
+    this.viewerRejoinInProgress = true;
+    try {
+      await this.performPeerReplacementForViewerRejoin(request);
+    } finally {
+      this.viewerRejoinInProgress = false;
+      this.drainPendingRecovery();
+    }
+  }
+
+  private async performPeerReplacementForViewerRejoin(
+    request: NonNullable<typeof this.pendingViewerRejoin>,
+  ): Promise<void> {
+    if (
+      this.peer !== request.peer ||
+      this.peerGeneration !== request.peerGeneration ||
+      this.sessionId !== request.sessionId ||
+      !this.canContinueViewerRejoin(request)
+    ) return;
+
+    let preserveRecovery = this.hasRecoveryDeadline();
+    let replacement: WebRtcPeer | undefined;
+    let generation: number | undefined;
+    try {
+      if (request.peer.offerInProgress) await request.peer.waitForOfferSettled();
+      preserveRecovery = preserveRecovery || this.hasRecoveryDeadline();
+      if (
+        this.peer !== request.peer ||
+        this.peerGeneration !== request.peerGeneration ||
+        this.sessionId !== request.sessionId ||
+        !this.canContinueViewerRejoin(request)
+      ) return;
+      if (this.iceRestartInFlight) {
+        this.pendingViewerRejoin = request;
+        return;
+      }
+
+      this.closePeer(preserveRecovery);
+      this.viewerRejoinHandled = true;
+      request.attempt = this.viewerRejoinAttempt;
+      this.setLifecycle("NEGOTIATING");
+      replacement = this.createPeer(
+        "owner",
+        request.sessionId,
+        this.iceConfiguration,
+        preserveRecovery ? null : INITIAL_NEGOTIATION_TIMEOUT_MS,
+        crypto.randomUUID(),
+        preserveRecovery,
+      );
+      this.recoveryReplacementPeer = replacement;
+      this.viewerRejoinHandled = true;
+      request.attempt = this.viewerRejoinAttempt;
+      generation = this.peerGeneration;
+      if (!this.canContinueViewerRejoin(request)) {
+        const preserveCurrentRecovery = this.hasRecoveryDeadline();
+        this.closePeer(preserveCurrentRecovery);
+        if (preserveCurrentRecovery) this.setLifecycle("RECONNECTING");
+        return;
+      }
+
+      await this.prepareOwnerPeer?.(replacement);
+      if (
+        this.peer !== replacement ||
+        this.peerGeneration !== generation ||
+        !this.canContinueViewerRejoin(request)
+      ) {
+        if (this.peer === replacement && this.peerGeneration === generation) {
+          const preserveCurrentRecovery = this.hasRecoveryDeadline();
+          this.closePeer(preserveCurrentRecovery);
+          if (preserveCurrentRecovery) this.setLifecycle("RECONNECTING");
+        }
+        return;
+      }
+
+      await replacement.createOffer();
+      if (
+        this.peer !== replacement ||
+        this.peerGeneration !== generation ||
+        !this.canContinueViewerRejoin(request)
+      ) {
+        if (this.peer === replacement && this.peerGeneration === generation) {
+          const preserveCurrentRecovery = this.hasRecoveryDeadline();
+          this.closePeer(preserveCurrentRecovery);
+          if (preserveCurrentRecovery) this.setLifecycle("RECONNECTING");
+        }
+        return;
+      }
+    } catch {
+      if (
+        replacement &&
+        this.peer === replacement &&
+        this.peerGeneration === generation &&
+        !this.terminal &&
+        !this.closing
+      ) {
+        if (this.hasRecoveryDeadline()) {
+          this.closePeer(true);
+          this.setLifecycle("RECONNECTING");
+        } else {
+          this.fail();
+        }
+      }
+    }
   }
 
   async start(reconnecting = false): Promise<void> {
@@ -1720,29 +2006,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
           this.fail(new Error("Rejoined viewer session did not match the active session"), "signaling");
           return;
         }
-        if (!this.isSharingActive()) return;
-        this.closePeer();
-        this.setLifecycle("NEGOTIATING");
-        const peer = this.createPeer(
-          "owner",
-          message.session_id,
-          this.iceConfiguration,
-          INITIAL_NEGOTIATION_TIMEOUT_MS,
-          crypto.randomUUID(),
-        );
-        const generation = this.peerGeneration;
-        void Promise.resolve(this.prepareOwnerPeer?.(peer)).then(() => {
-          if (this.peer !== peer || this.peerGeneration !== generation || this.terminal || this.closing) return;
-          if (!this.isSharingActive()) {
-            this.closePeer();
-            return;
-          }
-          return peer.createOffer();
-        }).catch(() => {
-          if (this.peer === peer && this.peerGeneration === generation && !this.terminal && !this.closing) {
-            this.fail();
-          }
-        });
+        this.queueViewerRejoin(message, socket);
         return;
       }
       if (message.type === "viewer_joined") {

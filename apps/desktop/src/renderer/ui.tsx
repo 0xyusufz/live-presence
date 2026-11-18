@@ -168,6 +168,7 @@ function ShareWindow(): JSX.Element {
         capture.current.screen.readyState === "live" &&
         capture.current.generation > 0
       ),
+      getSharingGeneration: () => capture.current.generation,
       prepareOwnerPeer: (peer) => attachCurrentTracks(peer, capture.current.generation),
       onSharingResumed: () => {
         setMessage("Connected / Sharing resumed");

@@ -91,7 +91,10 @@ export type WebRtcConfiguration = {
   iceTransportPolicy?: IceTransportPolicy;
 };
 export type WebRtcFactory = (configuration?: WebRtcConfiguration) => WebRtcPeerConnection;
-export type SignalingSender = (message: ClientMessage) => void;
+export type SignalingSender = (
+  message: ClientMessage,
+  isCurrent?: () => boolean,
+) => void | Promise<void>;
 export type PeerState = "new" | "connecting" | "connected" | "disconnected" | "failed" | "closed";
 
 const ORDER: readonly MediaKind[] = ["screen", "camera"];
@@ -172,6 +175,7 @@ export class WebRtcPeer {
   private lastConnectionState: string | undefined;
   private lastIceConnectionState: string | undefined;
   private lastSignalingState: string | undefined;
+  private offerOperation: Promise<void> | undefined;
 
   constructor(
     role: "owner" | "viewer",
@@ -190,20 +194,32 @@ export class WebRtcPeer {
     this.lastSignalingState = this.connection.signalingState;
     this.connection.onicecandidate = (event) => {
       if (!this.closed && event.candidate !== null) {
-        try {
-          if (!this.negotiationIdValue) return;
-          this.send({
-            type: "ice_candidate",
-            session_id: this.sessionId,
-            negotiation_id: this.negotiationIdValue,
-            candidate: event.candidate,
-          });
+        const negotiationId = this.negotiationIdValue;
+        if (!negotiationId) return;
+        const reportDelivered = () => {
+          if (this.closed) return;
           this.emitDiagnostic("ice_candidate_sent", {
             candidateType: candidateTypeFromCandidate(event.candidate),
-            reason: "local ICE candidate handed to signaling sender",
+            reason: "local ICE candidate delivered through signaling sender",
           });
-        } catch (error) {
+        };
+        const reportFailure = (error: unknown) => {
           this.failureListener?.(this.makeError("signaling", "Sending ICE candidate failed", error));
+        };
+        try {
+          const delivery = this.send({
+            type: "ice_candidate",
+            session_id: this.sessionId,
+            negotiation_id: negotiationId,
+            candidate: event.candidate,
+          }, () => !this.closed);
+          if (delivery && typeof delivery.then === "function") {
+            void delivery.then(reportDelivered, reportFailure);
+          } else {
+            reportDelivered();
+          }
+        } catch (error) {
+          reportFailure(error);
         }
       }
     };
@@ -361,7 +377,30 @@ export class WebRtcPeer {
     this.stateListener?.(this.stateValue);
   }
 
-  async createOffer(options?: { iceRestart?: boolean }): Promise<void> {
+  createOffer(options?: { iceRestart?: boolean }): Promise<void> {
+    if (this.offerOperation) return Promise.reject(new Error("peer offer is already in progress"));
+    const operation = this.createOfferInternal(options);
+    this.offerOperation = operation;
+    void operation.then(
+      () => {
+        if (this.offerOperation === operation) this.offerOperation = undefined;
+      },
+      () => {
+        if (this.offerOperation === operation) this.offerOperation = undefined;
+      },
+    );
+    return operation;
+  }
+
+  waitForOfferSettled(): Promise<void> {
+    return this.offerOperation?.then(() => undefined, () => undefined) ?? Promise.resolve();
+  }
+
+  get offerInProgress(): boolean {
+    return this.offerOperation !== undefined;
+  }
+
+  private async createOfferInternal(options?: { iceRestart?: boolean }): Promise<void> {
     if (this.closed) throw new Error("peer is closed");
     const restarting = options?.iceRestart === true;
     if (this.role !== "owner" ||
@@ -378,7 +417,9 @@ export class WebRtcPeer {
     try {
       if (restarting) this.negotiationState = "restart_offer_created";
       description = await this.connection.createOffer(options);
+      if (this.closed) throw new Error("peer is closed");
       await this.connection.setLocalDescription(description);
+      if (this.closed) throw new Error("peer is closed");
       if (!restarting) this.negotiationState = "offer_created";
       else this.emitDiagnostic("ice_restart_offer_created", {
         reason: "ICE restart offer created and set as local description",
@@ -388,15 +429,17 @@ export class WebRtcPeer {
       throw this.makeError(restarting ? "ice" : "negotiation", "Creating WebRTC offer failed", error);
     }
     try {
-      this.send({
+      if (this.closed) throw new Error("peer is closed");
+      await this.send({
         type: "offer",
         session_id: this.sessionId,
         negotiation_id: this.negotiationIdValue,
         sdp: description.sdp ?? "",
         track_map: trackMapFromTransceivers(this.connection.transceivers),
-      });
+      }, () => !this.closed);
+      if (this.closed) throw new Error("peer is closed");
       if (restarting) this.emitDiagnostic("ice_restart_offer_sent", {
-        reason: "ICE restart offer handed to signaling sender",
+        reason: "ICE restart offer delivered through signaling sender",
       });
     } catch (error) {
       this.negotiationState = "failed";
@@ -489,13 +532,14 @@ export class WebRtcPeer {
       }
       this.emitOperation("sendAnswer", "started");
       try {
-        this.send({
+        await this.send({
           type: "answer",
           session_id: this.sessionId,
           negotiation_id: this.negotiationIdValue!,
           sdp: description.sdp ?? "",
           track_map: negotiatedMap,
-        });
+        }, () => !this.closed);
+        if (this.closed) throw new Error("peer is closed");
       } catch (error) {
         this.emitOperation("sendAnswer", "failed");
         throw this.makeError("signaling", "Sending WebRTC answer through signaling failed", error);

@@ -9,8 +9,12 @@ const bridge: LivePresenceBridge = {
   getServerUrl: () => ipcRenderer.invoke("config:server-url") as Promise<string>,
   connectSignaling: (correlationId) =>
     ipcRenderer.invoke("signaling:connect", correlationId) as Promise<number>,
-  sendSignaling: (value, connectionGeneration) =>
-    ipcRenderer.invoke("signaling:send", value, connectionGeneration) as Promise<void>,
+  sendSignaling: (value, connectionGeneration, peerRegistrationId) =>
+    ipcRenderer.invoke("signaling:send", value, connectionGeneration, peerRegistrationId) as Promise<void>,
+  registerSignalingPeerGeneration: (sessionId, connectionGeneration) =>
+    ipcRenderer.invoke("signaling:peer-generation", sessionId, connectionGeneration) as Promise<string>,
+  clearSignalingPeerGeneration: (peerRegistrationId) =>
+    ipcRenderer.invoke("signaling:peer-generation:clear", peerRegistrationId) as Promise<void>,
   closeSignaling: (connectionGeneration) => ipcRenderer.send("signaling:close", connectionGeneration),
   onSocketEvent: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, value: SocketEvent) => callback(value);

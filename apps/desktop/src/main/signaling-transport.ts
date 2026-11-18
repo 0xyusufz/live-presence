@@ -94,7 +94,7 @@ export class MainSignalingTransport {
   private lastHeartbeatAckAt = 0;
   private heartbeatSentCount = 0;
   private heartbeatAckCount = 0;
-  private activeSessionId: string | undefined;
+  private activeSessionIdValue: string | undefined;
   private activeRecoveryAttemptId: string | undefined;
   private hasStartedConnection = false;
   private reconnectAttemptCount = 0;
@@ -104,6 +104,8 @@ export class MainSignalingTransport {
   private diagnosticLogger: DiagnosticLogger;
 
   get deviceId(): string | undefined { return this.authenticatedDeviceId; }
+  get connectionGeneration(): number { return this.socketConnectionGeneration; }
+  get activeSessionId(): string | undefined { return this.activeSessionIdValue; }
   get hasAuthenticatedOpenSocket(): boolean {
     return Boolean(
       this.socket?.readyState === WebSocket.OPEN &&
@@ -419,13 +421,26 @@ export class MainSignalingTransport {
           });
         }
       }
-      if (message.type === "viewer_joined" || message.type === "session_recovery") {
-        this.activeSessionId = message.session_id;
+      if (
+        message.type === "viewer_joined" ||
+        message.type === "viewer_rejoined" ||
+        message.type === "session_recovery" ||
+        message.type === "session_resumed"
+      ) {
+        this.activeSessionIdValue = message.session_id;
         if (message.type === "session_recovery") {
           this.activeRecoveryAttemptId = message.recovery_attempt_id;
         } else {
           this.activeRecoveryAttemptId = undefined;
         }
+      }
+      if (
+        message.type === "viewer_left" &&
+        message.session_id === this.activeSessionIdValue &&
+        message.reason !== "temporary_disconnect"
+      ) {
+        this.activeSessionIdValue = undefined;
+        this.activeRecoveryAttemptId = undefined;
       }
       this.emit({
         type: "message",
@@ -642,12 +657,12 @@ export class MainSignalingTransport {
         sharingState: { screen: message.screen, camera: message.camera },
       });
       if (!message.screen) {
-        this.activeSessionId = undefined;
+        this.activeSessionIdValue = undefined;
         this.activeRecoveryAttemptId = undefined;
       }
     }
     if (message.type === "offer" || message.type === "ice_candidate") {
-      this.activeSessionId = message.session_id;
+      this.activeSessionIdValue = message.session_id;
     }
   }
 
@@ -730,7 +745,7 @@ export class MainSignalingTransport {
     this.authenticated = false;
     this.authenticatedDeviceId = undefined;
     this.lastHeartbeatAckAt = 0;
-    this.activeSessionId = undefined;
+    this.activeSessionIdValue = undefined;
     this.activeRecoveryAttemptId = undefined;
     this.socket = undefined;
     socket.removeAllListeners("open");

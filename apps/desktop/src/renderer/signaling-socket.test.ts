@@ -549,6 +549,76 @@ test("diagnostic logger failures do not interrupt renderer signaling", async () 
   socket.close();
 });
 
+test("renderer signaling rejects a superseded peer before invoking IPC", async () => {
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const sends: string[] = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > = {
+    connectSignaling: async () => 48,
+    sendSignaling: async (data) => { sends.push(data); },
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {};
+    },
+  };
+  const socket = createSignalingSocket(bridge);
+  socket.connect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[0]?.({ type: "open", connectionGeneration: 48 });
+
+  await assert.rejects(async () => { await socket.send("stale-offer", undefined, () => false); }, /superseded peer/);
+  assert.deepEqual(sends, []);
+  await socket.send("current-offer", undefined, () => true);
+  assert.deepEqual(sends, ["current-offer"]);
+  socket.close();
+});
+
+test("renderer signaling forwards only the main-issued peer registration through IPC", async () => {
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const registrations: Array<[string, number]> = [];
+  const clearings: string[] = [];
+  const sends: Array<[string, number, string | undefined]> = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > & Partial<Pick<
+    LivePresenceBridge,
+    "registerSignalingPeerGeneration" | "clearSignalingPeerGeneration"
+  >> = {
+    connectSignaling: async () => 49,
+    registerSignalingPeerGeneration: async (sessionId, connectionGeneration) => {
+      registrations.push([sessionId, connectionGeneration]);
+      return "main-registration-1";
+    },
+    clearSignalingPeerGeneration: async (registrationId) => {
+      clearings.push(registrationId);
+    },
+    sendSignaling: async (data, connectionGeneration, registrationId) => {
+      sends.push([data, connectionGeneration, registrationId]);
+    },
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {};
+    },
+  };
+  const socket = createSignalingSocket(bridge);
+  socket.connect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[0]?.({ type: "open", connectionGeneration: 49 });
+
+  await socket.setPeerGeneration?.(12, "session-current");
+  await socket.send("current-offer", 12, () => true);
+
+  assert.deepEqual(registrations, [["session-current", 49]]);
+  assert.deepEqual(sends, [["current-offer", 49, "main-registration-1"]]);
+  assert.deepEqual(clearings, []);
+  socket.close();
+});
+
 test("connect rejection diagnostics preserve the safe IPC category and correlation ID", async () => {
   const diagnostics: Array<Record<string, unknown>> = [];
   let receivedCorrelationId: string | undefined;

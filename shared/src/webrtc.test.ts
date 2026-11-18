@@ -33,6 +33,8 @@ class MockConnection implements WebRtcPeerConnection {
   remoteDescriptionError: Error | undefined;
   answerError: Error | undefined;
   localDescriptionError: Error | undefined;
+  offerGate: Promise<void> | undefined;
+  localDescriptionGate: Promise<void> | undefined;
   hasAppliedRemoteOffer = false;
   addTransceiver(_kind: string, init: { direction: "sendonly" | "recvonly" }): WebRtcTransceiver {
     const index = this.transceivers.length;
@@ -46,6 +48,7 @@ class MockConnection implements WebRtcPeerConnection {
     return tx;
   }
   async createOffer() {
+    await this.offerGate;
     this.offerCalls += 1;
     if (this.failOfferCount > 0) {
       this.failOfferCount -= 1;
@@ -59,6 +62,7 @@ class MockConnection implements WebRtcPeerConnection {
     return { type: "answer" as const, sdp: "answer" };
   }
   async setLocalDescription(value: unknown) {
+    await this.localDescriptionGate;
     if (this.localDescriptionError) throw this.localDescriptionError;
     this.local = value;
     if (
@@ -105,7 +109,7 @@ class MockConnection implements WebRtcPeerConnection {
 test("owner creates fixed sendonly transceivers and exchanges offer/answer and ICE", async () => {
   const connection = new MockConnection();
   const messages: unknown[] = [];
-  const peer = new WebRtcPeer("owner", "session", () => connection, (message) => messages.push(message));
+  const peer = new WebRtcPeer("owner", "session", () => connection, (message) => { messages.push(message); });
   assert.deepEqual(connection.transceivers.map((tx) => tx.direction), ["sendonly", "sendonly"]);
   await peer.createOffer();
   assert.equal((messages[0] as { type: string }).type, "offer");
@@ -123,6 +127,81 @@ test("owner creates fixed sendonly transceivers and exchanges offer/answer and I
   connection.onicecandidate?.({ candidate: { candidate: "after-close" } });
   assert.equal(messages.length, 2);
   await assert.rejects(() => peer.addIceCandidate({ candidate: "after-close" }), /closed/);
+});
+
+test("closing a peer cancels an asynchronous offer before signaling", async () => {
+  let resolveOffer!: () => void;
+  const offerGate = new Promise<void>((resolve) => { resolveOffer = resolve; });
+  const connection = new MockConnection();
+  connection.offerGate = offerGate;
+  const messages: unknown[] = [];
+  const peer = new WebRtcPeer("owner", "session", () => connection, (message) => { messages.push(message); });
+  const offer = peer.createOffer();
+  peer.close();
+  resolveOffer();
+
+  await assert.rejects(offer, /closed/);
+  assert.equal(connection.local, undefined);
+  assert.equal(messages.length, 0);
+});
+
+test("closing a peer during setLocalDescription prevents a stale offer from signaling", async () => {
+  let resolveLocalDescription!: () => void;
+  const localDescriptionGate = new Promise<void>((resolve) => {
+    resolveLocalDescription = resolve;
+  });
+  const connection = new MockConnection();
+  connection.localDescriptionGate = localDescriptionGate;
+  const messages: unknown[] = [];
+  const peer = new WebRtcPeer("owner", "session", () => connection, (message) => { messages.push(message); });
+  const offer = peer.createOffer();
+  await new Promise((resolve) => setImmediate(resolve));
+  peer.close();
+  resolveLocalDescription();
+
+  await assert.rejects(offer, /closed/);
+  assert.equal(messages.length, 0);
+});
+
+test("offer completion waits for asynchronous signaling delivery", async () => {
+  let resolveDelivery!: () => void;
+  const delivery = new Promise<void>((resolve) => { resolveDelivery = resolve; });
+  const connection = new MockConnection();
+  const messages: unknown[] = [];
+  const peer = new WebRtcPeer("owner", "session", () => connection, async (message) => {
+    await delivery;
+    messages.push(message);
+  });
+  let settled = false;
+  const offer = peer.createOffer().then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(settled, false);
+  assert.equal(messages.length, 0);
+  resolveDelivery();
+  await offer;
+  assert.equal(settled, true);
+  assert.equal(messages.length, 1);
+  peer.close();
+});
+
+test("peer closure is checked at the asynchronous signaling delivery boundary", async () => {
+  let resolveDelivery!: () => void;
+  const delivery = new Promise<void>((resolve) => { resolveDelivery = resolve; });
+  const connection = new MockConnection();
+  const messages: unknown[] = [];
+  const peer = new WebRtcPeer("owner", "session", () => connection, async (message, isCurrent) => {
+    await delivery;
+    if (!isCurrent?.()) throw new Error("peer was superseded");
+    messages.push(message);
+  });
+  const offer = peer.createOffer();
+  await new Promise((resolve) => setImmediate(resolve));
+  peer.close();
+  resolveDelivery();
+
+  await assert.rejects(offer, /Sending WebRTC offer failed/);
+  assert.equal(messages.length, 0);
 });
 
 test("WebRTC diagnostics report transitions and candidate type without sensitive payloads", async () => {
@@ -163,7 +242,7 @@ test("WebRTC diagnostics report transitions and candidate type without sensitive
 test("viewer relies on remote offer sections to create and negotiate recvonly transceivers", async () => {
   const connection = new MockConnection();
   const messages: unknown[] = [];
-  const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => messages.push(message));
+  const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => { messages.push(message); });
   assert.equal(connection.transceivers.length, 0);
   assert.equal(connection.signalingState, "stable");
   await peer.acceptOffer("offer", [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }], NEGOTIATION_ID);
@@ -183,7 +262,7 @@ test("viewer relies on remote offer sections to create and negotiate recvonly tr
 test("viewer processes a two-media-section desktop offer and preserves canonical screen/camera MIDs", async () => {
   const connection = new MockConnection();
   const messages: unknown[] = [];
-  const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => messages.push(message));
+  const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => { messages.push(message); });
   const sdp = [
     "v=0",
     "o=- 123 1 IN IP4 127.0.0.1",
@@ -228,7 +307,7 @@ test("viewer sends exactly one answer for a valid offer, including concurrent du
   const connection = new MockConnection();
   const messages: unknown[] = [];
   const diagnostics: WebRtcDiagnostic[] = [];
-  const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => messages.push(message));
+  const peer = new WebRtcPeer("viewer", "session", () => connection, (message) => { messages.push(message); });
   peer.setDiagnosticListener((diagnostic) => diagnostics.push(diagnostic));
   const trackMap: TrackMap = [
     { mid: "0", kind: "screen" },
@@ -431,8 +510,8 @@ test("owner and viewer complete a bounded ICE restart after initial negotiation"
   const viewerMessages: unknown[] = [];
   const ownerConnection = new MockConnection();
   const viewerConnection = new MockConnection();
-  const owner = new WebRtcPeer("owner", "session", () => ownerConnection, (message) => ownerMessages.push(message));
-  const viewer = new WebRtcPeer("viewer", "session", () => viewerConnection, (message) => viewerMessages.push(message));
+  const owner = new WebRtcPeer("owner", "session", () => ownerConnection, (message) => { ownerMessages.push(message); });
+  const viewer = new WebRtcPeer("viewer", "session", () => viewerConnection, (message) => { viewerMessages.push(message); });
 
   await owner.createOffer();
   const negotiationId = owner.negotiationId;

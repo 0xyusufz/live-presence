@@ -44,6 +44,8 @@ class MockConnection implements WebRtcPeerConnection {
   failOfferCount = 0;
   configurations: unknown[] = [];
   replaceCalls: Array<{ index: number; track: unknown }> = [];
+  offerGate: Promise<void> | undefined;
+  localDescriptionGate: Promise<void> | undefined;
   candidateCalls = 0;
   events: string[] = [];
 
@@ -68,6 +70,7 @@ class MockConnection implements WebRtcPeerConnection {
   async createOffer() {
     this.events.push("offer");
     this.offerCalls += 1;
+    await this.offerGate;
     if (this.failOfferCount > 0) {
       this.failOfferCount -= 1;
       throw new Error("offer failed");
@@ -79,6 +82,7 @@ class MockConnection implements WebRtcPeerConnection {
     return { type: "answer" as const, sdp: "viewer-answer" };
   }
   async setLocalDescription(value: unknown) {
+    await this.localDescriptionGate;
     this.local = value;
     if (
       typeof value === "object" && value !== null &&
@@ -153,7 +157,8 @@ class MockSocket implements SignalingSocket {
   onclose: ((event?: { code?: number }) => void) | null = null;
   onerror: (() => void) | null = null;
 
-  send(data: string): void {
+  send(data: string, _peerGeneration?: number, isCurrent?: () => boolean): void {
+    if (isCurrent && !isCurrent()) throw new Error("signaling message belongs to a superseded peer");
     this.sent.push(data);
     try {
       const message = JSON.parse(data) as Record<string, unknown>;
@@ -1723,6 +1728,7 @@ async function connectedDesktop(
     onDiagnostic?: (diagnostic: DesktopDiagnostic) => void;
     recoveryTimeoutMs?: number;
     isSharingActive?: () => boolean;
+    getSharingGeneration?: () => number;
     prepareOwnerPeer?: (peer: WebRtcPeer) => Promise<void>;
     peerFactory?: () => MockConnection;
     onOwnerSessionEnded?: (reason: string) => void;
@@ -1746,6 +1752,7 @@ async function connectedDesktop(
         : { recoveryTimeoutMs: configuration.recoveryTimeoutMs }),
     },
     isSharingActive: configuration?.isSharingActive,
+    getSharingGeneration: configuration?.getSharingGeneration,
     onTerminalError,
     onDiagnostic: configuration?.onDiagnostic,
     onOwnerSessionEnded: configuration?.onOwnerSessionEnded,
@@ -2260,6 +2267,7 @@ test("same-session peer replacement rejects stale negotiation signaling", async 
     peerFactory: () => connections[peerFactoryCalls++]!,
     isSharingActive: () => true,
   });
+  await client.setSharingState(true, false);
   const oldNegotiationId = JSON.parse(
     socket.sent.filter((data) => JSON.parse(data).type === "offer").at(-1)!,
   ).negotiation_id as string;
@@ -2270,6 +2278,7 @@ test("same-session peer replacement rejects stale negotiation signaling", async 
       viewer_user_id: "viewer",
     }),
   });
+  await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   const currentOffer = JSON.parse(socket.sent.filter((data) => JSON.parse(data).type === "offer").at(-1)!);
   const newNegotiationId = currentOffer.negotiation_id as string;
@@ -2783,6 +2792,673 @@ test("owner replaces its peer and approved tracks when a fresh viewer reattaches
     sdp: "owner-offer",
     track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
   });
+  client.close();
+});
+
+test("owner waits for an in-flight ICE restart offer before replacing its peer", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const gate = deferred<void>();
+  const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  const cameraTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    prepareOwnerPeer: async (peer) => {
+      await peer.replaceTrack("screen", screenTrack);
+      await peer.replaceTrack("camera", cameraTrack);
+    },
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, true);
+  original.offerGate = gate.promise;
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  assert.equal(scheduler.runNext(), 8_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(original.offerCalls, 2);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  assert.equal(connections.length, 1);
+  assert.equal(original.closed, false);
+
+  gate.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(connections.length, 2);
+  assert.equal(original.closed, true);
+  assert.deepEqual(connections[1]!.replaceCalls, [
+    { index: 0, track: screenTrack },
+    { index: 1, track: cameraTrack },
+  ]);
+  assert.equal(connections[1]!.offerCalls, 1);
+  const offers = socket.sent.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .filter((message) => message.type === "offer");
+  assert.equal(offers.length, 3);
+  assert.notEqual(offers[1]!.negotiation_id, offers[2]!.negotiation_id);
+  client.close();
+});
+
+test("owner awaits delayed signaling delivery before replacing a peer", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const delivery = deferred<void>();
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  const sendImmediately = socket.send.bind(socket);
+  let offerCount = 0;
+  socket.send = async (data, _peerGeneration, isCurrent) => {
+    const message = JSON.parse(data) as { type?: string };
+    if (message.type === "offer" && ++offerCount === 1) {
+      await delivery.promise;
+      if (socket.readyState !== 1) throw new Error("signaling socket closed during delivery");
+      if (isCurrent && !isCurrent()) throw new Error("peer was superseded during delivery");
+    }
+    sendImmediately(data, _peerGeneration, isCurrent);
+  };
+
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  assert.equal(scheduler.runNext(), 8_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(original.offerCalls, 2);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  assert.equal(connections.length, 1);
+
+  delivery.resolve();
+  for (let index = 0; index < 6; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.offerCalls, 1);
+  client.close();
+});
+
+test("owner uses a fresh peer after both ICE restart attempts are exhausted", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  const cameraTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    prepareOwnerPeer: async (peer) => {
+      await peer.replaceTrack("screen", screenTrack);
+      await peer.replaceTrack("camera", cameraTrack);
+    },
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, true);
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  assert.equal(scheduler.runNext(), 8_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.runNext(), 8_000);
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.runNext(), 8_000);
+  assert.equal(original.offerCalls, 3);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  for (let index = 0; index < 5; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(connections.length, 2);
+  assert.equal(original.closed, true);
+  assert.deepEqual(connections[1]!.replaceCalls, [
+    { index: 0, track: screenTrack },
+    { index: 1, track: cameraTrack },
+  ]);
+  assert.equal(connections[1]!.offerCalls, 1);
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  client.close();
+});
+
+test("duplicate and reordered viewer reattachment events create one replacement offer", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const preparation = deferred<void>();
+  const terminalErrors: Error[] = [];
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, (error) => terminalErrors.push(error), {
+    isSharingActive: () => true,
+    prepareOwnerPeer: async () => preparation.promise,
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  const message = JSON.stringify({
+    type: "viewer_rejoined",
+    session_id: "00000000-0000-0000-0000-000000000002",
+    viewer_user_id: "viewer",
+  });
+  socket.onmessage?.({ data: message });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.onmessage?.({ data: message });
+  socket.onmessage?.({ data: message });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.offerCalls, 0);
+
+  preparation.resolve();
+  for (let index = 0; index < 5; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.offerCalls, 1);
+  assert.equal(
+    socket.sent.map((raw) => JSON.parse(raw) as { type: string })
+      .filter((message) => message.type === "offer").length,
+    1,
+    `${client.lifecycle}: ${terminalErrors[0]?.message ?? "no terminal error"}`,
+  );
+  socket.onmessage?.({ data: message });
+  for (let index = 0; index < 3; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(connections.length, 2);
+  assert.equal(socket.sent.map((raw) => JSON.parse(raw) as { type: string })
+    .filter((message) => message.type === "offer").length, 1);
+  client.close();
+});
+
+test("stale answers, candidates, and old peer state events cannot affect a replacement", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    prepareOwnerPeer: async (peer) => peer.replaceTrack("screen", screenTrack),
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  const oldStateChange = original.onconnectionstatechange;
+  const oldIceStateChange = original.oniceconnectionstatechange;
+  const oldNegotiationId = socket.sent.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .find((message) => message.type === "offer")!.negotiation_id as string;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const replacement = connections[1]!;
+  const replacementLifecycle = client.lifecycle;
+  const newOffer = socket.sent.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .filter((message) => message.type === "offer").at(-1)!;
+  assert.notEqual(newOffer.negotiation_id, oldNegotiationId);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: oldNegotiationId,
+      sdp: "stale-answer",
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "ice_candidate",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: oldNegotiationId,
+      candidate: { candidate: "candidate:stale" },
+    }),
+  });
+  original.connectionState = "failed";
+  oldStateChange?.();
+  oldIceStateChange?.();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(replacement.remote, undefined);
+  assert.equal(replacement.candidateCalls, 0);
+  assert.equal(replacement.closed, false);
+  assert.equal(client.lifecycle, replacementLifecycle);
+  client.close();
+});
+
+test("Stop Sharing during asynchronous replacement track attachment aborts recovery", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const preparation = deferred<void>();
+  let active = true;
+  let captureGeneration = 1;
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => active,
+    getSharingGeneration: () => captureGeneration,
+    prepareOwnerPeer: async () => preparation.promise,
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+
+  active = false;
+  captureGeneration += 1;
+  await client.stopSharingSession();
+  preparation.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.offerCalls, 0);
+  assert.equal(connections[1]!.closed, true);
+  client.close();
+});
+
+test("fresh-peer recovery preserves the original deadline and times out without a viewer answer", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  let active = true;
+  let factoryCalls = 0;
+  const endedReasons: string[] = [];
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => active,
+    prepareOwnerPeer: async () => {},
+    onOwnerSessionEnded: (reason) => {
+      endedReasons.push(reason);
+      active = false;
+    },
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(connections.length, 2);
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === INITIAL_NEGOTIATION_TIMEOUT_MS));
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  assert.equal(connections[1]!.closed, true);
+  client.close();
+});
+
+test("replacement peer failure preserves and honors the original recovery deadline", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const terminalErrors: Error[] = [];
+  const endedReasons: string[] = [];
+  let active = true;
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, (error) => terminalErrors.push(error), {
+    isSharingActive: () => active,
+    onOwnerSessionEnded: (reason) => {
+      endedReasons.push(reason);
+      active = false;
+    },
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  const recoveryTimer = [...scheduler.timers.entries()]
+    .find(([, timer]) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS)?.[0];
+  assert.notEqual(recoveryTimer, undefined);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+
+  connections[1]!.connectionState = "failed";
+  connections[1]!.onconnectionstatechange?.();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(connections[1]!.closed, true);
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.deepEqual(terminalErrors, []);
+  assert.deepEqual(endedReasons, []);
+  assert.equal(scheduler.timers.has(recoveryTimer!), true);
+
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  client.close();
+});
+
+test("replacement connected and failed before signaling authentication stays under the original recovery deadline", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const terminalErrors: Error[] = [];
+  const endedReasons: string[] = [];
+  let active = true;
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(
+    scheduler,
+    original,
+    (error) => terminalErrors.push(error),
+    {
+      isSharingActive: () => active,
+      onOwnerSessionEnded: (reason) => {
+        endedReasons.push(reason);
+        active = false;
+      },
+      peerFactory: () => {
+        if (factoryCalls++ === 0) return original;
+        const peer = new MockConnection();
+        connections.push(peer);
+        return peer;
+      },
+    },
+  );
+  await client.setSharingState(true, false);
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  const recoveryTimer = [...scheduler.timers.entries()]
+    .find(([, timer]) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS)?.[0];
+  assert.notEqual(recoveryTimer, undefined);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+
+  socket.disconnect();
+  connections[1]!.connectionState = "connected";
+  connections[1]!.onconnectionstatechange?.();
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(scheduler.timers.has(recoveryTimer!), true);
+  connections[1]!.connectionState = "failed";
+  connections[1]!.onconnectionstatechange?.();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(connections[1]!.closed, true);
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(scheduler.timers.has(recoveryTimer!), true);
+  assert.deepEqual(terminalErrors, []);
+  assert.deepEqual(endedReasons, []);
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  client.close();
+});
+
+test("replacement recovery completes after signaling authentication and re-arms viewer reattachment", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  let factoryCalls = 0;
+  const { client, socket: originalSocket, sockets } = await connectedDesktop(
+    scheduler,
+    original,
+    undefined,
+    {
+      isSharingActive: () => true,
+      peerFactory: () => {
+        if (factoryCalls++ === 0) return original;
+        const peer = new MockConnection();
+        connections.push(peer);
+        return peer;
+      },
+    },
+  );
+  await client.setSharingState(true, false);
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  const recoveryTimer = [...scheduler.timers.entries()]
+    .find(([, timer]) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS)?.[0];
+  assert.notEqual(recoveryTimer, undefined);
+  const rejoin = JSON.stringify({
+    type: "viewer_rejoined",
+    session_id: "00000000-0000-0000-0000-000000000002",
+    viewer_user_id: "viewer",
+  });
+  originalSocket.onmessage?.({ data: rejoin });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+
+  originalSocket.disconnect();
+  connections[1]!.connectionState = "connected";
+  connections[1]!.onconnectionstatechange?.();
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(scheduler.timers.has(recoveryTimer!), true);
+
+  assert.equal(scheduler.runNext(), 1_500);
+  for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  const authenticatedSocket = sockets[1]!;
+  authenticatedSocket.open();
+  authenticatedSocket.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.lifecycle, "CONNECTED");
+  assert.equal(scheduler.timers.has(recoveryTimer!), false);
+
+  authenticatedSocket.onmessage?.({ data: rejoin });
+  authenticatedSocket.onmessage?.({ data: rejoin });
+  assert.equal(connections.length, 3);
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 3);
+  assert.equal(connections[2]!.offerCalls, 1);
+  client.close();
+});
+
+test("peer error outside recovery remains terminal", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const terminalErrors: Error[] = [];
+  const { client } = await connectedDesktop(scheduler, connection, (error) => terminalErrors.push(error));
+
+  connection.onerror?.();
+
+  assert.equal(client.lifecycle, "FAILED");
+  assert.equal(terminalErrors.length, 1);
+  client.close();
+});
+
+test("queued viewer reattachment is invalidated across socket reconnection", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const delivery = deferred<void>();
+  let factoryCalls = 0;
+  const { client, socket: oldSocket, sockets } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  const sendImmediately = oldSocket.send.bind(oldSocket);
+  oldSocket.send = async (data, _peerGeneration, isCurrent) => {
+    const message = JSON.parse(data) as { type?: string };
+    if (message.type === "offer") {
+      await delivery.promise;
+      if (oldSocket.readyState !== 1) throw new Error("obsolete signaling socket");
+      if (isCurrent && !isCurrent()) throw new Error("peer was superseded");
+    }
+    sendImmediately(data, _peerGeneration, isCurrent);
+  };
+
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  assert.equal(scheduler.runNext(), 8_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  oldSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  assert.equal(connections.length, 1);
+  oldSocket.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  const newSocket = sockets[1]!;
+  newSocket.open();
+  newSocket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }) });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  oldSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  assert.equal(connections.length, 1);
+  const newRejoin = JSON.stringify({
+    type: "viewer_rejoined",
+    session_id: "00000000-0000-0000-0000-000000000002",
+    viewer_user_id: "viewer",
+  });
+  newSocket.onmessage?.({ data: newRejoin });
+  newSocket.onmessage?.({ data: newRejoin });
+  assert.equal(connections.length, 1);
+
+  delivery.resolve();
+  for (let index = 0; index < 8; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.offerCalls, 1);
+  assert.equal(newSocket.sent.map((raw) => JSON.parse(raw) as { type: string })
+    .filter((message) => message.type === "offer").length, 1);
+  client.close();
+});
+
+test("viewer reattachment after Stop Sharing and generic owner recovery do not replace the peer", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  let active = true;
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => active,
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "owner-reconnect",
+    }),
+  });
+  assert.equal(connections.length, 1);
+
+  active = false;
+  await client.stopSharingSession();
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 1);
+  assert.equal(original.closed, true);
   client.close();
 });
 
