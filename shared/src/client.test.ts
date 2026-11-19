@@ -1949,6 +1949,8 @@ test("desktop refreshes ICE servers and applies the new configuration before res
 test("desktop retires sharing at the recovery deadline without terminalizing signaling", async () => {
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();
+  const connections = [connection];
+  let factoryCalls = 0;
   const terminalErrors: Error[] = [];
   const diagnostics: DesktopDiagnostic[] = [];
   const endedReasons: string[] = [];
@@ -1959,6 +1961,13 @@ test("desktop retires sharing at the recovery deadline without terminalizing sig
     {
       onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
       onOwnerSessionEnded: (reason) => endedReasons.push(reason),
+      isSharingActive: () => true,
+      peerFactory: () => {
+        if (factoryCalls++ === 0) return connection;
+        const replacement = new MockConnection();
+        connections.push(replacement);
+        return replacement;
+      },
     },
   );
   await client.setSharingState(true, false);
@@ -1972,10 +1981,13 @@ test("desktop retires sharing at the recovery deadline without terminalizing sig
   assert.equal(peerConnection.offerCalls, 3);
   assert.equal(terminalErrors.length, 0);
   assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.offerCalls, 1);
   assert.equal(scheduler.runNext(), NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(client.lifecycle, "IDLE");
   assert.equal(peerConnection.closed, true);
+  assert.equal(connections[1]!.closed, true);
   assert.deepEqual(endedReasons, ["recovery_timeout"]);
   assert.ok(socket.sent.some((raw) => {
     const message = JSON.parse(raw) as Record<string, unknown>;
@@ -2107,11 +2119,7 @@ test("a new recovery event re-arms bounded ICE restart attempts without parallel
 
   assert.equal(scheduler.runNext(), 8_000);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(scheduler.runNext(), 8_000);
-  assert.equal(scheduler.runNext(), 0);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(scheduler.runNext(), 8_000);
-  assert.equal(peerConnection.offerCalls, 3);
+  assert.equal(peerConnection.offerCalls, 2);
 
   const newRecoveryEvent = {
     type: "session_recovery",
@@ -2120,6 +2128,7 @@ test("a new recovery event re-arms bounded ICE restart attempts without parallel
   };
   socket.onmessage?.({ data: JSON.stringify(newRecoveryEvent) });
   socket.onmessage?.({ data: JSON.stringify(newRecoveryEvent) });
+  await new Promise((resolve) => setImmediate(resolve));
   const receivedDiagnostic = diagnostics.find((diagnostic) =>
     diagnostic.event === "session_recovery_received" &&
     diagnostic.recoveryAttemptId === "recovery-attempt-new-cycle");
@@ -2129,6 +2138,57 @@ test("a new recovery event re-arms bounded ICE restart attempts without parallel
   assert.ok(receivedDiagnostic.peerGeneration !== undefined);
   assert.ok(receivedDiagnostic.negotiationId);
   assert.ok(receivedDiagnostic.socketConnectionGeneration !== undefined);
+  assert.equal(peerConnection.offerCalls, 2);
+  assert.equal(
+    diagnostics.filter((diagnostic) => diagnostic.event === "ice_restart_started").length,
+    1,
+  );
+
+  const firstRestartOffer = socket.sent
+    .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .filter((message) => message.type === "offer").at(-1)!;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: firstRestartOffer.negotiation_id,
+      sdp: "first-restart-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 3);
+  assert.equal(
+    diagnostics.filter((diagnostic) => diagnostic.event === "ice_restart_started").length,
+    2,
+  );
+  assert.ok(diagnostics.some((diagnostic) =>
+    diagnostic.event === "ice_restart_retry_scheduled" &&
+    diagnostic.reason === "new-recovery-event" &&
+    diagnostic.attempt === 1));
+
+  const queuedRecoveryEvent = {
+    type: "session_recovery",
+    session_id: "00000000-0000-0000-0000-000000000002",
+    recovery_attempt_id: "recovery-attempt-queued",
+  };
+  socket.onmessage?.({ data: JSON.stringify(queuedRecoveryEvent) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 3);
+  assert.equal(scheduler.timers.size, 2);
+  const secondRestartOffer = socket.sent
+    .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .filter((message) => message.type === "offer").at(-1)!;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: secondRestartOffer.negotiation_id,
+      sdp: "second-restart-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(scheduler.runNext(), 0);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(peerConnection.offerCalls, 4);
@@ -2136,33 +2196,6 @@ test("a new recovery event re-arms bounded ICE restart attempts without parallel
     diagnostics.filter((diagnostic) => diagnostic.event === "ice_restart_started").length,
     3,
   );
-  assert.ok(diagnostics.some((diagnostic) =>
-    diagnostic.event === "ice_restart_retry_scheduled" &&
-    diagnostic.reason === "new-recovery-event" &&
-    diagnostic.attempt === 1));
-
-  socket.onmessage?.({
-    data: JSON.stringify({
-      type: "session_recovery",
-      session_id: "00000000-0000-0000-0000-000000000002",
-      recovery_attempt_id: "recovery-attempt-queued",
-    }),
-  });
-  assert.equal(peerConnection.offerCalls, 4);
-  assert.equal(scheduler.timers.size, 2);
-  socket.onmessage?.({
-    data: JSON.stringify({
-      type: "answer",
-      session_id: "00000000-0000-0000-0000-000000000002",
-      negotiation_id: JSON.parse(socket.sent.filter((data) => JSON.parse(data).type === "offer").at(-1)!).negotiation_id,
-      sdp: "restart-answer",
-    }),
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(peerConnection.offerCalls, 4);
-  assert.equal(scheduler.runNext(), 0);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(peerConnection.offerCalls, 5);
   assert.equal([...scheduler.timers.values()].filter((timer) => timer.delay === 8_000).length, 1);
   client.close();
 });
@@ -2649,6 +2682,7 @@ test("owner reconnect retains approved tracks and restarts the same peer session
       recovery_attempt_id: "recovery-attempt-1",
     }),
   });
+  await new Promise((resolve) => setImmediate(resolve));
   assert.ok(diagnostics.some((diagnostic) =>
     diagnostic.event === "recovery" &&
     diagnostic.recoveryPhase === "session_recovery_received" &&
@@ -2902,15 +2936,17 @@ test("owner awaits delayed signaling delivery before replacing a peer", async ()
   client.close();
 });
 
-test("owner uses a fresh peer after both ICE restart attempts are exhausted", async () => {
+test("owner automatically uses a fresh peer after both ICE restart attempts are exhausted", async () => {
   const scheduler = new ManualScheduler();
   const original = new MockConnection();
   const connections = [original];
+  const diagnostics: DesktopDiagnostic[] = [];
   const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
   const cameraTrack: WebRtcTrack = { kind: "video", readyState: "live" };
   let factoryCalls = 0;
   const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
     isSharingActive: () => true,
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
     prepareOwnerPeer: async (peer) => {
       await peer.replaceTrack("screen", screenTrack);
       await peer.replaceTrack("camera", cameraTrack);
@@ -2932,14 +2968,6 @@ test("owner uses a fresh peer after both ICE restart attempts are exhausted", as
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(scheduler.runNext(), 8_000);
   assert.equal(original.offerCalls, 3);
-
-  socket.onmessage?.({
-    data: JSON.stringify({
-      type: "viewer_rejoined",
-      session_id: "00000000-0000-0000-0000-000000000002",
-      viewer_user_id: "viewer",
-    }),
-  });
   for (let index = 0; index < 5; index += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
@@ -2952,6 +2980,36 @@ test("owner uses a fresh peer after both ICE restart attempts are exhausted", as
   ]);
   assert.equal(connections[1]!.offerCalls, 1);
   assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.event === "fresh_peer_fallback_offer_sent"));
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.event === "fresh_peer_fallback_completed"));
+  const replacementOffer = socket.sent.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .filter((message) => message.type === "offer").at(-1)!;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: "stale-negotiation-id",
+      sdp: "stale-viewer-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.event === "fresh_peer_fallback_completed"));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: replacementOffer.negotiation_id,
+      sdp: "viewer-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.event === "fresh_peer_fallback_completed"));
+  connections[1]!.connectionState = "connected";
+  connections[1]!.onconnectionstatechange?.();
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.event === "fresh_peer_fallback_completed"));
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
   client.close();
 });
 
@@ -3122,8 +3180,10 @@ test("fresh-peer recovery preserves the original deadline and times out without 
   let active = true;
   let factoryCalls = 0;
   const endedReasons: string[] = [];
+  const diagnostics: DesktopDiagnostic[] = [];
   const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
     isSharingActive: () => active,
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
     prepareOwnerPeer: async () => {},
     onOwnerSessionEnded: (reason) => {
       endedReasons.push(reason);
@@ -3153,6 +3213,11 @@ test("fresh-peer recovery preserves the original deadline and times out without 
   assert.equal(connections.length, 2);
   assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
   assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === INITIAL_NEGOTIATION_TIMEOUT_MS));
+  connections[1]!.connectionState = "connected";
+  connections[1]!.onconnectionstatechange?.();
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.event === "fresh_peer_fallback_completed"));
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(endedReasons, ["recovery_timeout"]);
@@ -3207,9 +3272,80 @@ test("replacement peer failure preserves and honors the original recovery deadli
   assert.deepEqual(endedReasons, []);
   assert.equal(scheduler.timers.has(recoveryTimer!), true);
 
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+      reason: "temporary_disconnect",
+    }),
+  });
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(scheduler.timers.has(recoveryTimer!), true);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 3);
+  assert.equal(connections[2]!.offerCalls, 1);
+  assert.equal(scheduler.timers.has(recoveryTimer!), true);
+
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  client.close();
+});
+
+test("a new viewer session supersedes peerless recovery after replacement failure", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+    }),
+  });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+
+  connections[1]!.connectionState = "failed";
+  connections[1]!.onconnectionstatechange?.();
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      viewer_user_id: "another-viewer",
+    }),
+  });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(connections.length, 3);
+  assert.equal(connections[1]!.closed, true);
+  assert.equal(connections[2]!.offerCalls, 1);
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  assert.deepEqual(client.lifecycle, "NEGOTIATING");
   client.close();
 });
 
@@ -3323,11 +3459,25 @@ test("replacement recovery completes after signaling authentication and re-arms 
     data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
   });
   for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(scheduler.timers.has(recoveryTimer!), true);
+  const replacementOffer = originalSocket.sent.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .filter((message) => message.type === "offer").at(-1)!;
+  authenticatedSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: replacementOffer.negotiation_id,
+      sdp: "viewer-answer",
+    }),
+  });
+  for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
   assert.equal(client.lifecycle, "CONNECTED");
   assert.equal(scheduler.timers.has(recoveryTimer!), false);
 
   authenticatedSocket.onmessage?.({ data: rejoin });
   authenticatedSocket.onmessage?.({ data: rejoin });
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(connections.length, 3);
   for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
   assert.equal(connections.length, 3);

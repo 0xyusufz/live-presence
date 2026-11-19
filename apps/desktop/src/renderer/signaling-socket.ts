@@ -1,4 +1,5 @@
 import type { SignalingSocket } from "../../../../shared/src/client.js";
+import { parseServerMessage } from "../../../../shared/src/protocol.js";
 import type { LivePresenceBridge, SocketEvent } from "../ipc-contract.js";
 import { readSignalingConnectFailureCategory } from "../main/signaling-connect-handler.js";
 
@@ -13,6 +14,7 @@ type DiagnosticLogger = (level: "info" | "warn" | "error", entry: Record<string,
 
 let nextRendererAttemptId = 0;
 const rendererOwnerByBridge = new WeakMap<SignalingBridge, number>();
+const cancelPeerRegistrationWaitByBridge = new WeakMap<SignalingBridge, () => void>();
 
 function closeReasonCategory(code: number): string {
   if (code === 1008) return "policy_or_authentication";
@@ -50,9 +52,21 @@ export function createSignalingSocket(
   let connectPromise: Promise<number> | undefined;
   let activePeerGeneration: number | undefined;
   let activePeerRegistrationId: string | undefined;
+  let peerRegistrationRevision = 0;
+  let authenticatedConnectionGeneration: number | undefined;
+  let activeSessionId: string | undefined;
+  let sessionEventRevision = 0;
   let peerGenerationUpdates: Promise<void> = Promise.resolve();
   let unsubscribe: (() => void) | undefined;
   const pendingEvents: SocketEvent[] = [];
+  const readinessWaiters = new Set<{
+    revision: number;
+    sessionRevision: number;
+    sessionId: string;
+    generation: number;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }>();
 
   const log = (
     level: "info" | "warn" | "error",
@@ -85,6 +99,76 @@ export function createSignalingSocket(
     rendererAttemptId !== undefined &&
     rendererOwnerByBridge.get(bridge) === rendererAttemptId;
 
+  const rejectReadinessWaiters = (reason: string): void => {
+    for (const waiter of readinessWaiters) {
+      readinessWaiters.delete(waiter);
+      waiter.reject(new Error(reason));
+    }
+  };
+
+  const settleReadinessWaiters = (): void => {
+    for (const waiter of readinessWaiters) {
+      if (waiter.revision !== peerRegistrationRevision ||
+        waiter.generation !== connectionGeneration ||
+        !isCurrentRendererOwner() ||
+        localClosed ||
+        closeDelivered) {
+        readinessWaiters.delete(waiter);
+        waiter.reject(new Error("signaling peer registration was superseded"));
+      } else if (authenticatedConnectionGeneration === waiter.generation &&
+        activeSessionId === waiter.sessionId) {
+        readinessWaiters.delete(waiter);
+        log("info", "peer_registration_readiness_satisfied", {
+          socketConnectionGeneration: waiter.generation,
+          peerGeneration: activePeerGeneration ?? null,
+        });
+        waiter.resolve();
+      } else if (sessionEventRevision > waiter.sessionRevision) {
+        readinessWaiters.delete(waiter);
+        log("warn", "peer_registration_rejected_as_stale", {
+          socketConnectionGeneration: waiter.generation,
+          peerGeneration: activePeerGeneration ?? null,
+          reason: "server-observed session changed before registration",
+        });
+        waiter.reject(new Error("signaling peer registration session changed"));
+      }
+    }
+  };
+
+  const waitForPeerRegistrationReady = (
+    sessionId: string,
+    generation: number,
+    revision: number,
+  ): Promise<void> => {
+    if (revision !== peerRegistrationRevision ||
+      generation !== connectionGeneration ||
+      !isCurrentRendererOwner() ||
+      localClosed ||
+      closeDelivered) {
+      return Promise.reject(new Error("signaling peer registration was superseded"));
+    }
+    if (authenticatedConnectionGeneration === generation && activeSessionId === sessionId) {
+      return Promise.resolve();
+    }
+    log("info", "peer_registration_deferred", {
+      socketConnectionGeneration: generation,
+      peerGeneration: activePeerGeneration ?? null,
+      waitingForAuthentication: authenticatedConnectionGeneration !== generation,
+      waitingForSession: activeSessionId !== sessionId,
+    });
+    return new Promise<void>((resolve, reject) => {
+      readinessWaiters.add({
+        revision,
+        sessionRevision: sessionEventRevision,
+        sessionId,
+        generation,
+        resolve,
+        reject,
+      });
+      settleReadinessWaiters();
+    });
+  };
+
   log("info", "renderer_socket_adapter_created");
 
   const socket: SignalingSocket = {
@@ -105,7 +189,11 @@ export function createSignalingSocket(
       connectStarted = true;
       connectCorrelationId = crypto.randomUUID();
       rendererAttemptId = ++nextRendererAttemptId;
+      cancelPeerRegistrationWaitByBridge.get(bridge)?.();
       rendererOwnerByBridge.set(bridge, rendererAttemptId);
+      cancelPeerRegistrationWaitByBridge.set(bridge, () =>
+        rejectReadinessWaiters("signaling socket was superseded"),
+      );
       log("info", "renderer_connection_attempt_started");
       log("info", "renderer_signaling_connect_requested", {
         correlationId: connectCorrelationId,
@@ -116,7 +204,12 @@ export function createSignalingSocket(
           pendingEvents.push(event);
           return;
         }
-        if (event.connectionGeneration !== connectionGeneration) return;
+        if (event.connectionGeneration !== connectionGeneration) {
+          if (event.type === "open") {
+            rejectReadinessWaiters("signaling connection generation changed");
+          }
+          return;
+        }
 
         if (event.type === "authentication-started") {
           log("info", "owner_authentication_started", {
@@ -124,6 +217,7 @@ export function createSignalingSocket(
           });
         } else if (event.type === "open") {
           readyState = 1;
+          authenticatedConnectionGeneration = event.connectionGeneration;
           socket.authenticatedOnOpen =
             event.authenticatedTransportReuse === true && typeof event.deviceId === "string";
           socket.authenticatedDeviceId = socket.authenticatedOnOpen ? event.deviceId : undefined;
@@ -131,9 +225,38 @@ export function createSignalingSocket(
             socketConnectionGeneration: event.connectionGeneration,
             authenticatedTransportReuse: socket.authenticatedOnOpen,
           });
+          settleReadinessWaiters();
           endAttempt("open", event.connectionGeneration);
           socket.onopen?.();
         } else if (event.type === "message") {
+          let message: ReturnType<typeof parseServerMessage> | undefined;
+          try {
+            message = typeof event.data === "string"
+              ? parseServerMessage(JSON.parse(event.data))
+              : undefined;
+          } catch {
+            message = undefined;
+          }
+          if (message && (
+            message.type === "viewer_joined" ||
+            message.type === "viewer_rejoined" ||
+            message.type === "session_recovery" ||
+            message.type === "session_resumed"
+          )) {
+            activeSessionId = message.session_id;
+            sessionEventRevision += 1;
+            settleReadinessWaiters();
+          } else if (message?.type === "viewer_left" &&
+            message.session_id === activeSessionId &&
+            message.reason !== "temporary_disconnect") {
+            activeSessionId = undefined;
+            sessionEventRevision += 1;
+            settleReadinessWaiters();
+          } else if (message?.type === "sharing_state_updated" && !message.screen) {
+            activeSessionId = undefined;
+            sessionEventRevision += 1;
+            settleReadinessWaiters();
+          }
           if (isAuthenticationMessage(event.data)) {
             log("info", "renderer_authentication_received", {
               socketConnectionGeneration: event.connectionGeneration,
@@ -143,6 +266,10 @@ export function createSignalingSocket(
         } else if (event.type === "close") {
           closeDelivered = true;
           readyState = 3;
+          authenticatedConnectionGeneration = undefined;
+          activeSessionId = undefined;
+          sessionEventRevision += 1;
+          rejectReadinessWaiters("signaling socket closed before peer registration");
           log("warn", "renderer_socket_close_received", {
             socketConnectionGeneration: event.connectionGeneration,
             closeCode: event.code,
@@ -235,15 +362,20 @@ export function createSignalingSocket(
         return Promise.reject(new Error("signaling socket is no longer active"));
       }
       activePeerGeneration = peerGeneration;
+      const revision = ++peerRegistrationRevision;
+      settleReadinessWaiters();
       const previousRegistrationId = activePeerRegistrationId;
       activePeerRegistrationId = undefined;
-      const registration = peerGenerationUpdates.catch(() => undefined).then(async () => {
-        if (previousRegistrationId) {
-          if (!bridge.clearSignalingPeerGeneration) {
-            throw new Error("signaling peer cleanup is unavailable");
-          }
-          await bridge.clearSignalingPeerGeneration(previousRegistrationId);
+      let clearPrevious = Promise.resolve();
+      if (previousRegistrationId) {
+        if (!bridge.clearSignalingPeerGeneration) {
+          clearPrevious = Promise.reject(new Error("signaling peer cleanup is unavailable"));
+        } else {
+          clearPrevious = bridge.clearSignalingPeerGeneration(previousRegistrationId);
         }
+      }
+      const registration = (async () => {
+        await clearPrevious;
         if (sessionId === undefined) return;
         if (!bridge.registerSignalingPeerGeneration) {
           throw new Error("signaling peer registration is unavailable");
@@ -251,7 +383,12 @@ export function createSignalingSocket(
         const opening = connectPromise;
         if (!opening) throw new Error("signaling connection is not starting");
         const generation = await opening;
-        if (localClosed || !isCurrentRendererOwner() || activePeerGeneration !== peerGeneration) {
+        await waitForPeerRegistrationReady(sessionId, generation, revision);
+        if (localClosed || !isCurrentRendererOwner() ||
+          activePeerGeneration !== peerGeneration ||
+          peerRegistrationRevision !== revision ||
+          authenticatedConnectionGeneration !== generation ||
+          activeSessionId !== sessionId) {
           throw new Error("signaling peer generation was superseded");
         }
         const registrationId = await bridge.registerSignalingPeerGeneration(sessionId, generation);
@@ -262,8 +399,17 @@ export function createSignalingSocket(
           await bridge.clearSignalingPeerGeneration(registrationId);
           throw new Error("signaling peer generation was superseded");
         }
+        if (peerRegistrationRevision !== revision ||
+          authenticatedConnectionGeneration !== generation ||
+          activeSessionId !== sessionId) {
+          if (!bridge.clearSignalingPeerGeneration) {
+            throw new Error("signaling peer cleanup is unavailable");
+          }
+          await bridge.clearSignalingPeerGeneration(registrationId);
+          throw new Error("signaling peer generation was superseded");
+        }
         activePeerRegistrationId = registrationId;
-      });
+      })();
       peerGenerationUpdates = registration;
       void registration.catch(() => undefined);
       return registration;
@@ -307,6 +453,8 @@ export function createSignalingSocket(
     close: () => {
       if (localClosed) return;
       localClosed = true;
+      peerRegistrationRevision += 1;
+      rejectReadinessWaiters("signaling socket closed before peer registration");
       log("info", "renderer_close_requested", {
         socketConnectionGeneration: connectionGeneration ?? null,
         connectPending: connectStarted && connectionGeneration === undefined,
@@ -331,6 +479,10 @@ export function createSignalingSocket(
     if (closeDelivered) return;
     closeDelivered = true;
     readyState = 3;
+    authenticatedConnectionGeneration = undefined;
+    activeSessionId = undefined;
+    peerRegistrationRevision += 1;
+    rejectReadinessWaiters("signaling socket closed before peer registration");
     endAttempt(outcome);
     pendingEvents.length = 0;
     unsubscribe?.();

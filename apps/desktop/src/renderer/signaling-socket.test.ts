@@ -608,15 +608,243 @@ test("renderer signaling forwards only the main-issued peer registration through
   const socket = createSignalingSocket(bridge);
   socket.connect?.();
   await new Promise((resolve) => setImmediate(resolve));
-  listeners[0]?.({ type: "open", connectionGeneration: 49 });
+  const registration = socket.setPeerGeneration?.(12, "00000000-0000-0000-0000-000000000101");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(registrations, []);
 
-  await socket.setPeerGeneration?.(12, "session-current");
+  listeners[0]?.({ type: "open", connectionGeneration: 49 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(registrations, []);
+
+  listeners[0]?.({
+    type: "message",
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000101",
+      recovery_attempt_id: "recovery-current",
+    }),
+    connectionGeneration: 49,
+  });
+
+  await registration;
   await socket.send("current-offer", 12, () => true);
 
-  assert.deepEqual(registrations, [["session-current", 49]]);
+  assert.deepEqual(registrations, [["00000000-0000-0000-0000-000000000101", 49]]);
   assert.deepEqual(sends, [["current-offer", 49, "main-registration-1"]]);
   assert.deepEqual(clearings, []);
   socket.close();
+});
+
+test("peer registration waits for authentication and matching server session restoration", async () => {
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const registrations: Array<[string, number]> = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > & Partial<Pick<LivePresenceBridge, "registerSignalingPeerGeneration">> = {
+    connectSignaling: async () => 50,
+    registerSignalingPeerGeneration: async (sessionId, connectionGeneration) => {
+      registrations.push([sessionId, connectionGeneration]);
+      return "registration-ready";
+    },
+    sendSignaling: async () => {},
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {};
+    },
+  };
+  const socket = createSignalingSocket(bridge);
+  socket.connect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  const registration = socket.setPeerGeneration?.(18, "00000000-0000-0000-0000-000000000102");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(registrations, []);
+
+  listeners[0]?.({ type: "open", connectionGeneration: 50 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(registrations, []);
+
+  listeners[0]?.({
+    type: "message",
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: "00000000-0000-0000-0000-000000000102",
+      viewer_user_id: "viewer",
+    }),
+    connectionGeneration: 50,
+  });
+  await registration;
+  assert.deepEqual(registrations, [["00000000-0000-0000-0000-000000000102", 50]]);
+  socket.close();
+});
+
+test("old peer registration is cleared immediately while the replacement waits for session restoration", async () => {
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const registrations: string[] = [];
+  const clearings: string[] = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > & Partial<Pick<
+    LivePresenceBridge,
+    "registerSignalingPeerGeneration" | "clearSignalingPeerGeneration"
+  >> = {
+    connectSignaling: async () => 51,
+    registerSignalingPeerGeneration: async (sessionId) => {
+      registrations.push(sessionId);
+      return `registration-${registrations.length}`;
+    },
+    clearSignalingPeerGeneration: async (registrationId) => { clearings.push(registrationId); },
+    sendSignaling: async () => {},
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {};
+    },
+  };
+  const socket = createSignalingSocket(bridge);
+  socket.connect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[0]?.({ type: "open", connectionGeneration: 51 });
+  listeners[0]?.({
+    type: "message",
+    data: JSON.stringify({ type: "session_recovery", session_id: "00000000-0000-0000-0000-000000000103" }),
+    connectionGeneration: 51,
+  });
+  await socket.setPeerGeneration?.(1, "00000000-0000-0000-0000-000000000103");
+
+  const replacement = socket.setPeerGeneration?.(2, "00000000-0000-0000-0000-000000000104");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(clearings, ["registration-1"]);
+  assert.deepEqual(registrations, ["00000000-0000-0000-0000-000000000103"]);
+
+  listeners[0]?.({
+    type: "message",
+    data: JSON.stringify({ type: "session_recovery", session_id: "00000000-0000-0000-0000-000000000104" }),
+    connectionGeneration: 51,
+  });
+  await replacement;
+  assert.deepEqual(registrations, [
+    "00000000-0000-0000-0000-000000000103",
+    "00000000-0000-0000-0000-000000000104",
+  ]);
+  socket.close();
+});
+
+test("peer registration is rejected when the server-observed session changes while it waits", async () => {
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const registrations: string[] = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > & Partial<Pick<LivePresenceBridge, "registerSignalingPeerGeneration">> = {
+    connectSignaling: async () => 52,
+    registerSignalingPeerGeneration: async (sessionId) => {
+      registrations.push(sessionId);
+      return "registration";
+    },
+    sendSignaling: async () => {},
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {};
+    },
+  };
+  const socket = createSignalingSocket(bridge);
+  socket.connect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[0]?.({ type: "open", connectionGeneration: 52 });
+  const registration = socket.setPeerGeneration?.(3, "00000000-0000-0000-0000-000000000105");
+  assert.ok(registration);
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[0]?.({
+    type: "message",
+    data: JSON.stringify({ type: "session_recovery", session_id: "00000000-0000-0000-0000-000000000106" }),
+    connectionGeneration: 52,
+  });
+  await assert.rejects(registration, /session changed/);
+  assert.deepEqual(registrations, []);
+  socket.close();
+});
+
+test("peer registration is rejected when its socket generation changes while waiting", async () => {
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const registrations: string[] = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > & Partial<Pick<LivePresenceBridge, "registerSignalingPeerGeneration">> = {
+    connectSignaling: async () => 53,
+    registerSignalingPeerGeneration: async (sessionId) => {
+      registrations.push(sessionId);
+      return "registration";
+    },
+    sendSignaling: async () => {},
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {};
+    },
+  };
+  const socket = createSignalingSocket(bridge);
+  socket.connect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[0]?.({ type: "open", connectionGeneration: 53 });
+  const registration = socket.setPeerGeneration?.(4, "00000000-0000-0000-0000-000000000101");
+  assert.ok(registration);
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[0]?.({ type: "open", connectionGeneration: 54 });
+  await assert.rejects(registration, /connection generation changed|superseded/);
+  assert.deepEqual(registrations, []);
+  socket.close();
+});
+
+test("a superseded renderer socket cannot overwrite the current peer registration", async () => {
+  const listeners: Array<(event: SocketEvent) => void> = [];
+  const registrations: Array<[string, number]> = [];
+  const bridge: Pick<
+    LivePresenceBridge,
+    "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+  > & Partial<Pick<LivePresenceBridge, "registerSignalingPeerGeneration">> = {
+    connectSignaling: async () => 55,
+    registerSignalingPeerGeneration: async (sessionId, connectionGeneration) => {
+      registrations.push([sessionId, connectionGeneration]);
+      return `registration-${registrations.length}`;
+    },
+    sendSignaling: async () => {},
+    closeSignaling: () => {},
+    onSocketEvent: (callback) => {
+      listeners.push(callback);
+      return () => {};
+    },
+  };
+  const oldSocket = createSignalingSocket(bridge);
+  oldSocket.connect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  const oldRegistration = oldSocket.setPeerGeneration?.(7, "00000000-0000-0000-0000-000000000101");
+  assert.ok(oldRegistration);
+
+  const currentSocket = createSignalingSocket(bridge);
+  currentSocket.connect?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  listeners[1]?.({ type: "open", connectionGeneration: 55 });
+  listeners[1]?.({
+    type: "message",
+    data: JSON.stringify({ type: "session_recovery", session_id: "00000000-0000-0000-0000-000000000101" }),
+    connectionGeneration: 55,
+  });
+  await currentSocket.setPeerGeneration?.(8, "00000000-0000-0000-0000-000000000101");
+  await assert.rejects(oldRegistration, /superseded/);
+  listeners[0]?.({
+    type: "message",
+    data: JSON.stringify({ type: "session_recovery", session_id: "00000000-0000-0000-0000-000000000101" }),
+    connectionGeneration: 55,
+  });
+
+  assert.deepEqual(registrations, [["00000000-0000-0000-0000-000000000101", 55]]);
+  currentSocket.close();
+  oldSocket.close();
 });
 
 test("connect rejection diagnostics preserve the safe IPC category and correlation ID", async () => {
