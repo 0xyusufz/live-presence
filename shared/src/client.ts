@@ -644,6 +644,15 @@ export abstract class WebRtcClient {
             reason: "candidate could not be applied",
           });
         }
+        if (this.shouldPreserveRecoveryAfterNegotiationFailure(message)) {
+          this.onRecoveryDiagnostic(
+            "replacement_negotiation_failed",
+            this.recoveryAttemptId,
+            message.session_id,
+          );
+          this.setLifecycle("RECONNECTING");
+          return;
+        }
         throw error;
       }
       if (this.peer !== peer || this.peerGeneration !== peerGeneration) return;
@@ -912,6 +921,12 @@ export abstract class WebRtcClient {
 
   protected hasRecoveryAnswerApplied(): boolean {
     return true;
+  }
+
+  protected shouldPreserveRecoveryAfterNegotiationFailure(
+    _message: Extract<ServerMessage, { type: "offer" | "answer" | "ice_candidate" }>,
+  ): boolean {
+    return false;
   }
 
   protected onRecoveryDiagnostic(
@@ -2522,15 +2537,24 @@ export class ViewerWebRtcClient extends WebRtcClient {
   ): boolean {
     if (this.retiredNegotiationIds.has(message.negotiation_id) || !this.sessionId) return false;
     const previousNegotiationId = this.peer?.negotiationId;
+    const preserveRecovery = this.hasRecoveryDeadline() &&
+      this.recoverySessionId === message.session_id;
     const queuedCandidates = this.pendingIceCandidatesByNegotiation.get(message.negotiation_id);
     if (previousNegotiationId) this.retireNegotiation(previousNegotiationId);
-    this.closePeer();
+    const replacement = this.createPeer(
+      "viewer",
+      message.session_id,
+      this.iceConfiguration,
+      preserveRecovery ? null : INITIAL_NEGOTIATION_TIMEOUT_MS,
+      message.negotiation_id,
+      preserveRecovery,
+    );
     if (queuedCandidates) {
       this.pendingIceCandidatesByNegotiation.set(message.negotiation_id, queuedCandidates);
     }
     this.peerEverConnected = false;
-    this.setLifecycle("NEGOTIATING");
-    this.createPeer("viewer", message.session_id, this.iceConfiguration);
+    this.setLifecycle(preserveRecovery ? "RECONNECTING" : "NEGOTIATING");
+    if (replacement.state === "connected") this.onPeerState("connected");
     return true;
   }
 
@@ -2709,8 +2733,19 @@ export class ViewerWebRtcClient extends WebRtcClient {
     this.setLifecycle("RECONNECTING");
   }
 
-  protected override onRecoveryTimeout(_error: Error): void {
-    this.retireTimedOutSession();
+  protected override onRecoveryTimeout(error: Error): void {
+    this.retireCurrentSession();
+    this.clearOwnerRecoveryWait();
+    this.sessionRequestPending = false;
+    this.peerEverConnected = false;
+    this.reconnecting = false;
+    this.recoveryAttemptId = undefined;
+    this.sharingActive = false;
+    this.onDeviceAvailability?.(false);
+    this.onSharingState?.({ screen: false, camera: false });
+    this.onViewerSessionEnded?.("recovery_timeout");
+    this.fail(error, "timeout");
+    this.socket?.close();
   }
 
   protected override onServerMessage(message: ServerMessage): boolean {
@@ -2724,8 +2759,12 @@ export class ViewerWebRtcClient extends WebRtcClient {
             this.clientScheduler.clearTimeout(this.ownerRecoveryTimer);
             this.ownerRecoveryTimer = undefined;
           }
-          this.startInitialNegotiationTimeout(this.peer);
-          this.setLifecycle("NEGOTIATING");
+          if (!this.hasRecoveryDeadline()) {
+            this.startInitialNegotiationTimeout(this.peer);
+            this.setLifecycle("NEGOTIATING");
+          } else {
+            this.setLifecycle("RECONNECTING");
+          }
         }
         if (message.recovery_attempt_id) this.recoveryAttemptId = message.recovery_attempt_id;
         this.onRecoveryDiagnostic(
@@ -2736,7 +2775,11 @@ export class ViewerWebRtcClient extends WebRtcClient {
         this.reconnecting = false;
         if (this.peer.state === "connected") {
           this.completeRecovery();
-          this.setLifecycle("CONNECTED");
+          this.setLifecycle(
+            this.hasRecoveryDeadline() || !this.signalingAuthenticated
+              ? "RECONNECTING"
+              : "CONNECTED",
+          );
         } else if (!awaitingOwner) {
           this.beginRecovery();
         }
@@ -2808,7 +2851,12 @@ export class ViewerWebRtcClient extends WebRtcClient {
   }
 
   protected override shouldPreservePeerOnSocketClose(): boolean {
-    return Boolean(this.peer && this.sessionId && this.peerEverConnected);
+    return Boolean(
+      this.peer &&
+      this.sessionId &&
+      (this.peerEverConnected ||
+        (this.hasRecoveryDeadline() && this.recoverySessionId === this.sessionId)),
+    );
   }
 
   protected override onPeerState(state: PeerState): void {
@@ -2819,7 +2867,9 @@ export class ViewerWebRtcClient extends WebRtcClient {
           this.clientScheduler.clearTimeout(this.ownerRecoveryTimer);
           this.ownerRecoveryTimer = undefined;
         }
-        super.onPeerState(state);
+        this.completeRecovery();
+        if (this.hasRecoveryDeadline()) this.setLifecycle("RECONNECTING");
+        else super.onPeerState(state);
       } else {
         this.setLifecycle("RECONNECTING");
       }
@@ -2828,7 +2878,16 @@ export class ViewerWebRtcClient extends WebRtcClient {
     if (state === "connected") {
       this.peerEverConnected = true;
       this.completeRecovery();
-      super.onPeerState(state);
+      if (this.hasRecoveryDeadline()) this.setLifecycle("RECONNECTING");
+      else super.onPeerState(state);
+      return;
+    }
+    if (
+      this.hasRecoveryDeadline() &&
+      this.recoverySessionId === this.sessionId &&
+      (state === "disconnected" || state === "failed")
+    ) {
+      this.setLifecycle("RECONNECTING");
       return;
     }
     if ((state === "disconnected" || state === "failed") && this.peerEverConnected) {
@@ -2886,6 +2945,25 @@ export class ViewerWebRtcClient extends WebRtcClient {
   protected override onFailure(error: Error): void {
     this.clearOwnerRecoveryWait();
     this.onTerminalError?.(error);
+  }
+
+  protected override onPeerFailure(error: Error): void {
+    if (this.hasRecoveryDeadline() && this.recoverySessionId === this.sessionId) {
+      this.onRecoveryDiagnostic(
+        "replacement_peer_failed",
+        this.recoveryAttemptId,
+        this.sessionId,
+      );
+      this.setLifecycle("RECONNECTING");
+      return;
+    }
+    super.onPeerFailure(error);
+  }
+
+  protected override shouldPreserveRecoveryAfterNegotiationFailure(
+    message: Extract<ServerMessage, { type: "offer" | "answer" | "ice_candidate" }>,
+  ): boolean {
+    return this.hasRecoveryDeadline() && this.recoverySessionId === message.session_id;
   }
 
   private clearOwnerRecoveryWait(): void {
