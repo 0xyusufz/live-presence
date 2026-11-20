@@ -114,6 +114,7 @@ export async function buildApp(
     presenceService,
     authorization,
     webOrigin,
+    database.db,
     networkRecoveryGraceMs,
   );
   await registerTurnRoutes(app, auth, deviceService, turn);

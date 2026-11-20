@@ -5,7 +5,13 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { test } from "node:test";
 import { createDatabase } from "../db/index.js";
-import { users } from "../db/schema.js";
+import {
+  devices,
+  presenceAuthorizationBindings,
+  presenceRevocationOutbox,
+  presenceRevocationTombstones,
+  users,
+} from "../db/schema.js";
 import { ViewerAuthorizationService } from "../authorization/service.js";
 import { resolveDatabasePath, SERVER_ROOT } from "../config.js";
 import { AccessCommandError, executeAccessCommand } from "./access.js";
@@ -109,6 +115,74 @@ test("repeated grant fails safely and repeated revoke is idempotent", () => {
       () => executeAccessCommand("revoke", grantArgs, testFixture.databasePath),
     );
     assert.equal(canAccess(testFixture.databasePath), false);
+  } finally {
+    testFixture.close();
+  }
+});
+
+test("CLI revocation persists a device-scoped outbox operation for server retry", () => {
+  const testFixture = fixture();
+  try {
+    const database = createDatabase(testFixture.databasePath);
+    database.db.insert(devices).values({
+      id: "owner-device",
+      userId: "owner-id",
+      name: "Desktop",
+      platform: "macOS",
+      revokedAt: null,
+      lastSeenAt: null,
+    }).run();
+    const authorization = new ViewerAuthorizationService(database.db);
+    authorization.grant("owner-id", "viewer-id");
+    database.db.insert(presenceAuthorizationBindings).values({
+      ownerUserId: "owner-id",
+      deviceId: "owner-device",
+      viewerUserId: "viewer-id",
+      sessionId: "session-cli-revocation",
+    }).run();
+    database.close();
+
+    executeAccessCommand("revoke", grantArgs, testFixture.databasePath);
+
+    const reopened = createDatabase(testFixture.databasePath);
+    try {
+      assert.equal(
+        reopened.db.select().from(presenceAuthorizationBindings).all().length,
+        0,
+      );
+      assert.deepEqual(
+        reopened.db.select().from(presenceRevocationTombstones).all().map((entry) => ({
+          sessionId: entry.sessionId,
+          ownerUserId: entry.ownerUserId,
+          deviceId: entry.deviceId,
+          viewerUserId: entry.viewerUserId,
+        })),
+        [{
+          sessionId: "session-cli-revocation",
+          ownerUserId: "owner-id",
+          deviceId: "owner-device",
+          viewerUserId: "viewer-id",
+        }],
+      );
+      assert.deepEqual(
+        reopened.db.select().from(presenceRevocationOutbox).all().map((entry) => ({
+          sessionId: entry.sessionId,
+          ownerUserId: entry.ownerUserId,
+          deviceId: entry.deviceId,
+          viewerUserId: entry.viewerUserId,
+          processedAt: entry.processedAt,
+        })),
+        [{
+          sessionId: "session-cli-revocation",
+          ownerUserId: "owner-id",
+          deviceId: "owner-device",
+          viewerUserId: "viewer-id",
+          processedAt: null,
+        }],
+      );
+    } finally {
+      reopened.close();
+    }
   } finally {
     testFixture.close();
   }

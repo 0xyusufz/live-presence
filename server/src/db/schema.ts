@@ -104,3 +104,68 @@ export const deviceCredentials = sqliteTable(
     familyIndex: index("device_credentials_family_idx").on(table.familyId),
   }),
 );
+
+export const presenceAuthorizationBindings = sqliteTable(
+  "presence_authorization_bindings",
+  {
+    ownerUserId: text("owner_user_id")
+      .notNull()
+      .references(() => users.id),
+    deviceId: text("device_id")
+      .notNull()
+      .references(() => devices.id),
+    viewerUserId: text("viewer_user_id")
+      .notNull()
+      .references(() => users.id),
+    sessionId: text("session_id").notNull(),
+  },
+  (table) => ({
+    ownerDeviceViewerUnique: uniqueIndex("presence_authorization_bindings_owner_device_viewer_idx")
+      .on(table.ownerUserId, table.deviceId, table.viewerUserId),
+    sessionIndex: index("presence_authorization_bindings_session_idx").on(table.sessionId),
+  }),
+);
+
+export const presenceRevocationTombstones = sqliteTable(
+  "presence_revocation_tombstones",
+  {
+    sessionId: text("session_id").primaryKey(),
+    ownerUserId: text("owner_user_id")
+      .notNull()
+      .references(() => users.id),
+    deviceId: text("device_id")
+      .notNull()
+      .references(() => devices.id),
+    viewerUserId: text("viewer_user_id")
+      .notNull()
+      .references(() => users.id),
+    createdAt: integer("created_at", { mode: "number" }).notNull(),
+  },
+  (table) => ({
+    ownerDeviceIndex: index("presence_revocation_tombstones_owner_device_idx")
+      .on(table.ownerUserId, table.deviceId),
+  }),
+);
+
+export const presenceRevocationOutbox = sqliteTable(
+  "presence_revocation_outbox",
+  {
+    sessionId: text("session_id")
+      .primaryKey()
+      .references(() => presenceRevocationTombstones.sessionId, { onDelete: "cascade" }),
+    ownerUserId: text("owner_user_id")
+      .notNull()
+      .references(() => users.id),
+    deviceId: text("device_id")
+      .notNull()
+      .references(() => devices.id),
+    viewerUserId: text("viewer_user_id")
+      .notNull()
+      .references(() => users.id),
+    createdAt: integer("created_at", { mode: "number" }).notNull(),
+    processedAt: integer("processed_at", { mode: "number" }),
+  },
+  (table) => ({
+    pendingIndex: index("presence_revocation_outbox_pending_idx").on(table.processedAt),
+  }),
+);

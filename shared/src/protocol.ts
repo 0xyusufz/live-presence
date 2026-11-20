@@ -7,7 +7,9 @@ export type ClientMessage =
   | { type: "auth"; token: string }
   | { type: "heartbeat" }
   | { type: "sharing_state"; screen: boolean; camera: boolean }
-  | { type: "create_session"; device_id: string; active_session_id?: string }
+  | { type: "create_session"; device_id: string; active_session_id?: string; request_id?: string }
+  | { type: "retire_session"; session_id: string }
+  | { type: "retire_session_ack"; session_id: string; outcome: "retired" | "authorization_revoked" }
   | { type: "leave_session"; session_id: string }
   | { type: "prepare_sleep"; session_id: string; request_id: string }
   | { type: "resume_session"; session_id: string; epoch: number; capability: string; request_id: string }
@@ -21,13 +23,14 @@ export type ClientMessage =
 export type ServerMessage =
   | { type: "authenticated"; role: SessionRole; device_id?: string }
   | { type: "heartbeat_ack" }
+  | { type: "session_retired"; session_id: string; outcome: "retired" | "not_found" | "authorization_revoked" }
   | { type: "sharing_state_updated"; device_id: string; screen: boolean; camera: boolean; session_id?: string }
   | { type: "device_sharing_state"; device_id: string; screen: boolean; camera: boolean }
   | { type: "sleep_marked"; session_id: string; epoch: number; capability: string; expires_at: number; request_id: string }
   | { type: "resume_pending"; session_id: string; epoch: number; capability: string; expires_at: number; request_id: string }
   | { type: "session_resumed"; session_id: string; epoch: number }
   | { type: "session_recovery"; session_id: string; recovery_attempt_id?: string }
-  | { type: "session_created"; session_id: string; device_id: string }
+  | { type: "session_created"; session_id: string; device_id: string; request_id?: string }
   | {
     type: "session_attached";
     session_id: string;
@@ -35,6 +38,7 @@ export type ServerMessage =
     screen: boolean;
     camera: boolean;
     owner_recovery_remaining_ms?: number;
+    request_id?: string;
   }
   | { type: "viewer_joined"; session_id: string; viewer_user_id: string }
   | { type: "viewer_rejoined"; session_id: string; viewer_user_id: string }
@@ -97,20 +101,37 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     case "create_session":
       return exactKeys(
         item,
-        item.active_session_id === undefined
-          ? ["type", "device_id"]
-          : ["type", "device_id", "active_session_id"],
+        [
+          "type",
+          "device_id",
+          ...(item.active_session_id === undefined ? [] : ["active_session_id"]),
+          ...(item.request_id === undefined ? [] : ["request_id"]),
+        ],
       ) &&
         string(item.device_id, 128) && DEVICE_ID.test(item.device_id) &&
-        (item.active_session_id === undefined || validSession(item.active_session_id))
+        (item.active_session_id === undefined || validSession(item.active_session_id)) &&
+        (item.request_id === undefined || (string(item.request_id, 128) && ID.test(item.request_id)))
         ? {
           type: "create_session",
           device_id: item.device_id,
           ...(item.active_session_id === undefined ? {} : { active_session_id: item.active_session_id }),
+          ...(item.request_id === undefined ? {} : { request_id: item.request_id }),
         }
         : null;
-    case "leave_session": return validSession(item.session_id)
-      ? { type: "leave_session", session_id: item.session_id } : null;
+    case "retire_session":
+      return exactKeys(item, ["type", "session_id"]) && validSession(item.session_id)
+        ? { type: "retire_session", session_id: item.session_id }
+        : null;
+    case "retire_session_ack":
+      return exactKeys(item, ["type", "session_id", "outcome"]) &&
+        validSession(item.session_id) &&
+        (item.outcome === "retired" || item.outcome === "authorization_revoked")
+        ? { type: "retire_session_ack", session_id: item.session_id, outcome: item.outcome }
+        : null;
+    case "leave_session":
+      return exactKeys(item, ["type", "session_id"]) && validSession(item.session_id)
+        ? { type: item.type, session_id: item.session_id }
+        : null;
     case "prepare_sleep":
       return exactKeys(item, ["type", "session_id", "request_id"]) &&
         validSession(item.session_id) && string(item.request_id, 128) && ID.test(item.request_id)
@@ -166,6 +187,12 @@ export function parseServerMessage(value: unknown): ServerMessage | null {
     switch (item.type) {
       case "heartbeat_ack":
         return exactKeys(item, ["type"]) ? { type: "heartbeat_ack" } : null;
+      case "session_retired":
+        return exactKeys(item, ["type", "session_id", "outcome"]) &&
+          validSession(session) &&
+          (item.outcome === "retired" || item.outcome === "not_found" || item.outcome === "authorization_revoked")
+          ? { type: "session_retired", session_id: session, outcome: item.outcome }
+          : null;
       case "authenticated":
         return exactKeys(item, item.device_id === undefined ? ["type", "role"] : ["type", "role", "device_id"]) &&
           (item.role === "owner" || item.role === "viewer") &&
@@ -223,18 +250,36 @@ export function parseServerMessage(value: unknown): ServerMessage | null {
           }
           : null;
       case "session_created":
-        return exactKeys(item, ["type", "session_id", "device_id"]) &&
-          validSession(session) && string(item.device_id, 128) && DEVICE_ID.test(item.device_id)
-          ? { type: "session_created", session_id: session, device_id: item.device_id } : null;
+        return exactKeys(
+          item,
+          item.request_id === undefined
+            ? ["type", "session_id", "device_id"]
+            : ["type", "session_id", "device_id", "request_id"],
+        ) &&
+          validSession(session) && string(item.device_id, 128) && DEVICE_ID.test(item.device_id) &&
+          (item.request_id === undefined || (string(item.request_id, 128) && ID.test(item.request_id)))
+          ? {
+            type: "session_created",
+            session_id: session,
+            device_id: item.device_id,
+            ...(item.request_id === undefined ? {} : { request_id: item.request_id }),
+          } : null;
       case "session_attached":
         return exactKeys(
           item,
-          item.owner_recovery_remaining_ms === undefined
-            ? ["type", "session_id", "device_id", "screen", "camera"]
-            : ["type", "session_id", "device_id", "screen", "camera", "owner_recovery_remaining_ms"],
+          [
+            "type",
+            "session_id",
+            "device_id",
+            "screen",
+            "camera",
+            ...(item.owner_recovery_remaining_ms === undefined ? [] : ["owner_recovery_remaining_ms"]),
+            ...(item.request_id === undefined ? [] : ["request_id"]),
+          ],
         ) &&
           validSession(session) && string(item.device_id, 128) && DEVICE_ID.test(item.device_id) &&
           typeof item.screen === "boolean" && typeof item.camera === "boolean" &&
+          (item.request_id === undefined || (string(item.request_id, 128) && ID.test(item.request_id))) &&
           (item.owner_recovery_remaining_ms === undefined ||
             (Number.isSafeInteger(item.owner_recovery_remaining_ms) && (item.owner_recovery_remaining_ms as number) > 0)) &&
           (!item.camera || item.screen)
@@ -247,6 +292,7 @@ export function parseServerMessage(value: unknown): ServerMessage | null {
             ...(item.owner_recovery_remaining_ms === undefined
               ? {}
               : { owner_recovery_remaining_ms: item.owner_recovery_remaining_ms as number }),
+            ...(item.request_id === undefined ? {} : { request_id: item.request_id }),
           }
           : null;
       case "viewer_joined":

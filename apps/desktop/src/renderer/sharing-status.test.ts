@@ -1,17 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  attachApprovedTracks,
   acquireLiveScreenTrack,
   confirmLiveScreenCapture,
   inspectScreenVideoTracks,
+  removeApprovedCameraTrack,
+  replaceApprovedCameraTrack,
   sharingStatus,
+  setApprovedCameraTrack,
   stopCapturedTracks,
 } from "./sharing-status.js";
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((complete) => { resolve = complete; });
+  return { promise, resolve };
+}
+
 test("desktop sharing status never reports idle while capture is live", () => {
-  assert.equal(sharingStatus("live", "IDLE", false), "Sharing / connecting");
-  assert.equal(sharingStatus("live", "NEGOTIATING", false), "Sharing / connecting");
-  assert.equal(sharingStatus("live", "CONNECTED", false), "Connected");
+  assert.equal(sharingStatus("live", "IDLE", false), "Sharing locally — Viewer disconnected");
+  assert.equal(sharingStatus("live", "CONNECTING", false), "Sharing locally — Connecting");
+  assert.equal(sharingStatus("live", "NEGOTIATING", false), "Sharing locally — Negotiating");
+  assert.equal(sharingStatus("live", "CONNECTED", false), "Sharing — Connected");
+  assert.equal(sharingStatus("live", "RECONNECTING", false), "Sharing locally — Reconnecting");
   assert.equal(sharingStatus("live", "FAILED", true), "Failed");
 });
 
@@ -92,4 +104,161 @@ test("screen video-track inspection exceptions remain available to the validatio
   assert.throws(() => inspectScreenVideoTracks({
     getVideoTracks: () => [track],
   } as unknown as MediaStream), stateError);
+});
+
+test("camera removal during peer attachment reconciles the final camera track without stopping screen", async () => {
+  const cameraA = { readyState: "live" as const };
+  const screen = { readyState: "live" as const };
+  const current = { generation: 1, screen, camera: cameraA };
+  const cameraAttachment = deferred<void>();
+  const cameraStarted = deferred<void>();
+  const attached: Array<typeof cameraA | null> = [];
+  const peer = {
+    replaceTrack: async (kind: "screen" | "camera", track: typeof cameraA | null) => {
+      if (kind === "screen") return;
+      attached.push(track);
+      if (track === cameraA && attached.length === 1) {
+        cameraStarted.resolve();
+        await cameraAttachment.promise;
+      }
+    },
+  };
+
+  const attaching = attachApprovedTracks(peer, current, 1);
+  await cameraStarted.promise;
+  setApprovedCameraTrack(current, undefined);
+  const removing = replaceApprovedCameraTrack(current, 1, (track) => peer.replaceTrack("camera", track));
+  cameraAttachment.resolve();
+  await Promise.all([attaching, removing]);
+
+  assert.deepEqual(attached, [cameraA, null, null]);
+  assert.equal(current.screen, screen);
+  assert.equal(current.generation, 1);
+});
+
+test("late camera attachment cannot detach a newer approved camera", async () => {
+  const cameraA = { readyState: "live" as const };
+  const cameraB = { readyState: "live" as const };
+  const current = { generation: 2, screen: { readyState: "live" as const }, camera: cameraA };
+  const cameraAAttachment = deferred<void>();
+  const attached: Array<typeof cameraA | typeof cameraB | null> = [];
+  const replaceTrack = async (track: typeof cameraA | typeof cameraB | null) => {
+    attached.push(track);
+    if (track === cameraA && attached.length === 1) await cameraAAttachment.promise;
+  };
+
+  const attaching = replaceApprovedCameraTrack(current, 2, replaceTrack);
+  await Promise.resolve();
+  setApprovedCameraTrack(current, cameraB);
+  const replacing = replaceApprovedCameraTrack(current, 2, replaceTrack);
+  cameraAAttachment.resolve();
+  await Promise.all([attaching, replacing]);
+
+  assert.deepEqual(attached, [cameraA, cameraB]);
+  assert.equal(current.camera, cameraB);
+  assert.equal(current.screen?.readyState, "live");
+});
+
+test("toggle-camera removal stops the old camera without stale side effects after capture invalidation", async () => {
+  const oldCamera = {
+    readyState: "live" as const,
+    stopped: false,
+    stop() { this.stopped = true; },
+  };
+  const screen = { readyState: "live" as const };
+  const current: {
+    generation: number;
+    screen?: typeof screen;
+    camera?: typeof oldCamera;
+  } = { generation: 1, screen, camera: oldCamera };
+  const replacement = deferred<void>();
+  const sideEffects: string[] = [];
+
+  setApprovedCameraTrack(current, undefined);
+  const removal = removeApprovedCameraTrack(
+    current,
+    1,
+    oldCamera,
+    async () => replacement.promise,
+    async () => { sideEffects.push("camera-intent-false"); },
+    async (_screen, _camera) => { sideEffects.push("sharing-state"); },
+    () => { sideEffects.push("removed"); },
+  );
+  current.generation += 1;
+  current.screen = undefined;
+  replacement.resolve();
+  await removal;
+
+  assert.equal(oldCamera.stopped, true);
+  assert.deepEqual(sideEffects, []);
+});
+
+test("camera-failure removal stops the old camera without stale side effects after capture invalidation", async () => {
+  const oldCamera = {
+    readyState: "live" as const,
+    stopped: false,
+    stop() { this.stopped = true; },
+  };
+  const screen = { readyState: "live" as const };
+  const current: {
+    generation: number;
+    screen?: typeof screen;
+    camera?: typeof oldCamera;
+  } = { generation: 3, screen, camera: oldCamera };
+  const replacement = deferred<void>();
+  const sideEffects: string[] = [];
+
+  setApprovedCameraTrack(current, undefined);
+  const removal = removeApprovedCameraTrack(
+    current,
+    3,
+    oldCamera,
+    async () => replacement.promise,
+    async () => { sideEffects.push("camera-intent-false"); },
+    async (_screen, _camera) => { sideEffects.push("sharing-state"); },
+    () => { sideEffects.push("removed"); },
+    () => { sideEffects.push("replacement-failed-message"); },
+  );
+  current.generation += 1;
+  current.screen = undefined;
+  replacement.resolve();
+  await removal;
+
+  assert.equal(oldCamera.stopped, true);
+  assert.deepEqual(sideEffects, []);
+});
+
+test("normal camera removal publishes camera off while screen sharing remains active", async () => {
+  const camera = {
+    readyState: "live" as const,
+    stopped: false,
+    stop() { this.stopped = true; },
+  };
+  const screen = { readyState: "live" as const };
+  const current = { generation: 5, screen, camera: camera as typeof camera | undefined };
+  const replacement = deferred<void>();
+  const sideEffects: string[] = [];
+
+  setApprovedCameraTrack(current, undefined);
+  const removal = removeApprovedCameraTrack(
+    current,
+    5,
+    camera,
+    async () => replacement.promise,
+    async (enabled) => { sideEffects.push(`camera-intent-${enabled}`); },
+    async (screenEnabled, cameraEnabled) => {
+      sideEffects.push(`sharing-${screenEnabled}-${cameraEnabled}`);
+    },
+    () => { sideEffects.push("removed"); },
+  );
+  replacement.resolve();
+  await removal;
+
+  assert.equal(camera.stopped, true);
+  assert.deepEqual(sideEffects, [
+    "camera-intent-false",
+    "sharing-true-false",
+    "removed",
+  ]);
+  assert.equal(current.screen, screen);
 });

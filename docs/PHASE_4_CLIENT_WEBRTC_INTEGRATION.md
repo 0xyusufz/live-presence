@@ -64,6 +64,16 @@ counter resets only after 60 seconds of stable authentication. A viewer
 recreates a session only after server-side authorization succeeds; stale
 session and request references are not persisted.
 
+Capture, peer negotiation, and backend session state are separate lifecycles.
+The desktop's 180-second peer/session recovery deadline bounds WebRTC recovery
+and does not expire approved local capture consent. On recovery expiry the
+desktop retires the failed peer/session but preserves still-live approved
+tracks, republishes independent screen/camera state, and reconnects for a fresh
+authorized session. The viewer remains in reconnecting/waiting state instead of
+becoming permanently terminal for an ordinary recovery timeout. Explicit
+Stop, track end, revocation, crash, and shutdown remain independent terminal
+cleanup conditions.
+
 After ICE becomes disconnected, the owner waits approximately 8 seconds for
 normal recovery. A failed connection may then use at most two owner-offerer
 ICE restart offers. The viewer accepts restart offers only after the peer has
@@ -84,11 +94,50 @@ signaling messages because older clients do not send the required identifier
 and newer clients require it.
 
 Initial ICE negotiation is bounded by a 30-second client-side timeout. If the
-browser remains in a pending negotiating state without reaching a connected
-state, the client reports terminal failure, closes the peer and signaling
-resources, and ignores late peer or signaling callbacks. This timeout is
-separate from the approximately 8-second disconnected recovery grace period
-and does not add an initial retry.
+browser starts a genuinely fresh negotiation and remains pending without
+reaching a connected state, the client reports terminal failure and closes
+that peer. This timeout does not apply to an active peer replacement in a
+recovery cycle; the original recovery deadline remains authoritative. Ordinary
+viewer recovery timeout remains reconnectable, while fatal authorization,
+revocation, explicit leave, genuine SDP failure, and capture safety conditions
+remain terminal. Late peer and signaling callbacks are ignored.
+
+Viewer session-creation requests carry a request ID that is echoed by
+`session_created` and `session_attached`; replies for an older request cannot
+replace a newer session. Completed retired-session and negotiation IDs are
+bounded local stale-message history. The active session identity and request
+ID remain authoritative after an old history entry is removed.
+
+Desktop recovery-timeout retirements retain the exact session ID in a pending
+queue of at most 64 IDs and retry every five seconds through one bounded retry
+timer until `session_retired` confirms `retired`, `not_found`, or
+`authorization_revoked`. Unresolved retirements are never evicted to make room
+for completed history. At capacity, the desktop refuses new viewer sessions
+and asks the server to retire the incoming session; this is explicit
+backpressure, not loss of an unresolved entry. `retired` and `not_found`
+resolve the local retry but preserve approved capture; only
+`authorization_revoked` invalidates it. Explicit Stop, shutdown, or terminal
+client failure cancels the local retry timer and clears local pending state;
+the server's session lifecycle remains responsible for any request it did not
+receive. Completed stale-message history is separately bounded to 64 IDs and
+never substitutes for unresolved retirement state.
+
+Authorization revocation is persisted atomically with a device-scoped SQLite
+tombstone and cleanup outbox operation, scoped to owner account, device,
+viewer, and session. The server retries unprocessed operations at startup and
+every second; records have no time expiry and remain until cleanup is complete
+and the matching authenticated owner device acknowledges the tombstone. The
+10,000-record combined binding/tombstone limit rejects new grants or sessions
+instead of evicting unresolved revocations. This preserves revocation across
+CLI operation, owner disconnection, and server restart without turning
+ordinary expiry into a capture-stop event.
+
+Device-credential revocation is distinct from viewer-authorization revocation:
+an online device is disconnected with policy close code `1008` and its desktop
+stops capture through terminal renderer cleanup. An offline device cannot be
+stopped remotely while disconnected; credential rejection on its next
+reconnection triggers the same local cleanup, without changing the approved
+disconnected-capture policy.
 
 The all-policy fallback scenario starts both peers with
 `iceTransportPolicy: "all"` and uses a deterministic harness-only restriction

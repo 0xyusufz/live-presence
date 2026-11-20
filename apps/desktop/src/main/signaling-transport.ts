@@ -442,6 +442,13 @@ export class MainSignalingTransport {
         this.activeSessionIdValue = undefined;
         this.activeRecoveryAttemptId = undefined;
       }
+      if (
+        message.type === "session_retired" &&
+        message.session_id === this.activeSessionIdValue
+      ) {
+        this.activeSessionIdValue = undefined;
+        this.activeRecoveryAttemptId = undefined;
+      }
       this.emit({
         type: "message",
         data: JSON.stringify(message),
@@ -802,6 +809,8 @@ export class MainSignalingTransport {
       message.type === "sharing_state" ||
       message.type === "prepare_sleep" ||
       message.type === "resume_session" ||
+      message.type === "retire_session" ||
+      message.type === "retire_session_ack" ||
       message.type === "leave_session" ||
       message.type === "offer" ||
       message.type === "ice_candidate";

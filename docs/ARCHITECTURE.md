@@ -185,7 +185,7 @@ When a tick observes a different local date than the stored one, the counter res
 
 ## 4. Backend Architecture
 
-One Fastify process. Presence, active sessions, pending requests and chat buffers live **in memory**; only durable identity data touches SQLite.
+One Fastify process. Presence, active sessions, pending requests and chat buffers live **in memory**. Identity data and the narrowly scoped authorization-revocation recovery records touch SQLite.
 
 ```mermaid
 graph LR
@@ -206,7 +206,16 @@ graph LR
 | Pending screen/camera requests + per-kind deny cooldowns | — |
 | Transient chat buffer per active relationship (independent of media state — see §9) | — |
 | Last reported `active_usage_seconds` per device | — |
+| — | `presence_authorization_bindings` records the latest session for an owner-device/viewer authorization while approved sharing may continue |
+| — | `presence_revocation_tombstones` durably records authorization revocation until the matching authenticated owner device acknowledges it |
+| — | `presence_revocation_outbox` records pending server-side session cleanup for each tombstone; it is deleted with the acknowledged tombstone |
 | WS connections, rate-limit counters | — |
+
+An ordinary recovery/session retirement preserves its authorization binding because approved live capture may continue while disconnected. Revoking that viewer authorization atomically updates the permission, converts matching bindings into device-scoped tombstones and outbox operations, and removes the bindings in one immediate SQLite transaction. This applies when the session was already retired or the owner is offline, including revocation initiated by the access CLI while the server is stopped. A rollback leaves the permission and binding unchanged if any part of that transaction fails.
+
+The server processes pending outbox operations at startup, after an in-process revocation, and every second in batches of at most 100. Processing is idempotent and only ends a live session whose owner, device, viewer, and session all match the stored operation. A failed operation remains pending for retry. The tombstone remains until cleanup has completed and the matching authenticated owner account/device acknowledges it; the server verifies both identities before deletion. Tombstones and their outbox records have no time-based expiry and survive server restarts. Startup migration converts older revoked bindings and existing tombstones into outbox operations. An ordinary expired or retired session creates no revocation tombstone.
+
+The fixed SQLite presence-revocation capacity is 10,000 combined authorization bindings and unacknowledged tombstones; each outbox operation corresponds to one tombstone and does not add a separate capacity slot. At capacity, new viewer grants and session bindings are rejected with an explicit capacity error. Existing unresolved records are never expired, evicted, or overwritten to make room; operators should restore device connectivity so its owner can acknowledge revocations, or reduce active authorized relationships. A device whose credentials were separately revoked cannot authenticate an acknowledgment, so its tombstone deliberately remains indefinitely and consumes capacity; no automatic purge is provided. Thus a sustained backlog fails closed for new presence sessions rather than losing mandatory revocation state.
 
 A restart drops everyone; clients reconnect with backoff (§10). This isn't a shortcut around building reconnect logic — it's the reason to build it early, since it now runs on every deploy. A restart also clears pending requests, cooldowns and the chat buffer, which is the correct behavior: a stale consent prompt should never survive a deploy.
 
@@ -285,7 +294,7 @@ const screenTx = pc.addTransceiver(screenTrack ?? "video", { direction: "sendonl
 const cameraTx = pc.addTransceiver(cameraTrack ?? "video", { direction: "sendonly" });
 ```
 
-**WHY:** the sender can enable the optional camera after screen sharing is already live without adding a transceiver or renegotiating. With the slot reserved, turning the camera on is `cameraTx.sender.replaceTrack(cameraTrack)` and turning it off is `replaceTrack(null)`. The camera remains independent from the screen track.
+**WHY:** the sender can enable the optional camera after screen sharing is already live without adding a transceiver or renegotiating. With the slot reserved, turning the camera on is `cameraTx.sender.replaceTrack(cameraTrack)` and turning it off is `replaceTrack(null)`. The camera can be independently disabled or unplugged while screen sharing continues, but camera-only sharing is not supported: screen capture is required for an active sharing session. Screen termination stops camera too, closes the complete sharing session, and requires a fresh local Share Screen action.
 
 **Track identity: the viewer must be able to tell which received track is which.** With two same-kind (`video`) transceivers, the viewer cannot assume ordering in `ontrack` events is stable across browsers or renegotiations, so identity has to be pinned deliberately rather than inferred:
 
@@ -565,7 +574,7 @@ It has no buttons, it doesn't stop anything, and it doesn't repeat — no hourly
 
 **Why dropping the timebox is safe.** The timebox previously guarded one specific failure: a laptop sleeping and waking days later with capture silently still running. That failure is now blocked directly at the resume path instead — **sleep temporarily interrupts sharing, then automatically reconnects and resumes only the already-approved active sharing session**, with an explicit `Connected / Sharing resumed` notification and no fresh consent (§5). A crash or relaunch remains different: it returns sharing to IDLE and requires a fresh explicit local action. Guarding the actual failure beats guarding a clock, and it removes an expiry that interrupted legitimate long sessions for no privacy gain. What keeps this an accountability tool rather than monitoring software is the combination of: the indicator invariant (§11), the consent invariant (§5), the explicit approval required for every new viewer request, the crash/relaunch reset rule, and the absence of any history table (§8).
 
-**Viewer disconnect uses a short grace period, not an immediate stop.** A page refresh or a brief network blip shouldn't interrupt sharing — capture tracks stay live for a grace window (e.g. ~20–30s) after the viewer's connection drops, so a quick reconnect resumes seamlessly, with the chat buffer intact. Only after the grace period elapses with no reconnect does capture stop and the session return to idle.
+**Viewer disconnect uses a short grace period, not an immediate stop.** A page refresh or a brief network blip shouldn't interrupt sharing — capture tracks stay live for a grace window (e.g. ~20–30s) after the viewer's connection drops, so a quick reconnect resumes seamlessly, with the chat buffer intact. When the grace period elapses, retire the viewer session if needed, but do not stop still-live desktop capture solely because the viewer disappeared. Capture remains active until explicit local Stop, track end, revocation, crash, or another mandatory safety/shutdown condition.
 
 **Session ID guessing:** WebRTC `session_id`s are high-entropy (≥128-bit random), which on its own makes them impractical to guess — independent of the authorization check that's still required on every signaling message regardless.
 
@@ -628,19 +637,21 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 |---|---|
 | WS disconnect | Exponential backoff + jitter (1s→2s→4s...→30s cap). Jitter matters even with two users — without it a server restart is a synchronized reconnect storm. |
 | WS reconnect | Re-auth, re-fetch presence. Reset backoff only after 60s stable — a flapping network shouldn't tight-loop. |
-| WebRTC/ICE disconnect | Keep the approved local tracks and peer; wait ~8s (often self-heals), then try ICE restart up to twice. A 180-second configurable recovery deadline bounds the complete signaling/ICE recovery window; on expiry, stop safely and surface the timeout. |
-| Temporary internet drop | Keep approved capture tracks and the existing session for `NETWORK_RECOVERY_GRACE_MS` (default 180000 ms). Re-authenticate signaling, reattach both endpoints to the same session, and restart ICE without creating a peer/session duplicate. Show `Reconnecting` until WebRTC recovers. |
+| WebRTC/ICE disconnect | Keep the approved local tracks and peer; wait ~8s (often self-heals), then try ICE restart up to twice. A 180-second configurable recovery deadline bounds the complete signaling/ICE recovery window; on expiry, retire the peer/session but keep still-live approved capture tracks and show a persistent disconnected-but-capturing state. |
+| Temporary internet drop | Keep approved capture tracks and retire/recreate the peer/session as needed. Re-authenticate signaling, republish independent live screen/camera state, and create a fresh authorized session when a viewer returns. Show `Sharing locally — Reconnecting` while offline. |
 | Device presence during interruption | Mark the device offline after ~35s (2 missed 15s heartbeats + slack); the existing approved session remains recoverable until its separate recovery grace expires. |
-| Recovery deadline expires | End the session and safely stop local capture exactly once with a clear timeout reason; do not retry capture or silently create a replacement session. |
+| Recovery deadline expires | Retire the failed peer/session and keep still-live approved capture active. Never reacquire tracks. Reconnect signaling and wait for an authorized fresh session; explicit Stop, track end, revocation, crash, or shutdown still ends capture. The desktop retries unresolved session retirements every five seconds, with a single timer and a maximum of 64 pending session IDs. It does not evict unresolved IDs; at the limit it refuses a new viewer session and asks the server to retire that session. Explicit Stop, shutdown, or terminal client failure cancels the local retry timer and clears local pending state; the server's own session lifecycle remains responsible for retirements it did not receive. Completed stale-message history is a separate 64-ID bound and cannot replace unresolved entries. |
+| Authorization revoked | The server atomically updates permission state and creates a durable device-scoped tombstone/outbox operation, including when the session was already retired or the owner is offline. Cleanup is retried after restart until processed; the matching authenticated owner device receives the tombstone and acknowledges it. The desktop follows the existing revocation cleanup path and stops screen and camera capture. Tombstones are not expired by time or server restart and are deleted only after cleanup plus a matching owner-account/device acknowledgment. Ordinary `retired` / `not_found` outcomes do not stop approved capture. |
+| Device credential revoked | If connected, the server closes the device's signaling connection with policy code `1008`; terminal desktop handling invalidates the capture generation and stops both tracks. If the device is offline, the server cannot stop its local capture remotely: approved live capture remains under the disconnected-capture policy until the device next reconnects, receives credential rejection, and runs the same local cleanup. |
 | Laptop sleep/wake | A server-acknowledged sleep marker opens a five-minute continuity window for the already-active session only; ordinary viewer disconnect grace stays ~25 seconds. Reconnect using the existing shared-client recovery path and surviving tracks only; no silent reacquisition or fresh consent. Show `Connected / Sharing resumed` after peer recovery. New requests are never auto-approved; ended screen or unprovable continuity stops both tracks and requires a fresh local Share Screen action. Crash/relaunch starts IDLE (§5, §9) |
 | Camera unplugged | Camera `onended` fires → detach only camera with `replaceTrack(null)`; screen share continues |
 | Screen capture stopped (source window closed) | Screen `onended` stops camera too, ends the complete sharing session, and requires a fresh local Share Screen action; never silently reacquire |
 | Sender clicks Stop | Capture tracks stop, the server invalidates any resume capability, and the session returns to IDLE. No viewer request can restart capture |
 | macOS permission lost | Detect via track/error signals, black-frame check as fallback (§5) → stop, clear recovery message. Chat is unaffected |
 | App crash | Capture dies with the process. **On relaunch: always IDLE, never auto-resume sharing** — a fresh click is required |
-| Viewer closes tab / temporary disconnect | Server sees WS close → approved capture tracks stay live through the configurable recovery grace period to tolerate refresh or a brief drop; the chat buffer is retained through the same window since the control relationship is still considered "briefly away," not ended. Only if the viewer hasn't reconnected by the end of the grace period does the sender drop to armed-but-idle, stop any capture tracks (camera LED off), **and the relationship is now considered ended — only at that point does the chat buffer clear** |
+| Viewer closes tab / temporary disconnect | Server sees WS close → approved capture tracks remain live; the viewer grace period tolerates refresh or a brief drop and preserves session/chat continuity. Expiry retires the viewer session but does not stop still-live desktop capture. A fresh authorized viewer can attach later, while a server restart or revocation still ends stale recovery safely. |
 | Sender closes app | Graceful stop sent before quit where possible; otherwise timeout-based. This ends the control relationship, so the chat buffer clears with it |
-| Server restart | Everyone reconnects (backoff). Pending requests, cooldowns and chat buffers are gone — clients reset request UI to NONE rather than showing stale pending state |
+| Server restart | Everyone reconnects (backoff). Pending requests, cooldowns and chat buffers are gone — clients reset request UI to NONE rather than showing stale pending state. Unacknowledged authorization-revocation tombstones and their cleanup outbox operations remain in SQLite; pending operations retry and tombstones are delivered only to their owning device |
 | Sender offline when a request arrives | Request is rejected immediately with `share_request_state: CANCELLED`; nothing queues for later delivery |
 | Request left undecided | EXPIRES after ~2 min; the prompt closes itself on the sender side so old prompts don't pile up |
 | Usage tracker: clock change / DST / timezone move | Counter keys off local date; a date change resets to zero. A clock jump backwards at worst mis-attributes a few ticks — acceptable for an aggregate figure |
@@ -789,7 +800,10 @@ made unavailable by the deterministic harness; jittered WebSocket reconnect
 with fresh authentication;
 server restart invalidation and re-session; bounded ICE recovery; initial ICE
 timeout; terminal cleanup; and stale socket, peer, timer, and listener
-protection.
+protection. Presence tests also exercise server-side sleep-marker issuance,
+owner/viewer disconnect, device-authenticated wake reconnection, capability
+rotation, and resumption of the same approved session without creating a new
+viewer session.
 
 **Implemented but not fully integration-tested:** a live post-connection
 direct-to-relay network failover using Chromium's real network interfaces; the
@@ -854,7 +868,7 @@ No automated Windows/macOS UI testing infrastructure for MVP — not worth build
 
 - **Desktop:** Electron + TypeScript + React
 - **Backend:** Node.js + Fastify, one process (REST + WS)
-- **DB:** SQLite (better-sqlite3 + Drizzle), six tables
+- **DB:** SQLite (better-sqlite3 + Drizzle), eight tables
 - **Media:** WebRTC, P2P, 1 viewer, 2 reserved transceivers (screen + camera)
 - **Control plane:** WebSocket — presence, signaling, viewer requests, transient chat
 - **TURN:** Cloudflare Realtime temporary ICE servers for the active application; optional self-hosted coturn deployment remains documented
@@ -889,3 +903,4 @@ See §14 — Phases 0 through 7 get you a working MVP, Phase 8 completes the fea
 9. **Indefinite sessions put more weight on the indicator and resume boundary.** With no expiry, the indicator window, the explicit approval boundary for new viewer requests, and the distinction between automatic sleep/wake resume for an already-approved active session versus the IDLE reset after crash/relaunch are the whole safety net. A bug that lets the indicator hide while capture runs, or that lets wake resume a new request without approval, is now a serious defect, not a cosmetic one — which is exactly why its lifetime is bound to the capture handles (§3).
 10. **Hosting-platform mismatch** — if you ever move off the recommended VPS, verify the new host actually supports raw UDP + a static IP for coturn and has predictable egress pricing (§12); many PaaS platforms don't meet all four, and terms/allocations vary by provider and change over time.
 11. **Windows DRM/UAC capture gaps** — not fixable, just needs to be documented so it's not mistaken for a bug.
+12. **Durable revocation backlog and storage pressure** — an unreachable owner device can leave an unacknowledged revocation tombstone pending indefinitely. The 10,000-record cap deliberately rejects new grants and sessions rather than discarding unresolved revocations; monitor capacity errors and restore the affected device's connectivity to allow authenticated acknowledgment. A credential-revoked device cannot acknowledge, so its retained record may permanently consume capacity; this implementation intentionally has no unsafe automatic or manual purge path.

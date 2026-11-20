@@ -6,6 +6,8 @@ import { test } from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
 import { MainSignalingTransport } from "./signaling-transport.js";
 import type { SocketEvent } from "../ipc-contract.js";
+import type { LivePresenceBridge } from "../ipc-contract.js";
+import { createSignalingSocket } from "../renderer/signaling-socket.js";
 
 function waitForEvent(
   events: SocketEvent[],
@@ -136,6 +138,107 @@ test("owner transport shares one authenticated connection, heartbeats, and close
         }));
       } else if (message.type === "heartbeat") {
         socket.send(JSON.stringify({ type: "heartbeat_ack" }));
+      }
+    });
+
+    test("renderer adapter forwards revocation acknowledgments and retired-session state through owner transport", async () => {
+      const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+      await once(server, "listening");
+      const address = server.address();
+      assert.ok(address && typeof address !== "string");
+      const sessionId = "00000000-0000-4000-8000-000000000001";
+      const ackSessionId = "00000000-0000-4000-8000-000000000002";
+      const acknowledgments: Array<Record<string, unknown>> = [];
+      let ownerSocket: WebSocket | undefined;
+      server.on("connection", (socket: WebSocket) => {
+        ownerSocket = socket;
+        socket.on("message", (raw) => {
+          const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+          if (message.type === "auth") {
+            socket.send(JSON.stringify({
+              type: "authenticated",
+              role: "owner",
+              device_id: "00000000-0000-0000-0000-000000000001",
+            }));
+            socket.send(JSON.stringify({
+              type: "viewer_joined",
+              session_id: sessionId,
+              viewer_user_id: "viewer",
+            }));
+          } else if (message.type === "retire_session_ack") {
+            acknowledgments.push(message);
+          }
+        });
+      });
+
+      const subscribers = new Set<(event: SocketEvent) => void>();
+      const transport = new MainSignalingTransport(
+        `http://127.0.0.1:${address.port}`,
+        "http://localhost:5173",
+        { load: async () => "test-device-credential" },
+        (event) => {
+          for (const subscriber of subscribers) subscriber(event);
+        },
+      );
+      const bridge: Pick<
+        LivePresenceBridge,
+        "connectSignaling" | "sendSignaling" | "closeSignaling" | "onSocketEvent"
+      > = {
+        connectSignaling: () => transport.connect(),
+        sendSignaling: async (data, generation) => { transport.send(data, generation); },
+        closeSignaling: (generation) => { transport.close(generation); },
+        onSocketEvent: (callback) => {
+          subscribers.add(callback);
+          return () => { subscribers.delete(callback); };
+        },
+      };
+      const rendererSocket = createSignalingSocket(bridge);
+      const received: Array<Record<string, unknown>> = [];
+      rendererSocket.onmessage = ({ data }) => {
+        if (typeof data === "string") received.push(JSON.parse(data) as Record<string, unknown>);
+      };
+
+      try {
+        rendererSocket.connect?.();
+        await waitForCondition(() => received.some((message) => message.type === "authenticated"));
+        await waitForCondition(() => received.some((message) => message.type === "viewer_joined"));
+        assert.equal(transport.activeSessionId, sessionId);
+
+        await rendererSocket.send(JSON.stringify({
+          type: "retire_session_ack",
+          session_id: ackSessionId,
+          outcome: "authorization_revoked",
+        }));
+        await waitForCondition(() => acknowledgments.length === 1);
+        assert.deepEqual(acknowledgments[0], {
+          type: "retire_session_ack",
+          session_id: ackSessionId,
+          outcome: "authorization_revoked",
+        });
+
+        ownerSocket!.send(JSON.stringify({
+          type: "session_retired",
+          session_id: ackSessionId,
+          outcome: "retired",
+        }));
+        await waitForCondition(() => received.some((message) =>
+          message.type === "session_retired" && message.session_id === ackSessionId));
+        assert.equal(transport.activeSessionId, sessionId);
+
+        ownerSocket!.send(JSON.stringify({
+          type: "session_retired",
+          session_id: sessionId,
+          outcome: "retired",
+        }));
+        await waitForCondition(() => received.some((message) =>
+          message.type === "session_retired" && message.session_id === sessionId));
+        assert.equal(transport.activeSessionId, undefined);
+      } finally {
+        rendererSocket.close();
+        server.clients.forEach((socket) => socket.terminate());
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => error ? reject(error) : resolve());
+        });
       }
     });
   });

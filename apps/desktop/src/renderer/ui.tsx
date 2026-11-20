@@ -4,12 +4,19 @@ import {
   type SignalingSocket,
   type ClientLifecycleState,
 } from "../../../../shared/src/client.js";
-import type { WebRtcPeer } from "../../../../shared/src/webrtc.js";
 import { createBrowserPeer } from "./webrtc-adapter.js";
 import {
+  attachApprovedTracks,
   acquireLiveScreenTrack,
   confirmLiveScreenCapture,
+  handleTerminalCaptureFailure,
+  invalidateCapture,
   inspectScreenVideoTracks,
+  isCurrentCameraTrack,
+  isLiveCameraTrack,
+  removeApprovedCameraTrack,
+  replaceApprovedCameraTrack,
+  setApprovedCameraTrack,
   sharingStatus,
   stopOwnerCapture,
 } from "./sharing-status.js";
@@ -168,19 +175,23 @@ function ShareWindow(): JSX.Element {
         capture.current.screen.readyState === "live" &&
         capture.current.generation > 0
       ),
+      isCameraActive: () => Boolean(
+        capture.current.camera &&
+        capture.current.camera.readyState === "live" &&
+        capture.current.generation > 0
+      ),
       getSharingGeneration: () => capture.current.generation,
-      prepareOwnerPeer: (peer) => attachCurrentTracks(peer, capture.current.generation),
+      prepareOwnerPeer: (peer) =>
+        attachApprovedTracks(peer, capture.current, capture.current.generation),
       onSharingResumed: () => {
         setMessage("Connected / Sharing resumed");
         window.livePresence.notifySharingResumed();
       },
       onOwnerSessionEnded: (reason) => {
-        if (reason === "viewer_grace_expired" || reason === "authorization_revoked" || reason === "recovery_timeout") {
+        if (reason === "authorization_revoked") {
           void stopCurrent(
-            reason === "recovery_timeout"
-              ? "Network recovery timed out; sharing was stopped."
-              : "Viewer session ended; sharing was stopped.",
-            reason !== "recovery_timeout",
+            "Viewer authorization was revoked; sharing was stopped.",
+            true,
           );
         }
       },
@@ -267,13 +278,12 @@ function ShareWindow(): JSX.Element {
         }
       },
       onTerminalError: (error) => {
-        const current = capture.current;
-        if (current.failureHandled) return;
-        current.failureHandled = true;
-        current.failed = true;
-        const reason = `${error.message} Sharing was stopped.`;
-        if (current.screen || current.preparingScreen) void stopCurrent(reason);
-        else setMessage(reason);
+        handleTerminalCaptureFailure(
+          capture.current,
+          error,
+          (reason) => { void stopCurrent(reason); },
+          setMessage,
+        );
       },
     });
     current.client = client;
@@ -309,11 +319,12 @@ function ShareWindow(): JSX.Element {
       }
       if (current.client?.lifecycle === "FAILED" && !current.failureHandled) {
         const error = current.client.failure;
-        current.failureHandled = true;
-        current.failed = true;
-        const reason = `${error?.message ?? "The WebRTC session failed."} Sharing was stopped.`;
-        if (current.screen || current.preparingScreen) void stopCurrent(reason);
-        else setMessage(reason);
+        handleTerminalCaptureFailure(
+          current,
+          new Error(error?.message ?? "The WebRTC session failed."),
+          (reason) => { void stopCurrent(reason); },
+          setMessage,
+        );
       }
     }, 750);
     const removeEvents = window.livePresence.onAppEvent((event) => {
@@ -343,17 +354,13 @@ function ShareWindow(): JSX.Element {
 
   async function stopCurrent(reason?: string, stopClient = true): Promise<void> {
     const current = capture.current;
-    current.generation += 1;
+    const { screen, camera } = invalidateCapture(current);
     current.attemptId = undefined;
     current.cameraPending = false;
     current.preparingScreen = false;
     if (stopClient) {
       try { void current.client?.stopSharingSession().catch(() => undefined); } catch { /* the socket may already be closed */ }
     }
-    const screen = current.screen;
-    const camera = current.camera;
-    current.screen = undefined;
-    current.camera = undefined;
     setScreenSharing(false);
     setCameraSharing(false);
     setState("IDLE");
@@ -607,38 +614,34 @@ function ShareWindow(): JSX.Element {
     }
   }
 
-  async function attachCurrentTracks(peer: WebRtcPeer, generation: number): Promise<void> {
-    const current = capture.current;
-    if (current.generation !== generation || !current.screen || current.screen.readyState !== "live") {
-      throw new Error("screen track is unavailable");
-    }
-    await peer.replaceTrack("screen", current.screen);
-    if (current.generation !== generation || current.screen?.readyState !== "live") {
-      throw new Error("screen sharing ended during peer preparation");
-    }
-    const camera = current.camera;
-    if (camera?.readyState === "live") await peer.replaceTrack("camera", camera);
-    else await peer.replaceTrack("camera", null);
-    if (current.generation !== generation) throw new Error("sharing session stopped during peer preparation");
-  }
-
   async function toggleCamera(): Promise<void> {
     const current = capture.current;
     const generation = current.generation;
-    if (!current.screen || !current.client || current.screen.readyState !== "live") return;
+    if (
+      !current.screen ||
+      !current.client ||
+      current.screen.readyState !== "live" ||
+      current.cameraPending
+    ) return;
     if (current.camera) {
       const camera = current.camera;
-      current.camera = undefined;
-      try { await current.client.replaceOwnerTrack("camera", null); } catch { /* stopping the track is still safe */ }
-      camera.stop();
-      await window.livePresence.setCameraIntent(false).catch(() => undefined);
-      await current.client.setSharingState(true, false).catch(() => undefined);
-      setCameraSharing(false);
+      current.cameraPending = true;
+      setApprovedCameraTrack(current, undefined);
+      await removeApprovedCameraTrack(
+        current,
+        generation,
+        camera,
+        (track) => current.client!.replaceOwnerTrack("camera", track),
+        (enabled) => window.livePresence.setCameraIntent(enabled),
+        (screen, cameraEnabled) => current.client!.setSharingState(screen, cameraEnabled),
+        () => setCameraSharing(false),
+      );
+      if (capture.current.generation === generation) current.cameraPending = false;
       return;
     }
-    if (current.cameraPending) return;
 
     current.cameraPending = true;
+    let requestedCamera: MediaStreamTrack | undefined;
     try {
       await window.livePresence.setCameraIntent(true);
       if (capture.current.generation !== generation) return;
@@ -649,12 +652,22 @@ function ShareWindow(): JSX.Element {
         await window.livePresence.setCameraIntent(false);
         return;
       }
-      current.camera = camera;
+      requestedCamera = camera;
+      setApprovedCameraTrack(current, camera);
       camera.addEventListener("ended", () => {
         if (capture.current.camera === camera) void disableCameraAfterFailure(camera);
       }, { once: true });
-      await current.client.replaceOwnerTrack("camera", camera);
-      if (capture.current.generation !== generation || current.screen?.readyState !== "live") {
+      await replaceApprovedCameraTrack(
+        current,
+        generation,
+        (track) => current.client!.replaceOwnerTrack("camera", track),
+      );
+      if (
+        capture.current.generation !== generation ||
+        current.screen?.readyState !== "live" ||
+        !isCurrentCameraTrack(current, camera) ||
+        !isLiveCameraTrack(current, camera)
+      ) {
         camera.stop();
         return;
       }
@@ -662,11 +675,16 @@ function ShareWindow(): JSX.Element {
       setCameraSharing(true);
       setMessage("");
     } catch {
-      const failedCamera = current.camera;
-      current.camera = undefined;
-      failedCamera?.stop();
-      await current.client?.replaceOwnerTrack("camera", null).catch(() => undefined);
-      await window.livePresence.setCameraIntent(false).catch(() => undefined);
+      if (requestedCamera && isCurrentCameraTrack(current, requestedCamera)) {
+        setApprovedCameraTrack(current, undefined);
+        requestedCamera.stop();
+        await replaceApprovedCameraTrack(
+          current,
+          generation,
+          (track) => current.client!.replaceOwnerTrack("camera", track),
+        ).catch(() => undefined);
+        await window.livePresence.setCameraIntent(false).catch(() => undefined);
+      }
       if (capture.current.generation === generation) setMessage("Camera is unavailable or permission was denied.");
     } finally {
       if (capture.current.generation === generation) current.cameraPending = false;
@@ -676,17 +694,39 @@ function ShareWindow(): JSX.Element {
   async function disableCameraAfterFailure(camera: MediaStreamTrack): Promise<void> {
     const current = capture.current;
     if (current.camera !== camera) return;
-    current.camera = undefined;
-    try {
-      await current.client?.replaceOwnerTrack("camera", null);
-    } catch {
-      setMessage("Camera stopped; screen sharing continues.");
-    } finally {
+    const generation = current.generation;
+    setApprovedCameraTrack(current, undefined);
+    if (current.client) {
+      await removeApprovedCameraTrack(
+        current,
+        generation,
+        camera,
+        (track) => current.client!.replaceOwnerTrack("camera", track),
+        (enabled) => window.livePresence.setCameraIntent(enabled),
+        (screen, cameraEnabled) => current.client!.setSharingState(screen, cameraEnabled),
+        () => {
+          setCameraSharing(false);
+          setMessage("Camera stopped; screen sharing continues.");
+        },
+        () => {
+          if (capture.current.generation === generation &&
+            current.screen?.readyState === "live") {
+            setMessage("Camera stopped; screen sharing continues.");
+          }
+        },
+      );
+    } else {
       camera.stop();
-      await window.livePresence.setCameraIntent(false).catch(() => undefined);
-      await current.client?.setSharingState(true, false).catch(() => undefined);
-      setCameraSharing(false);
-      setMessage("Camera stopped; screen sharing continues.");
+      if (capture.current.generation === generation &&
+        current.screen?.readyState === "live" &&
+        current.camera === undefined) {
+        await window.livePresence.setCameraIntent(false).catch(() => undefined);
+        if (capture.current.generation === generation &&
+          current.screen?.readyState === "live") {
+          setCameraSharing(false);
+          setMessage("Camera stopped; screen sharing continues.");
+        }
+      }
     }
   }
 

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   DesktopWebRtcClient,
   INITIAL_NEGOTIATION_TIMEOUT_MS,
+  MAX_PENDING_SESSION_RETIREMENTS,
   ViewerWebRtcClient,
   type DesktopDiagnostic,
   type ClientSignalingDiagnostic,
@@ -12,7 +13,13 @@ import {
   type ClientScheduler,
 } from "./client.js";
 import { parseServerMessage } from "./protocol.js";
-import { stopOwnerCapture } from "../../apps/desktop/src/renderer/sharing-status.js";
+import {
+  attachApprovedTracks,
+  handleTerminalCaptureFailure,
+  invalidateCapture,
+  stopCapturedTracks,
+  stopOwnerCapture,
+} from "../../apps/desktop/src/renderer/sharing-status.js";
 import { createSignalingSocket } from "../../apps/desktop/src/renderer/signaling-socket.js";
 import type { LivePresenceBridge, SocketEvent } from "../../apps/desktop/src/ipc-contract.js";
 import type {
@@ -184,6 +191,15 @@ class MockSocket implements SignalingSocket {
   }
 }
 
+function createSessionRequestId(socket: MockSocket): string {
+  const request = [...socket.sent]
+    .reverse()
+    .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .find((message) => message.type === "create_session");
+  assert.equal(typeof request?.request_id, "string");
+  return request!.request_id as string;
+}
+
 class ManualScheduler implements ClientScheduler {
   nowValue = 0;
   nextId = 0;
@@ -247,8 +263,14 @@ async function createConnectedViewer(
   viewer.start();
   socket.open();
   socket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
   socket.onmessage?.({
-    data: JSON.stringify({ type: "session_created", session_id: sessionId, device_id: deviceId }),
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: sessionId,
+      device_id: deviceId,
+      request_id: createSessionRequestId(socket),
+    }),
   });
   socket.onmessage?.({
     data: JSON.stringify({
@@ -267,6 +289,112 @@ async function createConnectedViewer(
 
   return { viewer, socket, connections, sessionId, deviceId };
 }
+
+test("viewer retires a temporary-disconnect session and attaches to a fresh authorized session", async () => {
+  const scheduler = new ManualScheduler();
+  const socket = new MockSocket();
+  const connections: MockConnection[] = [];
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => socket,
+    peerFactory: () => {
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId,
+    reconnect: { scheduler },
+  });
+  viewer.start();
+  socket.open();
+  socket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  for (let index = 0; index < 3; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(socket.sent.filter((raw) => JSON.parse(raw).type === "create_session").length, 1);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: sessionId,
+      device_id: deviceId,
+      request_id: createSessionRequestId(socket),
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "negotiation-1",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  for (let index = 0; index < 4; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  connections[0]!.connectionState = "connected";
+  connections[0]!.onconnectionstatechange?.();
+  assert.equal(viewer.lifecycle, "CONNECTED");
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: sessionId,
+      viewer_user_id: "viewer",
+      reason: "temporary_disconnect",
+    }),
+  });
+
+  assert.equal(connections[0]!.closed, true);
+  assert.equal(viewer.lifecycle, "RECONNECTING");
+  assert.equal(scheduler.timers.size, 0);
+  assert.equal(
+    socket.sent.filter((raw) => JSON.parse(raw).type === "create_session").length,
+    2,
+  );
+  assert.notEqual(viewer.lifecycle, "FAILED");
+
+  const nextSessionId = "00000000-0000-0000-0000-000000000003";
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: nextSessionId,
+      device_id: deviceId,
+      request_id: createSessionRequestId(socket),
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: nextSessionId,
+      negotiation_id: "fresh-negotiation",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  for (let index = 0; index < 4; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.answerCalls, 1);
+  connections[1]!.connectionState = "connected";
+  connections[1]!.onconnectionstatechange?.();
+  assert.equal(viewer.lifecycle, "CONNECTED");
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "stale-negotiation",
+      sdp: "stale-offer",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  assert.equal(connections.length, 2);
+  viewer.close();
+});
 
 test("desktop and viewer clients negotiate through the existing signaling messages", async () => {
   const ownerSocket = new MockSocket();
@@ -312,11 +440,13 @@ test("desktop and viewer clients negotiate through the existing signaling messag
       device_id: "00000000-0000-0000-0000-000000000001",
     }),
   });
+  await new Promise((resolve) => setImmediate(resolve));
   viewerSocket.onmessage?.({
     data: JSON.stringify({
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(viewerSocket),
     }),
   });
   ownerSocket.onmessage?.({
@@ -474,6 +604,7 @@ test("late signaling after terminal failure cannot recreate a session", async ()
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: "stale-request-id",
     }),
   });
   assert.equal(client.lifecycle, "FAILED");
@@ -1187,6 +1318,7 @@ test("viewer does not re-session after an explicit leave", async () => {
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(socket),
     }),
   });
   socket.onmessage?.({
@@ -1231,6 +1363,7 @@ test("viewer treats sharing_stopped as an expected end and keeps authenticated p
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(socket),
     }),
   });
   assert.equal(viewer.lifecycle, "NEGOTIATING");
@@ -1324,6 +1457,7 @@ test("viewer waits while sharing is inactive and creates one fresh session on ea
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: deviceId,
+      request_id: createSessionRequestId(socket),
     }),
   });
   assert.equal(viewer.lifecycle, "NEGOTIATING");
@@ -1343,6 +1477,7 @@ test("viewer waits while sharing is inactive and creates one fresh session on ea
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000003",
       device_id: deviceId,
+      request_id: createSessionRequestId(socket),
     }),
   });
   assert.equal(viewer.lifecycle, "NEGOTIATING");
@@ -1476,6 +1611,7 @@ test("camera sharing updates preserve the active screen peer and canonical trans
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: deviceId,
+      request_id: createSessionRequestId(socket),
     }),
   });
   socket.onmessage?.({
@@ -1541,6 +1677,7 @@ test("viewer keeps genuine SDP failures in FAILED state", async () => {
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(socket),
     }),
   });
   socket.onmessage?.({
@@ -1593,6 +1730,7 @@ test("viewer processes the offer after session creation and sends one answer", a
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(socket),
     }),
   });
   const offer = JSON.stringify({
@@ -1652,6 +1790,7 @@ test("viewer exposes asynchronous offer-processing failures instead of hiding th
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(socket),
     }),
   });
   socket.onmessage?.({
@@ -1735,11 +1874,13 @@ test("viewer rejects initial unauthorized access and stops retrying after revoca
   viewer.start();
   sockets[0]!.open();
   sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
   sockets[0]!.onmessage?.({
     data: JSON.stringify({
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(sockets[0]!),
     }),
   });
   sockets[0]!.close();
@@ -1773,6 +1914,7 @@ async function connectedDesktop(
     onDiagnostic?: (diagnostic: DesktopDiagnostic) => void;
     recoveryTimeoutMs?: number;
     isSharingActive?: () => boolean;
+    isCameraActive?: () => boolean;
     getSharingGeneration?: () => number;
     prepareOwnerPeer?: (peer: WebRtcPeer) => Promise<void>;
     peerFactory?: () => MockConnection;
@@ -1797,6 +1939,7 @@ async function connectedDesktop(
         : { recoveryTimeoutMs: configuration.recoveryTimeoutMs }),
     },
     isSharingActive: configuration?.isSharingActive,
+    isCameraActive: configuration?.isCameraActive,
     getSharingGeneration: configuration?.getSharingGeneration,
     onTerminalError,
     onDiagnostic: configuration?.onDiagnostic,
@@ -1890,6 +2033,9 @@ test("desktop resumes a pending ICE restart after signaling reauthentication", a
     },
   );
   await client.setSharingState(true, true);
+  const internal = client as unknown as { retiredSessionIds: Set<string>; sessionId: string | undefined };
+  assert.equal(internal.sessionId, "00000000-0000-0000-0000-000000000002");
+  assert.equal(internal.retiredSessionIds.has("00000000-0000-0000-0000-000000000002"), false);
   peerConnection.connectionState = "disconnected";
   peerConnection.onconnectionstatechange?.();
   socket.disconnect(1013);
@@ -1991,7 +2137,7 @@ test("desktop refreshes ICE servers and applies the new configuration before res
   client.close();
 });
 
-test("desktop retires sharing at the recovery deadline without terminalizing signaling", async () => {
+test("desktop retires its peer at the recovery deadline while preserving approved capture", async () => {
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();
   const connections = [connection];
@@ -2007,6 +2153,7 @@ test("desktop retires sharing at the recovery deadline without terminalizing sig
       onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
       onOwnerSessionEnded: (reason) => endedReasons.push(reason),
       isSharingActive: () => true,
+      isCameraActive: () => false,
       peerFactory: () => {
         if (factoryCalls++ === 0) return connection;
         const replacement = new MockConnection();
@@ -2030,13 +2177,17 @@ test("desktop retires sharing at the recovery deadline without terminalizing sig
   assert.equal(connections[1]!.offerCalls, 1);
   assert.equal(scheduler.runNext(), NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(client.lifecycle, "IDLE");
+  assert.equal(client.lifecycle, "RECONNECTING");
   assert.equal(peerConnection.closed, true);
   assert.equal(connections[1]!.closed, true);
-  assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  assert.deepEqual(endedReasons, []);
   assert.ok(socket.sent.some((raw) => {
     const message = JSON.parse(raw) as Record<string, unknown>;
-    return message.type === "sharing_state" && message.screen === false && message.camera === false;
+    return message.type === "retire_session";
+  }));
+  assert.ok(socket.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "sharing_state" && message.screen === true && message.camera === false;
   }));
   assert.equal(terminalErrors.length, 0);
   assert.ok(diagnostics.some((diagnostic) =>
@@ -2046,10 +2197,134 @@ test("desktop retires sharing at the recovery deadline without terminalizing sig
   client.close();
 });
 
-test("recovery timeout stops approved tracks and reauthenticates in idle without recapturing", async () => {
+test("retirement accepts a fresh viewer join without a server departure and ignores old peer callbacks", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  const oldStateChange = original.onconnectionstatechange;
+  original.connectionState = "failed";
+  original.onconnectionstatechange?.();
+  for (let index = 0; index < 3; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(original.closed, true);
+  assert.ok(socket.sent.some((raw) => JSON.parse(raw).type === "retire_session"));
+  assert.equal(client.lifecycle, "RECONNECTING");
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      viewer_user_id: "viewer",
+    }),
+  });
+  for (let index = 0; index < 3; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.offerCalls, 1);
+  assert.equal(client.lifecycle, "NEGOTIATING");
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "stale-viewer",
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: "old-negotiation",
+      sdp: "stale-answer",
+    }),
+  });
+  oldStateChange?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.closed, false);
+  assert.equal(client.lifecycle, "NEGOTIATING");
+  client.close();
+});
+
+test("Stop during fresh attachment after retirement prevents tracks and offers", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const preparation = deferred<void>();
+  const screenTrack: WebRtcTrack & { stop(): void } = {
+    kind: "video",
+    readyState: "live",
+    stop() {},
+  };
+  const capture = { generation: 1, screen: screenTrack };
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => capture.screen?.readyState === "live",
+    getSharingGeneration: () => capture.generation,
+    prepareOwnerPeer: async (peer) => {
+      const generation = capture.generation;
+      await preparation.promise;
+      await attachApprovedTracks(peer, capture, generation);
+    },
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  original.connectionState = "failed";
+  original.onconnectionstatechange?.();
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      viewer_user_id: "viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+  const replacementStateChange = connections[1]!.onconnectionstatechange;
+
+  const tracks = invalidateCapture(capture);
+  stopCapturedTracks(tracks.screen, tracks.camera);
+  await client.stopSharingSession();
+  preparation.resolve();
+  for (let index = 0; index < 3; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(connections[1]!.closed, true);
+  assert.equal(connections[1]!.replaceCalls.length, 0);
+  assert.equal(connections[1]!.offerCalls, 0);
+  replacementStateChange?.();
+  assert.equal(client.lifecycle, "IDLE");
+  client.close();
+});
+
+test("recovery timeout retains approved tracks and reauthenticates with fresh sharing state", async () => {
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();
-  const cleanupActions: string[] = [];
   const screenTrack = {
     readyState: "live",
     stopped: false,
@@ -2061,24 +2336,16 @@ test("recovery timeout stops approved tracks and reauthenticates in idle without
     stop() { this.stopped = true; this.readyState = "ended"; },
   };
   let ownerPeerPreparations = 0;
-  let cleanupCompletion: Promise<boolean> | undefined;
+  const endedReasons: string[] = [];
   const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
     scheduler,
     connection,
     undefined,
     {
       isSharingActive: () => screenTrack.readyState === "live",
+      isCameraActive: () => cameraTrack.readyState === "live",
       prepareOwnerPeer: async () => { ownerPeerPreparations += 1; },
-      onOwnerSessionEnded: (reason) => {
-        assert.equal(reason, "recovery_timeout");
-        cleanupCompletion = stopOwnerCapture(
-          screenTrack,
-          cameraTrack,
-          async () => { cleanupActions.push("camera-intent-false"); },
-          async () => { cleanupActions.push("screen-active-false"); },
-          () => cleanupActions.push("cleanup-acknowledged"),
-        );
-      },
+      onOwnerSessionEnded: (reason) => endedReasons.push(reason),
     },
   );
   await client.setSharingState(true, true);
@@ -2087,20 +2354,13 @@ test("recovery timeout stops approved tracks and reauthenticates in idle without
   assert.equal(peerConnection.closed, false);
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(cleanupCompletion);
-  assert.equal(await cleanupCompletion, false);
 
   assert.equal(peerConnection.closed, true);
-  assert.equal(screenTrack.stopped, true);
-  assert.equal(cameraTrack.stopped, true);
-  assert.deepEqual(cleanupActions.sort(), [
-    "camera-intent-false",
-    "cleanup-acknowledged",
-    "screen-active-false",
-  ]);
-  assert.equal(client.lifecycle, "CLOSED");
+  assert.equal(screenTrack.stopped, false);
+  assert.equal(cameraTrack.stopped, false);
+  assert.equal(client.lifecycle, "RECONNECTING");
   assert.equal(client.failure, undefined);
-  assert.equal(sockets.length, 1);
+  assert.deepEqual(endedReasons, []);
 
   scheduler.runNext();
   await new Promise((resolve) => setImmediate(resolve));
@@ -2112,18 +2372,66 @@ test("recovery timeout stops approved tracks and reauthenticates in idle without
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(client.lifecycle, "IDLE");
+  assert.equal(client.lifecycle, "RECONNECTING");
   assert.equal(client.failure, undefined);
   assert.equal(ownerPeerPreparations, initialPreparations);
   assert.equal(sockets[1]!.sent.filter((raw) => {
     const message = JSON.parse(raw) as Record<string, unknown>;
-    return message.type === "sharing_state" && message.screen === false && message.camera === false;
+    return message.type === "sharing_state" && message.screen === true && message.camera === true;
   }).length, 1);
   assert.equal(sockets[1]!.sent.some((raw) => {
     const message = JSON.parse(raw) as Record<string, unknown>;
     return message.type === "offer";
   }), false);
   client.close();
+});
+
+test("recovery republishes only independently consented, live tracks without reacquiring", async () => {
+  const expireWithTracks = async (
+    screenInitiallyLive: boolean,
+    cameraInitiallyLive: boolean,
+    screenAfterRecovery: boolean,
+    cameraAfterRecovery: boolean,
+    expected: { screen: boolean; camera: boolean },
+  ): Promise<void> => {
+    const scheduler = new ManualScheduler();
+    const connection = new MockConnection();
+    let screenLive = screenInitiallyLive;
+    let cameraLive = cameraInitiallyLive;
+    let peerPreparations = 0;
+    const { client, socket } = await connectedDesktop(
+      scheduler,
+      connection,
+      undefined,
+      {
+        isSharingActive: () => screenLive,
+        isCameraActive: () => cameraLive,
+        prepareOwnerPeer: async () => { peerPreparations += 1; },
+      },
+    );
+    await client.setSharingState(true, true);
+    const initialPreparations = peerPreparations;
+    screenLive = screenAfterRecovery;
+    cameraLive = cameraAfterRecovery;
+    connection.connectionState = "failed";
+    connection.onconnectionstatechange?.();
+    scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.ok(socket.sent.some((raw) => {
+      const message = JSON.parse(raw) as Record<string, unknown>;
+      return message.type === "sharing_state" &&
+        message.screen === expected.screen &&
+        message.camera === expected.camera;
+    }));
+    assert.equal(peerPreparations, initialPreparations);
+    client.close();
+  };
+
+  await expireWithTracks(true, true, true, true, { screen: true, camera: true });
+  await expireWithTracks(true, true, true, false, { screen: true, camera: false });
+  await expireWithTracks(true, true, false, true, { screen: false, camera: false });
+  await expireWithTracks(true, true, false, false, { screen: false, camera: false });
 });
 
 test("explicit Stop Sharing clears pending recovery and ICE restart timers", async () => {
@@ -2686,6 +2994,75 @@ test("desktop remains terminal after authentication or policy close code 1008", 
   assert.equal(peerConnection.closed, true);
   assert.equal(scheduler.timers.size, 0);
   assert.equal(sockets.length, 1);
+  client.close();
+});
+
+test("device revocation rejection on reconnect stops both renderer capture tracks", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const stoppedTracks: string[] = [];
+  const cleanupOperations: string[] = [];
+  const messages: string[] = [];
+  let screenState = "live";
+  let cameraState = "live";
+  const capture = {
+    generation: 7,
+    screen: {
+      get readyState() { return screenState; },
+      stop() {
+        screenState = "ended";
+        stoppedTracks.push("screen");
+      },
+    },
+    camera: {
+      get readyState() { return cameraState; },
+      stop() {
+        cameraState = "ended";
+        stoppedTracks.push("camera");
+      },
+    },
+  };
+  let cleanup: Promise<boolean> | undefined;
+  const { client, socket, sockets } = await connectedDesktop(
+    scheduler,
+    connection,
+    (error) => {
+      handleTerminalCaptureFailure(capture, error, () => {
+        const tracks = invalidateCapture(capture);
+        cleanup = stopOwnerCapture(
+          tracks.screen,
+          tracks.camera,
+          async () => { cleanupOperations.push("camera"); },
+          async () => { cleanupOperations.push("screen"); },
+          () => {},
+        );
+      }, (message) => messages.push(message));
+    },
+    {
+      isSharingActive: () => screenState === "live",
+      isCameraActive: () => cameraState === "live",
+    },
+  );
+  await client.setSharingState(true, true);
+
+  socket.disconnect(1006);
+  assert.equal(screenState, "live");
+  assert.equal(cameraState, "live");
+  assert.equal(capture.generation, 7);
+  assert.equal(cleanup, undefined);
+  await client.start(true);
+  sockets[1]!.open();
+  sockets[1]!.disconnect(1008);
+
+  assert.equal(client.lifecycle, "FAILED");
+  assert.equal(connection.closed, true);
+  assert.equal(await cleanup, false);
+  assert.equal(capture.generation, 8);
+  assert.equal(capture.screen, undefined);
+  assert.equal(capture.camera, undefined);
+  assert.deepEqual(stoppedTracks, ["screen", "camera"]);
+  assert.deepEqual(cleanupOperations.sort(), ["camera", "screen"]);
+  assert.deepEqual(messages, []);
   client.close();
 });
 
@@ -3265,7 +3642,7 @@ test("fresh-peer recovery preserves the original deadline and times out without 
   assert.ok(!diagnostics.some((diagnostic) => diagnostic.event === "fresh_peer_fallback_completed"));
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  assert.deepEqual(endedReasons, []);
   assert.equal(connections[1]!.closed, true);
   client.close();
 });
@@ -3342,8 +3719,1192 @@ test("replacement peer failure preserves and honors the original recovery deadli
 
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  assert.deepEqual(endedReasons, []);
   client.close();
+});
+
+test("recovery timeout retires the captured session after closePeer(true)", async () => {
+  for (const socketAvailableAtTimeout of [true, false]) {
+    const scheduler = new ManualScheduler();
+    const original = new MockConnection();
+    const connections = [original];
+    let factoryCalls = 0;
+    const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+      isSharingActive: () => true,
+      peerFactory: () => {
+        if (factoryCalls++ === 0) return original;
+        const peer = new MockConnection();
+        connections.push(peer);
+        return peer;
+      },
+    });
+    const originalSessionId = "00000000-0000-0000-0000-000000000002";
+    await client.setSharingState(true, false);
+    original.connectionState = "disconnected";
+    original.onconnectionstatechange?.();
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "viewer_rejoined",
+        session_id: originalSessionId,
+        viewer_user_id: "viewer",
+      }),
+    });
+    for (let index = 0; index < 4; index += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(connections.length, 2);
+
+    // A failed replacement closes through the production closePeer(true) path.
+    connections[1]!.connectionState = "failed";
+    connections[1]!.onconnectionstatechange?.();
+    await new Promise((resolve) => setImmediate(resolve));
+    const internal = client as unknown as {
+      sessionId: string | undefined;
+      recoverySessionId: string | undefined;
+      retiredSessionIds: Set<string>;
+    };
+    assert.equal(connections[1]!.closed, true);
+    assert.equal(internal.sessionId, undefined);
+    assert.equal(internal.recoverySessionId, originalSessionId);
+    assert.ok([...scheduler.timers.values()].some(
+      (timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS,
+    ));
+
+    if (!socketAvailableAtTimeout) socket.disconnect();
+    scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(internal.recoverySessionId, undefined);
+    assert.equal(internal.retiredSessionIds.has(originalSessionId), true);
+    const retireMessages = socket.sent
+      .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+      .filter((message) => message.type === "retire_session");
+    if (socketAvailableAtTimeout) {
+      assert.deepEqual(retireMessages, [{
+        type: "retire_session",
+        session_id: originalSessionId,
+      }]);
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: "viewer_joined",
+          session_id: originalSessionId,
+          viewer_user_id: "stale-viewer",
+        }),
+      });
+      assert.equal(connections.length, 2);
+    } else {
+      assert.deepEqual(retireMessages, []);
+    }
+    client.close();
+  }
+});
+
+test("desktop recovery timeout flushes pending retirement after authentication and handles acknowledgments", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  let factoryCalls = 0;
+  const { client, socket, sockets } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  const timedOutSessionId = "00000000-0000-0000-0000-000000000002";
+
+  await client.setSharingState(true, false);
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_rejoined",
+      session_id: timedOutSessionId,
+      viewer_user_id: "viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  connections[1]!.connectionState = "failed";
+  connections[1]!.onconnectionstatechange?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.disconnect();
+  await client.start(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  const replacement = sockets[1]!;
+
+  const internal = client as unknown as {
+    sessionId: string | undefined;
+    recoverySessionId: string | undefined;
+    pendingSessionRetirements: Map<string, number>;
+    retiredSessionIds: Set<string>;
+  };
+  assert.equal(internal.recoverySessionId, timedOutSessionId);
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(internal.recoverySessionId, undefined);
+  assert.equal(internal.pendingSessionRetirements.has(timedOutSessionId), true);
+  assert.equal(internal.retiredSessionIds.has(timedOutSessionId), true);
+
+  replacement.open();
+  replacement.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    replacement.sent.some((raw) => {
+      const message = JSON.parse(raw) as Record<string, unknown>;
+      return message.type === "retire_session" && message.session_id === timedOutSessionId;
+    }),
+    true,
+  );
+
+  replacement.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: timedOutSessionId,
+      outcome: "retired",
+    }),
+  });
+  assert.equal(internal.pendingSessionRetirements.has(timedOutSessionId), false);
+  assert.equal(internal.retiredSessionIds.has(timedOutSessionId), true);
+
+  replacement.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: timedOutSessionId,
+      outcome: "not_found",
+    }),
+  });
+  assert.equal(internal.pendingSessionRetirements.has(timedOutSessionId), false);
+  assert.equal(original.closed, true);
+  client.close();
+});
+
+test("pending retirement capacity refuses new sessions without evicting unresolved entries", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket } = await connectedDesktop(scheduler, connection);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+      reason: "viewer_grace_expired",
+    }),
+  });
+  const internal = client as unknown as {
+    pendingSessionRetirements: Map<string, number>;
+  };
+  for (let index = 0; index < MAX_PENDING_SESSION_RETIREMENTS; index += 1) {
+    internal.pendingSessionRetirements.set(`pending-session-${index}`, index);
+  }
+  const retained = [...internal.pendingSessionRetirements.keys()];
+  const refusedSessionId = "00000000-0000-0000-0000-000000000099";
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: refusedSessionId,
+      viewer_user_id: "viewer",
+    }),
+  });
+
+  assert.equal(internal.pendingSessionRetirements.size, MAX_PENDING_SESSION_RETIREMENTS);
+  assert.deepEqual([...internal.pendingSessionRetirements.keys()], retained);
+  assert.equal(socket.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "retire_session" && message.session_id === refusedSessionId;
+  }), true);
+  client.close();
+});
+
+test("recovery timeout retains and directly retires the 65th unresolved session", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket, sockets } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => true,
+  });
+  const internal = client as unknown as {
+    pendingSessionRetirements: Map<string, number>;
+    overflowPendingRetirement: { sessionId: string; peerGeneration: number } | undefined;
+  };
+  for (let index = 0; index < MAX_PENDING_SESSION_RETIREMENTS; index += 1) {
+    internal.pendingSessionRetirements.set(`pending-session-${index}`, index);
+  }
+  const retained = [...internal.pendingSessionRetirements.entries()];
+  const timedOutSessionId = "00000000-0000-0000-0000-000000000002";
+
+  await client.setSharingState(true, false);
+  connection.connectionState = "disconnected";
+  connection.onconnectionstatechange?.();
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual([...internal.pendingSessionRetirements.entries()], retained);
+  assert.equal(internal.overflowPendingRetirement?.sessionId, timedOutSessionId);
+  assert.equal(socket.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "retire_session" && message.session_id === timedOutSessionId;
+  }), true);
+  client.close();
+});
+
+test("offline 65th retirement remains pending until signaling reauthenticates", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket, sockets } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => true,
+  });
+  const internal = client as unknown as {
+    pendingSessionRetirements: Map<string, number>;
+    overflowPendingRetirement: { sessionId: string; peerGeneration: number } | undefined;
+  };
+  for (let index = 0; index < MAX_PENDING_SESSION_RETIREMENTS; index += 1) {
+    internal.pendingSessionRetirements.set(`pending-session-${index}`, index);
+  }
+  const retained = [...internal.pendingSessionRetirements.entries()];
+  const timedOutSessionId = "00000000-0000-0000-0000-000000000002";
+  await client.setSharingState(true, false);
+  socket.disconnect();
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual([...internal.pendingSessionRetirements.entries()], retained);
+  assert.equal(internal.overflowPendingRetirement?.sessionId, timedOutSessionId);
+  assert.equal(socket.sent.some((raw) => JSON.parse(raw).type === "retire_session"), false);
+
+  await client.start(true);
+  const replacement = sockets[1]!;
+  replacement.open();
+  replacement.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(replacement.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "retire_session" && message.session_id === timedOutSessionId;
+  }), true);
+  client.close();
+});
+
+test("pending retirement retries after synchronous and asynchronous send failures without stopping capture", async () => {
+  for (const failureMode of ["synchronous", "asynchronous"] as const) {
+    const scheduler = new ManualScheduler();
+    const connection = new MockConnection();
+    let captureActive = true;
+    const { client, socket } = await connectedDesktop(scheduler, connection, undefined, {
+      isSharingActive: () => captureActive,
+    });
+    await client.setSharingState(true, false);
+    const originalSend = socket.send.bind(socket);
+    socket.send = (data, peerGeneration, isCurrent) => {
+      const message = JSON.parse(data) as Record<string, unknown>;
+      if (message.type === "retire_session") {
+        if (failureMode === "synchronous") throw new Error("temporary send failure");
+        return Promise.reject(new Error("temporary async send failure"));
+      }
+      return originalSend(data, peerGeneration, isCurrent);
+    };
+
+    connection.connectionState = "disconnected";
+    connection.onconnectionstatechange?.();
+    scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+    await new Promise((resolve) => setImmediate(resolve));
+    const internal = client as unknown as {
+      pendingSessionRetirements: Map<string, number>;
+      pendingRetirementRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    };
+    const sessionId = "00000000-0000-0000-0000-000000000002";
+    assert.equal(internal.pendingSessionRetirements.has(sessionId), true);
+    assert.notEqual(internal.pendingRetirementRetryTimer, undefined);
+    assert.equal(client.lifecycle, "RECONNECTING");
+    assert.equal(captureActive, true);
+
+    socket.send = originalSend;
+    scheduler.runDelay(5_000);
+    assert.ok(socket.sent.some((raw) => {
+      const message = JSON.parse(raw) as Record<string, unknown>;
+      return message.type === "retire_session" && message.session_id === sessionId;
+    }));
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "session_retired",
+        session_id: sessionId,
+        outcome: "retired",
+      }),
+    });
+    assert.equal(internal.pendingSessionRetirements.has(sessionId), false);
+    assert.equal(internal.pendingRetirementRetryTimer, undefined);
+    assert.equal(captureActive, true);
+    client.close();
+  }
+});
+
+test("asynchronous old-session revocation acknowledgment failure preserves newer capture", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const sessionA = "00000000-0000-0000-0000-000000000002";
+  const sessionB = "00000000-0000-0000-0000-000000000003";
+  let captureActive = true;
+  const replacementConnection = new MockConnection();
+  let peerCalls = 0;
+  const { client, socket, sockets } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => captureActive,
+    peerFactory: () => peerCalls++ === 0 ? connection : replacementConnection,
+  });
+  await client.setSharingState(true, false);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: sessionA,
+      viewer_user_id: "old-viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  connection.connectionState = "disconnected";
+  connection.onconnectionstatechange?.();
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: sessionB,
+      viewer_user_id: "new-viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const internal = client as unknown as {
+    sessionId: string | undefined;
+    approvedCaptureSessionId: string | undefined;
+    pendingSessionRetirements: Map<string, number>;
+  };
+  assert.equal(internal.sessionId, sessionB);
+  assert.equal(internal.approvedCaptureSessionId, sessionB);
+  assert.equal(internal.pendingSessionRetirements.has(sessionA), true);
+
+  const originalSend = socket.send.bind(socket);
+  socket.send = (data, peerGeneration, isCurrent) => {
+    const message = JSON.parse(data) as Record<string, unknown>;
+    if (message.type === "retire_session_ack") {
+      return Promise.reject(new Error("temporary acknowledgment failure"));
+    }
+    return originalSend(data, peerGeneration, isCurrent);
+  };
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: sessionA,
+      viewer_user_id: "viewer",
+      reason: "authorization_revoked",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(client.lifecycle, "NEGOTIATING");
+  assert.equal(internal.sessionId, sessionB);
+  assert.equal(internal.approvedCaptureSessionId, sessionB);
+  assert.equal(internal.pendingSessionRetirements.has(sessionA), false);
+  assert.equal(captureActive, true);
+
+  socket.disconnect();
+  await client.start(true);
+  const retrySocket = sockets[1]!;
+  retrySocket.open();
+  retrySocket.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  retrySocket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: sessionA,
+      outcome: "authorization_revoked",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(retrySocket.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "retire_session_ack" &&
+      message.session_id === sessionA &&
+      message.outcome === "authorization_revoked";
+  }));
+  assert.equal(internal.sessionId, sessionB);
+  assert.equal(internal.approvedCaptureSessionId, sessionB);
+  assert.equal(captureActive, true);
+  client.close();
+});
+
+test("desktop authorization revocation reaches lifecycle after recovery timeout retires the session", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const endedReasons: string[] = [];
+  const stoppedTracks: string[] = [];
+  let rendererCleanup: Promise<boolean> | undefined;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    onOwnerSessionEnded: (reason) => {
+      endedReasons.push(reason);
+      if (reason === "authorization_revoked") {
+        rendererCleanup = stopOwnerCapture(
+          { stop: () => stoppedTracks.push("screen") },
+          { stop: () => stoppedTracks.push("camera") },
+          async () => {},
+          async () => {},
+          () => {},
+        );
+      }
+    },
+  });
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+
+  await client.setSharingState(true, false);
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: sessionId,
+      viewer_user_id: "viewer",
+      reason: "authorization_revoked",
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: sessionId,
+      viewer_user_id: "viewer",
+      reason: "authorization_revoked",
+    }),
+  });
+  assert.deepEqual(endedReasons, ["authorization_revoked"]);
+  assert.equal(socket.sent.filter((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "retire_session_ack" && message.session_id === sessionId;
+  }).length, 2);
+  assert.equal(
+    socket.sent.some((raw) => {
+      const message = JSON.parse(raw) as Record<string, unknown>;
+      return message.type === "retire_session_ack" &&
+        message.session_id === sessionId &&
+        message.outcome === "authorization_revoked";
+    }),
+    true,
+  );
+  assert.equal(await rendererCleanup, false);
+  assert.deepEqual(stoppedTracks, ["screen", "camera"]);
+  client.close();
+});
+
+test("viewer grace expiry preserves live capture identity until revocation invalidates it", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+  const stoppedTracks: string[] = [];
+  let screenState = "live";
+  let cameraState = "live";
+  const screenTrack = {
+    get readyState() { return screenState; },
+    stop() {
+      screenState = "ended";
+      stoppedTracks.push("screen");
+    },
+  };
+  const cameraTrack = {
+    get readyState() { return cameraState; },
+    stop() {
+      cameraState = "ended";
+      stoppedTracks.push("camera");
+    },
+  };
+  const capture = { generation: 4, screen: screenTrack, camera: cameraTrack };
+  const endedReasons: string[] = [];
+  let rendererCleanup: Promise<boolean> | undefined;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => screenState === "live",
+    isCameraActive: () => cameraState === "live",
+    onOwnerSessionEnded: (reason) => {
+      endedReasons.push(reason);
+      if (reason !== "authorization_revoked") return;
+      const tracks = invalidateCapture(capture);
+      rendererCleanup = stopOwnerCapture(
+        tracks.screen,
+        tracks.camera,
+        async () => {},
+        async () => {},
+        () => {},
+      );
+    },
+  });
+  await client.setSharingState(true, true);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: sessionId,
+      viewer_user_id: "viewer",
+      reason: "viewer_grace_expired",
+    }),
+  });
+  assert.equal(original.closed, true);
+  assert.equal(screenState, "live");
+  assert.equal(cameraState, "live");
+  assert.equal(capture.generation, 4);
+  assert.deepEqual(endedReasons, []);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "retired",
+    }),
+  });
+  assert.equal(screenState, "live");
+  assert.equal(cameraState, "live");
+  assert.deepEqual(endedReasons, []);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "authorization_revoked",
+    }),
+  });
+  assert.deepEqual(endedReasons, ["authorization_revoked"]);
+  assert.equal(capture.generation, 5);
+  assert.equal(capture.screen, undefined);
+  assert.equal(capture.camera, undefined);
+  assert.equal(await rendererCleanup, false);
+  assert.equal(screenState, "ended");
+  assert.equal(cameraState, "ended");
+  assert.deepEqual(stoppedTracks, ["screen", "camera"]);
+  assert.ok(socket.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "retire_session_ack" &&
+      message.session_id === sessionId &&
+      message.outcome === "authorization_revoked";
+  }));
+  client.close();
+});
+
+test("a retired session revocation cannot stop a newer approved capture", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const connections = [original];
+  const oldSessionId = "00000000-0000-0000-0000-000000000002";
+  const newSessionId = "00000000-0000-0000-0000-000000000003";
+  let screenActive = true;
+  const endedReasons: string[] = [];
+  let factoryCalls = 0;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => screenActive,
+    onOwnerSessionEnded: (reason) => {
+      endedReasons.push(reason);
+      screenActive = false;
+    },
+    peerFactory: () => {
+      if (factoryCalls++ === 0) return original;
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+  });
+  await client.setSharingState(true, false);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: oldSessionId,
+      viewer_user_id: "viewer",
+      reason: "viewer_grace_expired",
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_joined",
+      session_id: newSessionId,
+      viewer_user_id: "new-viewer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: oldSessionId,
+      outcome: "authorization_revoked",
+    }),
+  });
+  assert.deepEqual(endedReasons, []);
+  assert.equal(screenActive, true);
+  assert.equal(client.lifecycle, "NEGOTIATING");
+  assert.ok(socket.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "retire_session_ack" &&
+      message.session_id === oldSessionId &&
+      message.outcome === "authorization_revoked";
+  }));
+  client.close();
+});
+
+test("pending old-session revocation only cleans up its own capture association", async () => {
+  for (const oldNotification of ["viewer_left", "session_retired"] as const) {
+    const scheduler = new ManualScheduler();
+    const original = new MockConnection();
+    const connections = [original];
+    const sessionA = "00000000-0000-0000-0000-000000000002";
+    const sessionB = "00000000-0000-0000-0000-000000000003";
+    let screenState = "live";
+    let cameraState = "live";
+    const stoppedTracks: string[] = [];
+    const capture = {
+      generation: 1,
+      screen: {
+        get readyState() { return screenState; },
+        stop() {
+          screenState = "ended";
+          stoppedTracks.push("screen");
+        },
+      },
+      camera: {
+        get readyState() { return cameraState; },
+        stop() {
+          cameraState = "ended";
+          stoppedTracks.push("camera");
+        },
+      },
+    };
+    const endedReasons: string[] = [];
+    let rendererCleanup: Promise<boolean> | undefined;
+    let factoryCalls = 0;
+    const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+      isSharingActive: () => screenState === "live",
+      isCameraActive: () => cameraState === "live",
+      onOwnerSessionEnded: (reason) => {
+        endedReasons.push(reason);
+        if (reason !== "authorization_revoked") return;
+        const tracks = invalidateCapture(capture);
+        rendererCleanup = stopOwnerCapture(
+          tracks.screen,
+          tracks.camera,
+          async () => {},
+          async () => {},
+          () => {},
+        );
+      },
+      peerFactory: () => {
+        if (factoryCalls++ === 0) return original;
+        const peer = new MockConnection();
+        connections.push(peer);
+        return peer;
+      },
+    });
+    await client.setSharingState(true, true);
+
+    original.connectionState = "disconnected";
+    original.onconnectionstatechange?.();
+    scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const internal = client as unknown as {
+      sessionId: string | undefined;
+      approvedCaptureSessionId: string | undefined;
+      pendingSessionRetirements: Map<string, number>;
+      pendingRetirementRetryTimer: ReturnType<typeof setTimeout> | undefined;
+      retiredSessionIds: Set<string>;
+      handledRevocationSessionIds: Set<string>;
+    };
+    assert.equal(internal.pendingSessionRetirements.has(sessionA), true);
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "viewer_joined",
+        session_id: sessionB,
+        viewer_user_id: "new-viewer",
+      }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(connections.length, 2);
+    assert.equal(internal.sessionId, sessionB);
+    assert.equal(internal.approvedCaptureSessionId, sessionB);
+
+    const sendRevocation = (sessionId: string, type: "viewer_left" | "session_retired") => {
+      socket.onmessage?.({
+        data: JSON.stringify(type === "viewer_left" ? {
+          type,
+          session_id: sessionId,
+          viewer_user_id: "viewer",
+          reason: "authorization_revoked",
+        } : {
+          type,
+          session_id: sessionId,
+          outcome: "authorization_revoked",
+        }),
+      });
+    };
+    sendRevocation(sessionA, oldNotification);
+    assert.equal(internal.pendingSessionRetirements.has(sessionA), false);
+    assert.equal(internal.retiredSessionIds.has(sessionA), true);
+    assert.equal(internal.handledRevocationSessionIds.has(sessionA), true);
+    assert.equal(internal.pendingRetirementRetryTimer, undefined);
+    assert.equal(internal.sessionId, sessionB);
+    assert.equal(internal.approvedCaptureSessionId, sessionB);
+    assert.deepEqual(endedReasons, []);
+    assert.equal(screenState, "live");
+    assert.equal(cameraState, "live");
+    assert.equal(capture.generation, 1);
+    assert.deepEqual(stoppedTracks, []);
+    assert.ok(socket.sent.some((raw) => {
+      const message = JSON.parse(raw) as Record<string, unknown>;
+      return message.type === "retire_session_ack" &&
+        message.session_id === sessionA &&
+        message.outcome === "authorization_revoked";
+    }));
+
+    sendRevocation(sessionB, oldNotification === "viewer_left" ? "session_retired" : "viewer_left");
+    assert.deepEqual(endedReasons, ["authorization_revoked"]);
+    assert.equal(await rendererCleanup, false);
+    assert.equal(capture.generation, 2);
+    assert.equal(screenState, "ended");
+    assert.equal(cameraState, "ended");
+    assert.deepEqual(stoppedTracks, ["screen", "camera"]);
+    client.close();
+  }
+});
+
+test("authentication reconciliation clears retired capture identity before a new capture starts", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const sessionA = "00000000-0000-0000-0000-000000000002";
+  let screenState = "live";
+  let cameraState = "live";
+  const stoppedTracks: string[] = [];
+  const screenTrack = {
+    get readyState() { return screenState; },
+    stop() {
+      screenState = "ended";
+      stoppedTracks.push("screen");
+    },
+  };
+  const cameraTrack = {
+    get readyState() { return cameraState; },
+    stop() {
+      cameraState = "ended";
+      stoppedTracks.push("camera");
+    },
+  };
+  const capture = { generation: 1, screen: screenTrack, camera: cameraTrack };
+  const endedReasons: string[] = [];
+  const { client, socket, sockets } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => screenState === "live",
+    isCameraActive: () => cameraState === "live",
+    onOwnerSessionEnded: (reason) => {
+      endedReasons.push(reason);
+      if (reason !== "authorization_revoked") return;
+      const tracks = invalidateCapture(capture);
+      void stopOwnerCapture(
+        tracks.screen,
+        tracks.camera,
+        async () => {},
+        async () => {},
+        () => {},
+      );
+    },
+  });
+  await client.setSharingState(true, true);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: sessionA,
+      viewer_user_id: "viewer",
+      reason: "viewer_grace_expired",
+    }),
+  });
+  assert.equal((client as unknown as { approvedCaptureSessionId?: string })
+    .approvedCaptureSessionId, sessionA);
+
+  screenState = "ended";
+  cameraState = "ended";
+  socket.disconnect(1006);
+  await client.start(true);
+  const reconnectedSocket = sockets[1]!;
+  reconnectedSocket.open();
+  reconnectedSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "authenticated",
+      role: "owner",
+      device_id: "device",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((client as unknown as { sharingState: { screen: boolean } })
+    .sharingState.screen, false);
+  assert.equal((client as unknown as { approvedCaptureSessionId?: string })
+    .approvedCaptureSessionId, undefined);
+
+  screenState = "live";
+  cameraState = "live";
+  capture.generation += 1;
+  capture.screen = {
+    get readyState() { return screenState; },
+    stop() {
+      screenState = "ended";
+      stoppedTracks.push("screen-b");
+    },
+  };
+  capture.camera = {
+    get readyState() { return cameraState; },
+    stop() {
+      cameraState = "ended";
+      stoppedTracks.push("camera-b");
+    },
+  };
+  await client.setSharingState(true, true);
+  assert.equal((client as unknown as { sharingState: { screen: boolean } })
+    .sharingState.screen, true);
+
+  reconnectedSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: sessionA,
+      outcome: "authorization_revoked",
+    }),
+  });
+
+  assert.deepEqual(endedReasons, []);
+  assert.equal(screenState, "live");
+  assert.equal(cameraState, "live");
+  assert.deepEqual(stoppedTracks, []);
+  assert.equal(capture.generation, 2);
+  assert.ok(reconnectedSocket.sent.some((raw) => {
+    const message = JSON.parse(raw) as Record<string, unknown>;
+    return message.type === "retire_session_ack" &&
+      message.session_id === sessionA &&
+      message.outcome === "authorization_revoked";
+  }));
+  client.close();
+});
+
+test("explicit stop and screen-track termination clear retired capture associations", async () => {
+  for (const stopCause of ["explicit_stop", "screen_track_ended"] as const) {
+    const scheduler = new ManualScheduler();
+    const original = new MockConnection();
+    const sessionId = "00000000-0000-0000-0000-000000000002";
+    let screenState = "live";
+    let cameraState = "live";
+    const screenTrack = {
+      get readyState() { return screenState; },
+      stop() { screenState = "ended"; },
+    };
+    const cameraTrack = {
+      get readyState() { return cameraState; },
+      stop() { cameraState = "ended"; },
+    };
+    const capture = { generation: 1, screen: screenTrack, camera: cameraTrack };
+    const endedReasons: string[] = [];
+    const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+      isSharingActive: () => screenState === "live",
+      isCameraActive: () => cameraState === "live",
+      onOwnerSessionEnded: (reason) => endedReasons.push(reason),
+    });
+    await client.setSharingState(true, true);
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "viewer_left",
+        session_id: sessionId,
+        viewer_user_id: "viewer",
+        reason: "viewer_grace_expired",
+      }),
+    });
+
+    if (stopCause === "screen_track_ended") screenState = "ended";
+    const tracks = invalidateCapture(capture);
+    await stopOwnerCapture(
+      tracks.screen,
+      tracks.camera,
+      async () => {},
+      async () => {},
+      () => {},
+    );
+    await client.stopSharingSession();
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "session_retired",
+        session_id: sessionId,
+        outcome: "authorization_revoked",
+      }),
+    });
+    assert.equal(capture.generation, 2, stopCause);
+    assert.equal(capture.screen, undefined, stopCause);
+    assert.equal(capture.camera, undefined, stopCause);
+    assert.equal(screenState, "ended", stopCause);
+    assert.equal(cameraState, "ended", stopCause);
+    assert.deepEqual(endedReasons, [], stopCause);
+    client.close();
+  }
+});
+
+test("revocation after ordinary retirement still stops the approved capture", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const endedReasons: string[] = [];
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+    onOwnerSessionEnded: (reason) => endedReasons.push(reason),
+  });
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+  await client.setSharingState(true, false);
+
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "retired",
+    }),
+  });
+  assert.equal(endedReasons.length, 0);
+  assert.equal(
+    (client as unknown as { pendingSessionRetirements: Map<string, number> })
+      .pendingSessionRetirements.has(sessionId),
+    false,
+  );
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "authorization_revoked",
+    }),
+  });
+  assert.deepEqual(endedReasons, ["authorization_revoked"]);
+  client.close();
+});
+
+test("desktop terminal failure cancels pending retirement retries", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+  });
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const internal = client as unknown as {
+    pendingSessionRetirements: Map<string, number>;
+    pendingRetirementRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  };
+  assert.equal(internal.pendingSessionRetirements.size > 0, true);
+
+  socket.onmessage?.({ data: JSON.stringify({ type: "error", code: "NOT_AUTHORIZED" }) });
+  assert.equal(internal.pendingSessionRetirements.size, 0);
+  assert.equal(internal.pendingRetirementRetryTimer, undefined);
+  assert.equal([...scheduler.timers.values()].some((timer) => timer.delay === 5000), false);
+  client.close();
+});
+
+test("desktop pending retirement ignores a newer session and Stop clears pending state", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => true,
+  });
+  const oldSessionId = "00000000-0000-0000-0000-000000000002";
+  const newerSessionId = "00000000-0000-0000-0000-000000000003";
+
+  original.connectionState = "disconnected";
+  original.onconnectionstatechange?.();
+  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const internal = client as unknown as {
+    sessionId: string | undefined;
+    pendingSessionRetirements: Map<string, number>;
+  };
+  assert.equal(internal.pendingSessionRetirements.has(oldSessionId), true);
+  assert.equal(internal.pendingSessionRetirements.has(newerSessionId), false);
+  await client.stopSharingSession();
+  assert.equal(internal.pendingSessionRetirements.size, 0);
+  client.close();
+});
+
+test("ordinary not-found retirement preserves approved desktop capture", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const endedReasons: string[] = [];
+  let captureActive = true;
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    isSharingActive: () => captureActive,
+    onOwnerSessionEnded: (reason) => endedReasons.push(reason),
+  });
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "not_found",
+    }),
+  });
+  assert.equal(captureActive, true);
+  assert.deepEqual(endedReasons, []);
+  client.close();
+});
+
+test("desktop completed session and revocation history stays bounded", async () => {
+  const scheduler = new ManualScheduler();
+  const original = new MockConnection();
+  const endedReasons: string[] = [];
+  const { client, socket } = await connectedDesktop(scheduler, original, undefined, {
+    onOwnerSessionEnded: (reason) => endedReasons.push(reason),
+  });
+  const internal = client as unknown as {
+    retiredSessionIds: Set<string>;
+    handledRevocationSessionIds: Set<string>;
+  };
+  for (let index = 10; index < 90; index += 1) {
+    const sessionId = `00000000-0000-0000-0000-${index.toString().padStart(12, "0")}`;
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "session_retired",
+        session_id: sessionId,
+        outcome: "authorization_revoked",
+      }),
+    });
+  }
+  assert.equal(internal.retiredSessionIds.size, 64);
+  assert.equal(internal.handledRevocationSessionIds.size, 64);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_retired",
+      session_id: "00000000-0000-0000-0000-000000000010",
+      outcome: "authorization_revoked",
+    }),
+  });
+  assert.deepEqual(endedReasons, []);
+  client.close();
+});
+
+test("viewer rejects delayed session replies after completed history is cleaned up", async () => {
+  const scheduler = new ManualScheduler();
+  const socket = new MockSocket();
+  const connections: MockConnection[] = [];
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => socket,
+    peerFactory: () => {
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId,
+    reconnect: { scheduler },
+  });
+  viewer.start();
+  socket.open();
+  socket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  const createRequest = socket.sent
+    .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .find((message) => message.type === "create_session");
+  assert.equal(typeof createRequest?.request_id, "string");
+  const requestId = createRequest!.request_id as string;
+  const oldSessionId = "00000000-0000-0000-0000-000000000002";
+  const freshSessionId = "00000000-0000-0000-0000-000000000003";
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: oldSessionId,
+      device_id: deviceId,
+    }),
+  });
+  assert.equal(connections.length, 0);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: oldSessionId,
+      device_id: deviceId,
+      request_id: "stale-request-id",
+    }),
+  });
+  assert.equal(connections.length, 0);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: freshSessionId,
+      device_id: deviceId,
+      request_id: requestId,
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: freshSessionId,
+      negotiation_id: "fresh-negotiation",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 1);
+  assert.equal(connections[0]?.answerCalls, 1);
+  connections[0]!.connectionState = "connected";
+  connections[0]!.onconnectionstatechange?.();
+  assert.equal(viewer.lifecycle, "CONNECTED");
+
+  const internal = viewer as unknown as {
+    retireSession(sessionId: string): void;
+    retiredSessionIds: Set<string>;
+    sessionId: string | undefined;
+  };
+  internal.retireSession(oldSessionId);
+  for (let index = 4; index < 84; index += 1) {
+    internal.retireSession(
+      `00000000-0000-0000-0000-${index.toString().padStart(12, "0")}`,
+    );
+  }
+  assert.equal(internal.retiredSessionIds.size, 64);
+  assert.equal(internal.retiredSessionIds.has(oldSessionId), false);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_attached",
+      session_id: oldSessionId,
+      device_id: deviceId,
+      screen: true,
+      camera: true,
+      request_id: requestId,
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: oldSessionId,
+      negotiation_id: "stale-negotiation",
+      sdp: "stale-offer",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  assert.equal(internal.sessionId, freshSessionId);
+  assert.equal(connections.length, 1);
+  assert.equal(connections[0]!.closed, false);
+  assert.equal(viewer.lifecycle, "CONNECTED");
+  viewer.close();
 });
 
 test("a new viewer session supersedes peerless recovery after replacement failure", async () => {
@@ -3452,7 +5013,7 @@ test("replacement connected and failed before signaling authentication stays und
   assert.deepEqual(endedReasons, []);
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(endedReasons, ["recovery_timeout"]);
+  assert.deepEqual(endedReasons, []);
   client.close();
 });
 
@@ -3700,7 +5261,7 @@ test("owner replaces the peer with the existing screen and camera tracks after r
         reason: "closed",
       }),
     });
-    assert.equal(previousPeer.closed, true);
+    assert.equal(previousPeer.closed, true, `viewer left did not close peer at index ${index}`);
 
     socket.onmessage?.({
       data: JSON.stringify({
@@ -3760,6 +5321,7 @@ test("viewer reconnect reattaches to the existing session without creating anoth
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(sockets[0]!),
     }),
   });
   await new Promise((resolve) => setImmediate(resolve));
@@ -3835,10 +5397,30 @@ test("fresh viewer attaches to an existing session before immediate offer and IC
   sockets[0]!.open();
   sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(JSON.parse(sockets[0]!.sent.at(-1)!), {
+  const createRequest = JSON.parse(sockets[0]!.sent.at(-1)!) as Record<string, unknown>;
+  assert.deepEqual({
+    type: createRequest.type,
+    device_id: createRequest.device_id,
+  }, {
     type: "create_session",
     device_id: deviceId,
   });
+  assert.equal(typeof createRequest.request_id, "string");
+  const requestId = createRequest.request_id as string;
+  for (const response of [
+    { type: "session_attached", session_id: sessionId, device_id: deviceId, screen: true, camera: true },
+    {
+      type: "session_attached",
+      session_id: sessionId,
+      device_id: deviceId,
+      screen: true,
+      camera: true,
+      request_id: "stale-request-id",
+    },
+  ]) {
+    sockets[0]!.onmessage?.({ data: JSON.stringify(response) });
+    assert.equal(connections.length, 0);
+  }
   sockets[0]!.onmessage?.({
     data: JSON.stringify({
       type: "session_attached",
@@ -3846,6 +5428,7 @@ test("fresh viewer attaches to an existing session before immediate offer and IC
       device_id: deviceId,
       screen: true,
       camera: true,
+      request_id: requestId,
     }),
   });
   assert.equal(connections.length, 1);
@@ -3904,6 +5487,7 @@ test("recoverable attachment waits beyond initial negotiation deadline and resum
       screen: true,
       camera: true,
       owner_recovery_remaining_ms: 90_000,
+      request_id: createSessionRequestId(socket),
     }),
   });
   assert.equal(viewer.lifecycle, "RECONNECTING");
@@ -3970,6 +5554,7 @@ test("recoverable attachment retires its peer when owner recovery grace expires 
       screen: true,
       camera: false,
       owner_recovery_remaining_ms: 45_000,
+      request_id: createSessionRequestId(socket),
     }),
   });
   assert.equal(viewer.lifecycle, "RECONNECTING");
@@ -4003,6 +5588,7 @@ test("recoverable attachment retires its peer when owner recovery grace expires 
       type: "session_created",
       session_id: "00000000-0000-0000-0000-000000000003",
       device_id: deviceId,
+      request_id: createSessionRequestId(socket),
     }),
   });
   assert.equal(connections.length, 2);
@@ -4027,7 +5613,7 @@ test("recoverable attachment retires its peer when owner recovery grace expires 
   viewer.close();
 });
 
-test("viewer recovery deadline expiry produces a terminal failure", async () => {
+test("viewer recovery deadline expiry remains reconnectable", async () => {
   const scheduler = new ManualScheduler();
   const { viewer, socket, connections, sessionId } = await createConnectedViewer(scheduler);
   const original = connections[0]!;
@@ -4037,8 +5623,8 @@ test("viewer recovery deadline expiry produces a terminal failure", async () => 
   assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === NETWORK_RECOVERY_TIMEOUT_MS));
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
 
-  assert.equal(viewer.lifecycle, "FAILED");
-  assert.match(String(viewer.failure), /network recovery timed out/);
+  assert.equal(viewer.lifecycle, "RECONNECTING");
+  assert.equal(viewer.failure, undefined);
   assert.equal(original.closed, true);
   assert.equal(socket.readyState, 3);
   socket.onmessage?.({
@@ -4051,6 +5637,335 @@ test("viewer recovery deadline expiry produces a terminal failure", async () => 
     }),
   });
   assert.equal(connections.length, 1);
+});
+
+test("viewer recovery timeout retires the captured session and ignores it on the new socket", async () => {
+  const scheduler = new ManualScheduler();
+  const sockets: MockSocket[] = [];
+  const connections: MockConnection[] = [];
+  const diagnostics: Array<WebRtcDiagnostic | RecoveryDiagnostic | ClientSignalingDiagnostic> = [];
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+  const newerSessionId = "00000000-0000-0000-0000-000000000003";
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    peerFactory: () => {
+      const connection = new MockConnection();
+      connections.push(connection);
+      return connection;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId,
+    reconnect: { scheduler },
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+  });
+  viewer.start();
+  sockets[0]!.open();
+  sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[0]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: sessionId,
+      device_id: deviceId,
+      request_id: createSessionRequestId(sockets[0]!),
+    }),
+  });
+  sockets[0]!.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "negotiation-1",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  connections[0]!.connectionState = "connected";
+  connections[0]!.onconnectionstatechange?.();
+
+  connections[0]!.connectionState = "disconnected";
+  connections[0]!.onconnectionstatechange?.();
+  const internal = viewer as unknown as {
+    closePeer(preserveRecovery?: boolean): void;
+    sessionId: string | undefined;
+    recoverySessionId: string | undefined;
+    retiredSessionIds: Set<string>;
+  };
+  internal.closePeer(true);
+  assert.equal(internal.sessionId, undefined);
+  assert.equal(internal.recoverySessionId, sessionId);
+
+  // A distinct current ID must not replace the identity captured for this recovery cycle.
+  internal.sessionId = newerSessionId;
+  scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
+  assert.equal(internal.recoverySessionId, undefined);
+  assert.equal(internal.retiredSessionIds.has(sessionId), true);
+  assert.equal(internal.retiredSessionIds.has(newerSessionId), false);
+  assert.equal(connections[0]!.closed, true);
+  assert.equal(viewer.lifecycle, "RECONNECTING");
+  assert.equal(sockets[0]!.readyState, 3);
+  assert.equal(
+    sockets.some((socket) => socket.sent.some((raw) => JSON.parse(raw).type === "retire_session")),
+    false,
+  );
+
+  scheduler.runNext();
+  assert.equal(sockets.length, 2);
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sockets[1]!.readyState, 1);
+  assert.ok(sockets[1]!.sent.some((raw) => JSON.parse(raw).type === "create_session"));
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "stale-negotiation",
+      sdp: "stale-offer",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  assert.equal(connections.length, 1);
+  assert.equal(viewer.failure, undefined);
+  assert.equal(viewer.lifecycle, "CONNECTING");
+  assert.ok(diagnostics.some((diagnostic) =>
+    "phase" in diagnostic &&
+    diagnostic.phase === "stale_session_signaling_ignored" &&
+    diagnostic.sessionId === sessionId));
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_attached",
+      session_id: sessionId,
+      device_id: deviceId,
+      screen: true,
+      camera: false,
+      request_id: createSessionRequestId(sockets[1]!),
+    }),
+  });
+  assert.equal(connections.length, 1);
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: sessionId,
+      device_id: deviceId,
+      request_id: createSessionRequestId(sockets[1]!),
+    }),
+  });
+  assert.equal(connections.length, 1);
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({ type: "session_recovery", session_id: sessionId }),
+  });
+  assert.equal(viewer.lifecycle, "CONNECTING");
+
+  for (const reason of ["temporary_disconnect", "authorization_revoked", "closed"]) {
+    sockets[1]!.onmessage?.({
+      data: JSON.stringify({
+        type: "viewer_left",
+        session_id: sessionId,
+        viewer_user_id: "viewer",
+        reason,
+      }),
+    });
+  }
+  assert.equal(viewer.lifecycle, "CONNECTING");
+  assert.equal(viewer.failure, undefined);
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "share_request",
+      session_id: sessionId,
+      request_id: "share-request-1",
+      kind: "camera",
+      viewer_user_id: "viewer",
+    }),
+  });
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_resumed",
+      session_id: sessionId,
+      epoch: 1,
+    }),
+  });
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: sessionId,
+      negotiation_id: "stale-negotiation",
+      sdp: "stale-answer",
+    }),
+  });
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "ice_candidate",
+      session_id: sessionId,
+      negotiation_id: "stale-negotiation",
+      candidate: { candidate: "candidate:stale" },
+    }),
+  });
+  assert.equal(connections.length, 1);
+  assert.equal(viewer.failure, undefined);
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: newerSessionId,
+      device_id: deviceId,
+      request_id: createSessionRequestId(sockets[1]!),
+    }),
+  });
+  assert.equal(connections.length, 2);
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_attached",
+      session_id: sessionId,
+      device_id: deviceId,
+      screen: true,
+      camera: false,
+      request_id: createSessionRequestId(sockets[1]!),
+    }),
+  });
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]!.closed, false);
+  viewer.close();
+});
+
+test("viewer processes authorization revocation after owner recovery expires on an open socket", async () => {
+  const scheduler = new ManualScheduler();
+  const socket = new MockSocket();
+  const connections: MockConnection[] = [];
+  const endedReasons: string[] = [];
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => socket,
+    peerFactory: () => {
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId,
+    reconnect: { scheduler },
+    onSessionEnded: (reason) => endedReasons.push(reason),
+  });
+  viewer.start();
+  socket.open();
+  socket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_attached",
+      session_id: sessionId,
+      device_id: deviceId,
+      screen: true,
+      camera: true,
+      owner_recovery_remaining_ms: 45_000,
+      request_id: createSessionRequestId(socket),
+    }),
+  });
+  assert.equal(viewer.lifecycle, "RECONNECTING");
+  scheduler.runDelay(45_000);
+  assert.equal(socket.readyState, 1);
+  assert.equal(viewer.lifecycle, "RECONNECTING");
+  assert.equal(connections[0]?.closed, true);
+  assert.equal(endedReasons[0], "recovery_timeout");
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: sessionId,
+      viewer_user_id: "viewer",
+      reason: "authorization_revoked",
+    }),
+  });
+
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.equal(viewer.failure, undefined);
+  assert.deepEqual(endedReasons, ["recovery_timeout", "authorization_revoked"]);
+  assert.equal(scheduler.timers.size, 0);
+  viewer.close();
+});
+
+test("revocation for a timed-out retired session cannot terminate a newer viewer session", async () => {
+  const scheduler = new ManualScheduler();
+  const socket = new MockSocket();
+  const connections: MockConnection[] = [];
+  const sessionA = "00000000-0000-0000-0000-000000000002";
+  const sessionB = "00000000-0000-0000-0000-000000000003";
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => socket,
+    peerFactory: () => {
+      const peer = new MockConnection();
+      connections.push(peer);
+      return peer;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId,
+    reconnect: { scheduler },
+  });
+  viewer.start();
+  socket.open();
+  socket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_attached",
+      session_id: sessionA,
+      device_id: deviceId,
+      screen: true,
+      camera: false,
+      owner_recovery_remaining_ms: 45_000,
+      request_id: createSessionRequestId(socket),
+    }),
+  });
+  scheduler.runDelay(45_000);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "device_sharing_state",
+      device_id: deviceId,
+      screen: true,
+      camera: false,
+    }),
+  });
+  const requestId = createSessionRequestId(socket);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: sessionB,
+      device_id: deviceId,
+      request_id: requestId,
+    }),
+  });
+  assert.equal(connections.length, 2);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: sessionA,
+      viewer_user_id: "viewer",
+      reason: "authorization_revoked",
+    }),
+  });
+
+  assert.equal(viewer.lifecycle, "NEGOTIATING");
+  assert.equal(viewer.failure, undefined);
+  assert.equal(
+    (viewer as unknown as { sessionId: string | undefined }).sessionId,
+    sessionB,
+  );
+  assert.equal(connections[1]?.closed, false);
+  viewer.close();
 });
 
 test("viewer peer replacement preserves the recovery deadline and rejects stale peer events", async () => {
@@ -4161,8 +6076,8 @@ test("failed viewer replacement can retry within the original recovery deadline"
   assert.equal(scheduler.timers.has(recoveryTimerId!), true);
   assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === INITIAL_NEGOTIATION_TIMEOUT_MS));
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
-  assert.equal(viewer.lifecycle, "FAILED");
-  assert.match(String(viewer.failure), /network recovery timed out/);
+  assert.equal(viewer.lifecycle, "RECONNECTING");
+  assert.equal(viewer.failure, undefined);
   assert.equal(connections[2]!.closed, true);
 });
 
@@ -4193,7 +6108,7 @@ test("viewer leave and authorization revocation cancel active recovery", async (
   assert.equal(revokeFixture.connections[0]!.closed, true);
 });
 
-test("reconnect retires replaced session signaling but still rejects unknown session IDs", async () => {
+test("reconnect ignores replaced and unknown session signaling without affecting the active session", async () => {
   const scheduler = new ManualScheduler();
   const sockets: MockSocket[] = [];
   const connections: MockConnection[] = [];
@@ -4219,11 +6134,13 @@ test("reconnect retires replaced session signaling but still rejects unknown ses
   viewer.start();
   sockets[0]!.open();
   sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
   sockets[0]!.onmessage?.({
     data: JSON.stringify({
       type: "session_created",
       session_id: oldSessionId,
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(sockets[0]!),
     }),
   });
   sockets[0]!.onmessage?.({
@@ -4243,16 +6160,23 @@ test("reconnect retires replaced session signaling but still rejects unknown ses
   sockets[1]!.open();
   sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(JSON.parse(sockets[1]!.sent.at(-1)!), {
+  const createRequest = JSON.parse(sockets[1]!.sent.at(-1)!) as Record<string, unknown>;
+  assert.deepEqual({
+    type: createRequest.type,
+    device_id: createRequest.device_id,
+    active_session_id: createRequest.active_session_id,
+  }, {
     type: "create_session",
     device_id: "00000000-0000-0000-0000-000000000001",
     active_session_id: oldSessionId,
   });
+  assert.equal(typeof createRequest.request_id, "string");
   sockets[1]!.onmessage?.({
     data: JSON.stringify({
       type: "session_created",
       session_id: currentSessionId,
       device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createRequest.request_id,
     }),
   });
   assert.equal(connections.length, 2);
@@ -4277,7 +6201,8 @@ test("reconnect retires replaced session signaling but still rejects unknown ses
       candidate: { candidate: "candidate:unknown" },
     }),
   });
-  assert.equal(viewer.lifecycle, "FAILED");
+  assert.equal(viewer.lifecycle, "NEGOTIATING");
+  assert.equal(connections[1]!.closed, false);
   viewer.close();
 });
 
@@ -4312,12 +6237,22 @@ async function createSleepMarkedViewer(): Promise<{
   sockets[0]!.open();
   sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(JSON.parse(sockets[0]!.sent.at(-1)!), {
+  const createRequest = JSON.parse(sockets[0]!.sent.at(-1)!) as Record<string, unknown>;
+  assert.deepEqual({
+    type: createRequest.type,
+    device_id: createRequest.device_id,
+  }, {
     type: "create_session",
     device_id: deviceId,
   });
+  assert.equal(typeof createRequest.request_id, "string");
   sockets[0]!.onmessage?.({
-    data: JSON.stringify({ type: "session_created", session_id: sessionId, device_id: deviceId }),
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: sessionId,
+      device_id: deviceId,
+      request_id: createRequest.request_id,
+    }),
   });
   sockets[0]!.onmessage?.({
     data: JSON.stringify({

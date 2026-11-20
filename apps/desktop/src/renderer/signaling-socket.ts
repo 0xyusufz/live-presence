@@ -252,6 +252,11 @@ export function createSignalingSocket(
             activeSessionId = undefined;
             sessionEventRevision += 1;
             settleReadinessWaiters();
+          } else if (message?.type === "session_retired" &&
+            message.session_id === activeSessionId) {
+            activeSessionId = undefined;
+            sessionEventRevision += 1;
+            settleReadinessWaiters();
           } else if (message?.type === "sharing_state_updated" && !message.screen) {
             activeSessionId = undefined;
             sessionEventRevision += 1;

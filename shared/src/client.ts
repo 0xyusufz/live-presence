@@ -16,6 +16,18 @@ import {
   type WebRtcFactory,
 } from "./webrtc.js";
 
+const COMPLETED_SESSION_HISTORY_LIMIT = 64;
+export const MAX_PENDING_SESSION_RETIREMENTS = 64;
+
+function rememberBoundedId(history: Set<string>, id: string): void {
+  history.delete(id);
+  history.add(id);
+  if (history.size > COMPLETED_SESSION_HISTORY_LIMIT) {
+    const oldest = history.values().next().value as string | undefined;
+    if (oldest) history.delete(oldest);
+  }
+}
+
 export type ClientLifecycleState =
   | "IDLE"
   | "CONNECTING"
@@ -51,7 +63,9 @@ export type ClientSignalingDiagnostic = {
     | "offer_received"
     | "answer_received"
     | "answer_applied"
+    | "signaling_send_failed"
     | "signaling_message_rejected"
+    | "pending_retirement_capacity_reached"
     | "lifecycle_changed";
   timestamp: string;
   deviceId?: string;
@@ -796,11 +810,13 @@ export abstract class WebRtcClient {
 
   protected onRecoveryCompleted(): void {}
 
-  protected onRecoveryTimeout(error: Error): void {
+  protected onRecoveryTimeout(error: Error, _sessionId?: string): void {
     this.fail(error, "timeout");
   }
 
   protected onSignalingAuthenticated(): void {}
+
+  protected onTerminalPendingCleanup(): void {}
 
   protected replacePeerForNegotiation(
     _message: Extract<ServerMessage, { type: "offer" }>,
@@ -857,6 +873,7 @@ export abstract class WebRtcClient {
     this.cancelReconnect();
     this.clearStableTimer();
     this.clearRecoveryContext("terminal_failure");
+    this.onTerminalPendingCleanup();
     this.terminal = true;
   }
 
@@ -892,12 +909,14 @@ export abstract class WebRtcClient {
     this.onRecoveryStarted();
     this.recoveryTimer = this.clientScheduler.setTimeout(() => {
       if (this.recoveryCycleId !== recoveryCycleId) return;
+      const timedOutSessionId = this.recoverySessionId;
       this.recoveryTimer = undefined;
       this.clearRecoveryContext("timeout");
       if (this.terminal || this.closing) return;
       this.onRecoveryDiagnostic("timed_out");
       this.onRecoveryTimeout(
         new Error(`network recovery timed out after ${this.reconnectOptions.recoveryTimeoutMs / 1000} seconds`),
+        timedOutSessionId,
       );
     }, this.reconnectOptions.recoveryTimeoutMs);
     this.recoveryAttemptId = crypto.randomUUID();
@@ -1066,6 +1085,7 @@ export type DesktopClientOptions = {
   loadManagedIceServers?: () => Promise<WebRtcConfiguration>;
   managedAuthentication?: boolean;
   isSharingActive?: () => boolean;
+  isCameraActive?: () => boolean;
   getSharingGeneration?: () => number;
   prepareOwnerPeer?: (peer: WebRtcPeer) => Promise<void>;
   onSharingResumed?: () => void;
@@ -1090,6 +1110,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
     this.loadManagedIceServers = options.loadManagedIceServers;
     this.managedAuthentication = options.managedAuthentication ?? false;
     this.isSharingActive = options.isSharingActive ?? (() => true);
+    this.isCameraActive = options.isCameraActive ?? (() => this.sharingState.camera);
     this.getSharingGeneration = options.getSharingGeneration;
     this.prepareOwnerPeer = options.prepareOwnerPeer;
     this.onSharingResumed = options.onSharingResumed;
@@ -1105,6 +1126,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private readonly loadManagedIceServers?: () => Promise<WebRtcConfiguration>;
   private readonly managedAuthentication: boolean;
   private readonly isSharingActive: () => boolean;
+  private readonly isCameraActive: () => boolean;
   private readonly getSharingGeneration?: () => number;
   private readonly prepareOwnerPeer?: (peer: WebRtcPeer) => Promise<void>;
   private readonly onSharingResumed?: () => void;
@@ -1120,6 +1142,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
     rendererConnectionGeneration: number | null;
   }) => void;
   private sharingState = { screen: false, camera: false };
+  private approvedCaptureSessionId: string | undefined;
   private confirmedSharingState: { screen: boolean; camera: boolean } | undefined;
   private pendingSharingResumed = false;
   private resume: { sessionId: string; epoch: number; capability: string; expiresAt: number } | undefined;
@@ -1133,6 +1156,11 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private pendingIceRecovery = false;
   private restartOfferGeneration: number | undefined;
   private recoveryTimeoutHandled = false;
+  private readonly retiredSessionIds = new Set<string>();
+  private readonly pendingSessionRetirements = new Map<string, number>();
+  private overflowPendingRetirement: { sessionId: string; peerGeneration: number } | undefined;
+  private readonly handledRevocationSessionIds = new Set<string>();
+  private pendingRetirementRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingPeerReplacement: {
     source: "viewer_rejoined" | "ice_restart_exhausted";
     sessionId: string;
@@ -1206,6 +1234,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
   }
 
   protected override onControlPlaneClosed(): void {
+    if (this.sharingState.screen && this.isSharingActive()) this.setLifecycle("RECONNECTING");
     this.scheduleReconnect(() => void this.start(true).catch(() => this.onControlPlaneClosed()));
   }
 
@@ -1438,13 +1467,68 @@ export class DesktopWebRtcClient extends WebRtcClient {
   }
 
   protected override onServerMessage(message: ServerMessage): boolean {
-    if (message.type === "viewer_left" &&
-      !this.peer &&
-      message.session_id === this.recoverySessionId &&
-      message.reason !== "temporary_disconnect") {
-      this.clearRecoveryContext("terminal_session_departure");
-      this.setLifecycle("CLOSED");
-      this.onSessionEnded(message.reason);
+    if (
+      message.type === "viewer_joined" &&
+      !this.pendingSessionRetirements.has(message.session_id) &&
+      (this.pendingSessionRetirements.size >= MAX_PENDING_SESSION_RETIREMENTS ||
+        this.overflowPendingRetirement !== undefined)
+    ) {
+      this.reportClientDiagnostic("pending_retirement_capacity_reached", {
+        sessionId: message.session_id,
+        messageType: message.type,
+        reason: "refusing a new viewer session until older retirements are acknowledged",
+      });
+      this.rememberRetiredSession(message.session_id);
+      try {
+        this.send({ type: "retire_session", session_id: message.session_id });
+      } catch {
+        this.socket?.close();
+      }
+      return true;
+    }
+    if (message.type === "session_retired") {
+      this.pendingSessionRetirements.delete(message.session_id);
+      if (this.overflowPendingRetirement?.sessionId === message.session_id) {
+        this.overflowPendingRetirement = undefined;
+      }
+      this.rememberRetiredSession(message.session_id);
+      if (!this.hasPendingRetirements() &&
+        this.pendingRetirementRetryTimer !== undefined) {
+        this.clientScheduler.clearTimeout(this.pendingRetirementRetryTimer);
+        this.pendingRetirementRetryTimer = undefined;
+      }
+      if (message.outcome === "authorization_revoked") {
+        this.handleAuthorizationRevocation(message.session_id);
+      }
+      return true;
+    }
+    if (message.type === "viewer_left") {
+      if (message.reason === "authorization_revoked") {
+        this.handleAuthorizationRevocation(message.session_id);
+        return true;
+      }
+      if (message.session_id === (this.sessionId ?? this.recoverySessionId)) {
+        if (message.reason === "temporary_disconnect") {
+          this.beginRecovery();
+          this.onSessionEnded(message.reason);
+          return true;
+        }
+        if (
+          (message.reason === "viewer_grace_expired" || message.reason === "closed") &&
+          this.sharingState.screen &&
+          this.isSharingActive()
+        ) {
+          this.approvedCaptureSessionId = message.session_id;
+        } else if (this.approvedCaptureSessionId === message.session_id) {
+          this.approvedCaptureSessionId = undefined;
+        }
+        this.rememberRetiredSession(message.session_id);
+        this.clearRecoveryContext("terminal_session_departure");
+        this.closePeer();
+        this.setLifecycle("CLOSED");
+        this.onSessionEnded(message.reason);
+        return true;
+      }
       return true;
     }
     if (message.type !== "sharing_state_updated") return false;
@@ -1454,7 +1538,10 @@ export class DesktopWebRtcClient extends WebRtcClient {
     }
 
     this.confirmedSharingState = { screen: message.screen, camera: message.camera };
-    if (!message.screen) this.clearRecoveryContext("sharing_inactive");
+    if (!message.screen) {
+      this.approvedCaptureSessionId = undefined;
+      this.clearRecoveryContext("sharing_inactive");
+    }
     this.onDiagnostic?.({
       event: "sharing-state",
       lifecycle: this.lifecycle,
@@ -1620,25 +1707,180 @@ export class DesktopWebRtcClient extends WebRtcClient {
     }
   }
 
+  private handleAuthorizationRevocation(sessionId: string): void {
+    const alreadyHandled = this.handledRevocationSessionIds.has(sessionId);
+    this.sendAuthorizationRevocationAck(sessionId);
+    rememberBoundedId(this.handledRevocationSessionIds, sessionId);
+    const isCurrentSession =
+      this.sessionId === sessionId ||
+      this.recoverySessionId === sessionId ||
+      this.approvedCaptureSessionId === sessionId;
+    this.pendingSessionRetirements.delete(sessionId);
+    if (this.overflowPendingRetirement?.sessionId === sessionId) {
+      this.overflowPendingRetirement = undefined;
+    }
+    if (!this.hasPendingRetirements() &&
+      this.pendingRetirementRetryTimer !== undefined) {
+      this.clientScheduler.clearTimeout(this.pendingRetirementRetryTimer);
+      this.pendingRetirementRetryTimer = undefined;
+    }
+    this.rememberRetiredSession(sessionId);
+    if (alreadyHandled || !isCurrentSession) return;
+    this.clearRecoveryContext("authorization_revoked");
+    this.onSessionEnded("authorization_revoked");
+  }
+
+  private sendAuthorizationRevocationAck(sessionId: string): void {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== 1) return;
+    try {
+      const result = socket.send(JSON.stringify({
+        type: "retire_session_ack",
+        session_id: sessionId,
+        outcome: "authorization_revoked",
+      }));
+      if (result && typeof result.then === "function") {
+        void result.catch(() => {
+          this.reportClientDiagnostic("signaling_send_failed", {
+            sessionId,
+            messageType: "retire_session_ack",
+            reason: "authorization acknowledgment remains pending on the server",
+          });
+        });
+      }
+    } catch {
+      this.reportClientDiagnostic("signaling_send_failed", {
+        sessionId,
+        messageType: "retire_session_ack",
+        reason: "authorization acknowledgment remains pending on the server",
+      });
+    }
+  }
+
   protected override onSessionEnded(reason: string): void {
     if (reason === "temporary_disconnect") {
       this.pendingPeerReplacement = undefined;
       this.viewerRejoinHandled = false;
       this.viewerRejoinAttempt += 1;
     }
-    if (reason === "viewer_grace_expired" || reason === "authorization_revoked") {
+    if (reason === "authorization_revoked") {
+      this.approvedCaptureSessionId = undefined;
       this.clearRecoveryContext(reason);
       this.onOwnerSessionEnded?.(reason);
     }
   }
 
-  protected override onRecoveryTimeout(_error: Error): void {
+  protected override onRecoveryTimeout(_error: Error, timedOutSessionId?: string): void {
     if (this.recoveryTimeoutHandled) return;
     this.recoveryTimeoutHandled = true;
     this.pendingSharingResumed = false;
-    void this.stopSharingSession()
-      .then(() => this.onOwnerSessionEnded?.("recovery_timeout"))
-      .catch(() => this.onOwnerSessionEnded?.("recovery_timeout"));
+    this.pendingPeerReplacement = undefined;
+    this.viewerRejoinHandled = false;
+    const sessionId = timedOutSessionId;
+    if (sessionId) {
+      if (this.sharingState.screen && this.isSharingActive()) {
+        this.approvedCaptureSessionId = sessionId;
+      }
+      this.rememberRetiredSession(sessionId);
+      this.rememberPendingRetirement(sessionId);
+      this.flushPendingRetirements();
+    }
+    this.closePeer();
+    if (!this.terminal && !this.closing) this.setLifecycle("RECONNECTING");
+    this.reconcileApprovedSharingState();
+  }
+
+  private rememberRetiredSession(sessionId: string): void {
+    rememberBoundedId(this.retiredSessionIds, sessionId);
+  }
+
+  private rememberPendingRetirement(sessionId: string): void {
+    if (
+      !this.pendingSessionRetirements.has(sessionId) &&
+      this.pendingSessionRetirements.size >= MAX_PENDING_SESSION_RETIREMENTS
+    ) {
+      if (!this.overflowPendingRetirement || this.overflowPendingRetirement.sessionId === sessionId) {
+        this.overflowPendingRetirement = { sessionId, peerGeneration: this.peerGeneration };
+        this.reportClientDiagnostic("pending_retirement_capacity_reached", {
+          sessionId,
+          reason: "retirement is retained separately until signaling can acknowledge it",
+        });
+        return;
+      }
+      this.reportClientDiagnostic("pending_retirement_capacity_reached", {
+        sessionId,
+        reason: `refusing further sessions while overflow retirement ${this.overflowPendingRetirement.sessionId} remains unresolved`,
+      });
+      this.socket?.close();
+      return;
+    }
+    this.pendingSessionRetirements.set(sessionId, this.peerGeneration);
+  }
+
+  private hasPendingRetirements(): boolean {
+    return this.pendingSessionRetirements.size > 0 || this.overflowPendingRetirement !== undefined;
+  }
+
+  private flushPendingRetirements(): void {
+    if (this.closing ||
+      this.terminal ||
+      this.socket?.readyState !== 1 ||
+      !this.signalingAuthenticated) return;
+    if (this.hasPendingRetirements() &&
+      this.pendingRetirementRetryTimer === undefined) {
+      this.pendingRetirementRetryTimer = this.clientScheduler.setTimeout(() => {
+        this.pendingRetirementRetryTimer = undefined;
+        this.flushPendingRetirements();
+      }, 5_000);
+    }
+    const overflow = this.overflowPendingRetirement;
+    if (overflow) {
+      this.sendRetirementBestEffort(overflow.sessionId);
+    }
+    for (const [sessionId] of [...this.pendingSessionRetirements]) {
+      if (!this.pendingSessionRetirements.has(sessionId)) continue;
+      this.sendRetirementBestEffort(sessionId);
+    }
+  }
+
+  private sendRetirementBestEffort(sessionId: string): void {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== 1 || !this.signalingAuthenticated) return;
+    try {
+      const result = socket.send(JSON.stringify({ type: "retire_session", session_id: sessionId }));
+      if (result && typeof result.then === "function") {
+        void result.catch(() => {
+          this.reportClientDiagnostic("signaling_send_failed", {
+            sessionId,
+            messageType: "retire_session",
+            reason: "retirement remains pending for retry",
+          });
+        });
+      }
+    } catch {
+      this.reportClientDiagnostic("signaling_send_failed", {
+        sessionId,
+        messageType: "retire_session",
+        reason: "retirement remains pending for retry",
+      });
+    }
+  }
+
+  private clearPendingRetirements(): void {
+    this.pendingSessionRetirements.clear();
+    this.overflowPendingRetirement = undefined;
+    if (this.pendingRetirementRetryTimer !== undefined) {
+      this.clientScheduler.clearTimeout(this.pendingRetirementRetryTimer);
+      this.pendingRetirementRetryTimer = undefined;
+    }
+  }
+
+  private reconcileApprovedSharingState(): void {
+    const screen = this.sharingState.screen && this.isSharingActive();
+    const camera = screen && this.sharingState.camera && this.isCameraActive();
+    this.sharingState = { screen, camera };
+    if (!screen) this.approvedCaptureSessionId = undefined;
+    void this.publishSharingState().catch(() => undefined);
   }
 
   protected override shouldPreservePeerOnSocketClose(): boolean {
@@ -1654,10 +1896,18 @@ export class DesktopWebRtcClient extends WebRtcClient {
     const signalingReconnected = this.awaitingControlPlaneRecovery;
     await this.refreshPresence?.();
     if (this.terminal || this.closing || (sourceSocket && this.socket !== sourceSocket)) return;
-    if (this.sharingState.screen && !this.isSharingActive()) {
-      this.sharingState = { screen: false, camera: false };
-      this.resume = undefined;
-      this.resumeRequestId = undefined;
+    if (this.sharingState.screen) {
+      const screen = this.isSharingActive();
+      const camera = screen && this.sharingState.camera && this.isCameraActive();
+      this.sharingState = { screen, camera };
+      if (!screen) {
+        this.approvedCaptureSessionId = undefined;
+        this.resume = undefined;
+        this.resumeRequestId = undefined;
+      }
+    }
+    if (this.recoveryTimeoutHandled && this.sharingState.screen && !this.peer) {
+      this.setLifecycle("RECONNECTING");
     }
     await this.publishSharingState();
     if (this.terminal || this.closing || (sourceSocket && this.socket !== sourceSocket)) return;
@@ -1692,7 +1942,13 @@ export class DesktopWebRtcClient extends WebRtcClient {
     }
   }
 
+  protected override onTerminalPendingCleanup(): void {
+    this.clearPendingRetirements();
+    this.approvedCaptureSessionId = undefined;
+  }
+
   protected override onSignalingAuthenticated(): void {
+    this.flushPendingRetirements();
     if (this.peer?.state === "connected") {
       this.completeRecovery();
       if (this.hasRecoveryInProgress()) {
@@ -1772,7 +2028,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
       );
       return;
     }
-    if (!this.sharingState.screen || !this.isSharingActive()) {
+    if (!this.isSharingActive()) {
       this.clearRecoveryContext("sharing_inactive");
       this.reportFreshPeerFallback("fresh_peer_fallback_rejected", "sharing is inactive");
       return;
@@ -2077,6 +2333,8 @@ export class DesktopWebRtcClient extends WebRtcClient {
   }
 
   override close(): void {
+    this.clearPendingRetirements();
+    this.approvedCaptureSessionId = undefined;
     super.close();
   }
 
@@ -2095,7 +2353,6 @@ export class DesktopWebRtcClient extends WebRtcClient {
       socket.readyState !== 1 ||
       message.session_id !== activeSessionId ||
       (!this.peer && !recoverableWithoutPeer) ||
-      !this.sharingState.screen ||
       !this.isSharingActive()
     ) return;
     this.viewerRejoinHandled = true;
@@ -2301,10 +2558,51 @@ export class DesktopWebRtcClient extends WebRtcClient {
     }
     if (this.closing || this.terminal) return;
     this.connect(credential, async (message, socket) => {
+      if (
+        "session_id" in message &&
+        typeof message.session_id === "string" &&
+        message.type !== "session_retired" &&
+        !(message.type === "viewer_left" && message.reason === "authorization_revoked") &&
+        this.retiredSessionIds.has(message.session_id)
+      ) {
+        this.reportClientDiagnostic("signaling_message_rejected", {
+          sessionId: message.session_id,
+          messageType: message.type,
+          reason: "session was retired",
+        });
+        return;
+      }
+      let isNewViewerSession = false;
+      if ("session_id" in message &&
+        message.type !== "session_retired" &&
+        !(message.type === "viewer_left" && message.reason === "authorization_revoked")) {
+        const activeSessionId = this.sessionId ?? this.recoverySessionId;
+        isNewViewerSession =
+          message.type === "viewer_joined" &&
+          (!activeSessionId ||
+            (this.recoverySessionId !== undefined &&
+              (!this.peer || this.peer.state === "failed" || this.peer.state === "disconnected"))) &&
+          this.approvedCaptureSessionId !== message.session_id;
+        if (
+          (!activeSessionId && !isNewViewerSession) ||
+          (activeSessionId && message.session_id !== activeSessionId && !isNewViewerSession)
+        ) {
+          this.reportClientDiagnostic("signaling_message_rejected", {
+            sessionId: message.session_id,
+            messageType: message.type,
+            reason: "session did not match the active owner session",
+          });
+          return;
+        }
+      }
       if (message.type === "viewer_rejoined") {
         const activeSessionId = this.sessionId ?? this.recoverySessionId;
         if (activeSessionId && message.session_id !== activeSessionId) {
-          this.fail(new Error("Rejoined viewer session did not match the active session"), "signaling");
+          this.reportClientDiagnostic("signaling_message_rejected", {
+            sessionId: message.session_id,
+            messageType: message.type,
+            reason: "session did not match the active owner session",
+          });
           return;
         }
         if (this.peer && this.sessionId === message.session_id) {
@@ -2319,7 +2617,11 @@ export class DesktopWebRtcClient extends WebRtcClient {
           try { this.send({ type: "leave_session", session_id: message.session_id }); } catch { /* socket closing */ }
           return;
         }
-        if (this.peer || this.sessionId) return this.fail();
+        if (this.peer || this.sessionId) {
+          if (!isNewViewerSession) return;
+          this.closePeer();
+        }
+        this.approvedCaptureSessionId = message.session_id;
         if (this.managedAuthentication) {
           try {
             this.iceConfiguration = await this.loadManagedIceServers?.();
@@ -2329,6 +2631,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
           }
           if (this.socket !== socket || this.terminal || this.closing || !this.isSharingActive()) return;
         }
+        if (this.recoveryTimeoutHandled) this.recoveryTimeoutHandled = false;
         this.setLifecycle("NEGOTIATING");
         const peer = this.createPeer(
           "owner",
@@ -2358,6 +2661,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
     this.sharingState = { screen, camera };
     if (screen) this.recoveryTimeoutHandled = false;
     if (!screen) {
+      this.approvedCaptureSessionId = undefined;
       this.clearRecoveryContext("sharing_stopped");
       this.resume = undefined;
       this.resumeRequestId = undefined;
@@ -2371,6 +2675,8 @@ export class DesktopWebRtcClient extends WebRtcClient {
       update = this.setSharingState(false, false);
     } finally {
       this.pendingSharingResumed = false;
+      this.approvedCaptureSessionId = undefined;
+      this.clearPendingRetirements();
       this.closePeer();
       if (!this.terminal && !this.closing) {
         this.setLifecycle(this.socket?.readyState === 1 ? "IDLE" : "CLOSED");
@@ -2511,12 +2817,14 @@ export class ViewerWebRtcClient extends WebRtcClient {
   private readonly retiredNegotiationIds = new Set<string>();
   private sharingActive: boolean | undefined;
   private sessionRequestPending = false;
+  private sessionRequestId: string | undefined;
   private peerEverConnected = false;
   private resume: { sessionId: string; epoch: number; capability: string; expiresAt: number } | undefined;
   private resumeRequestId: string | undefined;
   private resumeRequestPending = false;
   private ownerRecoverySessionId: string | undefined;
   private ownerRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private authorizationRevocationCandidateSessionId: string | undefined;
 
   public constructor(options: ViewerClientOptions) {
     super(options.socketFactory, options.peerFactory, options.reconnect);
@@ -2563,7 +2871,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
   }
 
   private retireNegotiation(negotiationId: string): void {
-    this.retiredNegotiationIds.add(negotiationId);
+    rememberBoundedId(this.retiredNegotiationIds, negotiationId);
   }
 
   start(reconnecting = false): void {
@@ -2571,24 +2879,70 @@ export class ViewerWebRtcClient extends WebRtcClient {
     if (this.socket) return;
     this.reconnecting = reconnecting;
     this.sessionRequestPending = false;
+    this.sessionRequestId = undefined;
     if (!this.managedAuthentication && !this.browserSessionToken) {
       this.markTerminal();
       this.setLifecycle("FAILED");
       return;
     }
     this.connect(this.managedAuthentication ? undefined : this.browserSessionToken, (message, socket) => {
-      if (
-        (message.type === "offer" || message.type === "answer" || message.type === "ice_candidate") &&
-        this.retiredSessionIds.has(message.session_id)
-      ) {
+      const applicableAuthorizationRevocation =
+        message.type === "viewer_left" &&
+        message.reason === "authorization_revoked" &&
+        (message.session_id === this.sessionId ||
+          message.session_id === this.recoverySessionId ||
+          (!this.sessionId &&
+            !this.recoverySessionId &&
+            message.session_id === this.authorizationRevocationCandidateSessionId));
+      if ("session_id" in message &&
+        typeof message.session_id === "string" &&
+        this.retiredSessionIds.has(message.session_id) &&
+        !applicableAuthorizationRevocation) {
         this.onRecoveryDiagnostic("stale_session_signaling_ignored", undefined, message.session_id);
         return;
       }
       if (message.type === "session_created" || message.type === "session_attached") {
+        if (
+          !this.sessionRequestPending ||
+          !this.sessionRequestId ||
+          message.request_id !== this.sessionRequestId
+        ) {
+          this.onRecoveryDiagnostic("stale_session_signaling_ignored", undefined, message.session_id);
+          return;
+        }
         this.sessionRequestPending = false;
+        this.sessionRequestId = undefined;
+      }
+      if ("session_id" in message &&
+        message.type !== "session_created" &&
+        message.type !== "session_attached") {
+        const expectedSessionId = this.sessionId ??
+          this.recoverySessionId ??
+          (message.type === "resume_pending" || message.type === "session_resumed"
+            ? this.resume?.sessionId
+            : undefined);
+        if (
+          (!expectedSessionId || message.session_id !== expectedSessionId) &&
+          !applicableAuthorizationRevocation
+        ) {
+          this.onRecoveryDiagnostic("stale_session_signaling_ignored", undefined, message.session_id);
+          return;
+        }
+      }
+      if ((message.type === "session_created" || message.type === "session_attached") &&
+        (this.sessionId ?? this.recoverySessionId) &&
+        message.session_id !== (this.sessionId ?? this.recoverySessionId) &&
+        (!this.reconnecting || !this.sessionId)) {
+        this.onRecoveryDiagnostic("stale_session_signaling_ignored", undefined, message.session_id);
+        return;
+      }
+      if (message.type === "session_created" || message.type === "session_attached") {
         if (message.device_id !== this.deviceId) {
           this.fail(new Error("Attached session device did not match the requested device"), "signaling");
           return;
+        }
+        if (this.authorizationRevocationCandidateSessionId !== message.session_id) {
+          this.authorizationRevocationCandidateSessionId = undefined;
         }
         if (message.type === "session_attached") {
           this.sharingActive = message.screen;
@@ -2603,12 +2957,18 @@ export class ViewerWebRtcClient extends WebRtcClient {
           if (
             message.session_id === this.sessionId
           ) {
-            if (message.type === "session_created") return this.fail();
+            if (message.type === "session_created") {
+              this.onRecoveryDiagnostic("stale_session_signaling_ignored", undefined, message.session_id);
+              return;
+            }
             this.reconnecting = false;
             this.sessionRequestPending = false;
             return this.handleMessage(message, socket);
           }
-          if (!this.reconnecting || !this.sessionId) return this.fail();
+          if (!this.reconnecting || !this.sessionId) {
+            this.onRecoveryDiagnostic("stale_session_signaling_ignored", undefined, message.session_id);
+            return;
+          }
           this.retireSession(this.sessionId);
           this.closePeer();
           this.peerEverConnected = false;
@@ -2683,43 +3043,53 @@ export class ViewerWebRtcClient extends WebRtcClient {
     }
   }
 
-  private requestSession(recovering = false): void {
+  private requestSession(recovering = false, keepReconnecting = false): void {
     if (
       this.closing || this.terminal || this.sessionRequestPending ||
       ((!recovering) && (this.peer || this.sessionId)) || this.socket?.readyState !== 1 ||
       (this.resume && this.resume.expiresAt > this.clientScheduler.now())
     ) return;
     this.sessionRequestPending = true;
+    const requestId = crypto.randomUUID();
+    this.sessionRequestId = requestId;
     if (this.sharingActive !== false) {
-      this.setLifecycle(this.peer && this.sessionId ? "RECONNECTING" : "CONNECTING");
+      this.setLifecycle(
+        keepReconnecting || (this.peer && this.sessionId)
+          ? "RECONNECTING"
+          : "CONNECTING",
+      );
     }
     try {
       this.send({
         type: "create_session",
         device_id: this.deviceId,
         ...(recovering && this.sessionId ? { active_session_id: this.sessionId } : {}),
+        request_id: requestId,
       });
     } catch (error) {
       this.sessionRequestPending = false;
+      this.sessionRequestId = undefined;
       this.fail(error, "signaling");
     }
   }
 
   private retireSession(sessionId: string): void {
-    this.retiredSessionIds.add(sessionId);
-    if (this.retiredSessionIds.size > 8) {
-      const oldest = this.retiredSessionIds.values().next().value as string | undefined;
-      if (oldest) this.retiredSessionIds.delete(oldest);
-    }
+    rememberBoundedId(this.retiredSessionIds, sessionId);
   }
 
   private retireCurrentSession(): void {
-    if (this.sessionId) this.retireSession(this.sessionId);
+    const sessionId = this.sessionId ?? this.recoverySessionId;
+    if (sessionId) this.retireSession(sessionId);
     if (this.peer?.negotiationId) this.retireNegotiation(this.peer.negotiationId);
   }
 
   private retireTimedOutSession(): void {
+    const timedOutSessionId = this.sessionId ?? this.recoverySessionId;
+    const ownerRecoverySessionId = this.ownerRecoverySessionId;
     this.retireCurrentSession();
+    if (timedOutSessionId && ownerRecoverySessionId === timedOutSessionId) {
+      this.authorizationRevocationCandidateSessionId = timedOutSessionId;
+    }
     this.clearOwnerRecoveryWait();
     this.sessionRequestPending = false;
     this.peerEverConnected = false;
@@ -2733,22 +3103,56 @@ export class ViewerWebRtcClient extends WebRtcClient {
     this.setLifecycle("RECONNECTING");
   }
 
-  protected override onRecoveryTimeout(error: Error): void {
-    this.retireCurrentSession();
+  protected override onRecoveryTimeout(_error: Error, timedOutSessionId?: string): void {
+    if (timedOutSessionId) {
+      this.retireSession(timedOutSessionId);
+      if (this.sessionId === timedOutSessionId && this.peer?.negotiationId) {
+        this.retireNegotiation(this.peer.negotiationId);
+      }
+    }
     this.clearOwnerRecoveryWait();
     this.sessionRequestPending = false;
     this.peerEverConnected = false;
     this.reconnecting = false;
     this.recoveryAttemptId = undefined;
-    this.sharingActive = false;
-    this.onDeviceAvailability?.(false);
-    this.onSharingState?.({ screen: false, camera: false });
-    this.onViewerSessionEnded?.("recovery_timeout");
-    this.fail(error, "timeout");
+    this.closePeer();
+    this.setLifecycle("RECONNECTING");
+    this.scheduleReconnect(() => this.start(true));
     this.socket?.close();
   }
 
   protected override onServerMessage(message: ServerMessage): boolean {
+    if (
+      message.type === "viewer_left" &&
+      message.reason === "authorization_revoked" &&
+      (message.session_id === this.sessionId ||
+        message.session_id === this.recoverySessionId ||
+        (!this.sessionId &&
+          !this.recoverySessionId &&
+          message.session_id === this.authorizationRevocationCandidateSessionId))
+    ) {
+      this.authorizationRevocationCandidateSessionId = undefined;
+      this.cancelReconnect();
+      this.sessionRequestPending = false;
+      this.sessionRequestId = undefined;
+      this.sharingActive = false;
+      this.onDeviceAvailability?.(false);
+      this.onSharingState?.({ screen: false, camera: false });
+      this.clearOwnerRecoveryWait();
+      this.closePeer();
+      this.onSessionEnded("authorization_revoked");
+      this.setLifecycle("CLOSED");
+      return true;
+    }
+    if (
+      message.type === "viewer_left" &&
+      message.reason === "temporary_disconnect" &&
+      !this.peer &&
+      message.session_id === this.recoverySessionId
+    ) {
+      this.onSessionEnded(message.reason);
+      return true;
+    }
     if (message.type === "session_recovery") {
       this.sessionRequestPending = false;
       if (message.session_id === this.sessionId && this.peer) {
@@ -2799,6 +3203,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
     this.onSharingState?.({ screen: message.screen, camera: message.camera });
     if (!message.screen) {
       this.sessionRequestPending = false;
+      this.sessionRequestId = undefined;
       this.peerEverConnected = false;
       if (this.peer || this.sessionId) {
         this.retireCurrentSession();
@@ -2907,6 +3312,8 @@ export class ViewerWebRtcClient extends WebRtcClient {
   }
 
   protected override onControlPlaneClosed(): void {
+    this.reconnecting = true;
+    this.setLifecycle("RECONNECTING");
     this.scheduleReconnect(() => this.start(true));
   }
 
@@ -2976,6 +3383,15 @@ export class ViewerWebRtcClient extends WebRtcClient {
 
   protected override onServerError(code: string): boolean {
     this.sessionRequestPending = false;
+    this.sessionRequestId = undefined;
+    if (code === "SESSION_NOT_FOUND") {
+      this.retireCurrentSession();
+      this.closePeer();
+      this.reconnecting = true;
+      this.setLifecycle("RECONNECTING");
+      this.scheduleReconnect(() => this.requestSession());
+      return true;
+    }
     if (code === "DEVICE_OFFLINE") {
       this.onDeviceAvailability?.(false);
       this.setLifecycle("RECONNECTING");
@@ -2996,12 +3412,23 @@ export class ViewerWebRtcClient extends WebRtcClient {
 
   protected override onSessionEnded(reason: string): void {
     this.sessionRequestPending = false;
+    this.sessionRequestId = undefined;
     this.clearOwnerRecoveryWait();
     if (reason === "recovery_timeout") {
       this.retireTimedOutSession();
       return;
     }
     this.onViewerSessionEnded?.(reason);
+    if (reason === "temporary_disconnect") {
+      this.retireCurrentSession();
+      this.peerEverConnected = false;
+      this.reconnecting = true;
+      this.recoveryAttemptId = undefined;
+      this.closePeer();
+      this.setLifecycle("RECONNECTING");
+      this.requestSession(false, true);
+      return;
+    }
     if (reason === "sharing_stopped") {
       this.sharingActive = false;
       this.peerEverConnected = false;

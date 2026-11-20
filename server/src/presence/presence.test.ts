@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { WebSocket, type RawData } from "ws";
 import { buildApp } from "../app.js";
+import { executeAccessCommand } from "../cli/access.js";
 import {
   closeExpiredPresenceSocket,
   isLatestOwnerSocket,
@@ -187,11 +192,11 @@ function waitForOpen(socket: WebSocket): Promise<void> {
   });
 }
 
-function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {
+function nextMessage(socket: WebSocket, timeoutMs = 5_000): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       finish(() => reject(new Error("Timed out waiting for a WebSocket message")));
-    }, 5_000);
+    }, timeoutMs);
     const finish = (action: () => void) => {
       clearTimeout(timer);
       socket.off("message", onMessage);
@@ -307,6 +312,47 @@ async function createDevice(
     payload: { code, name: "Presence laptop", platform: "macOS" },
   });
   return { ...enrolled.json(), cookie };
+}
+
+async function createAdditionalDevice(
+  server: Awaited<ReturnType<typeof buildApp>>,
+  cookie: string,
+): Promise<{ deviceId: string; refreshToken: string }> {
+  const codeResponse = await server.app.inject({
+    method: "POST",
+    url: "/devices/enrollment-code",
+    headers: { cookie },
+  });
+  const { code } = codeResponse.json<{ code: string }>();
+  const enrolled = await server.app.inject({
+    method: "POST",
+    url: "/devices/enroll",
+    payload: { code, name: "Second laptop", platform: "macOS" },
+  });
+  return enrolled.json();
+}
+
+async function createViewer(
+  server: Awaited<ReturnType<typeof buildApp>>,
+  email: string,
+): Promise<{ cookie: string; userId: string }> {
+  const login = await server.app.inject({
+    method: "POST",
+    url: "/auth/request-login",
+    payload: { email },
+  });
+  const verification = await server.app.inject({
+    method: "POST",
+    url: "/auth/verify-login",
+    payload: { token: login.json<{ developmentToken: string }>().developmentToken },
+  });
+  const cookie = cookieValue(verification.headers["set-cookie"]);
+  const session = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie },
+  });
+  return { cookie, userId: session.json<{ user: { id: string } }>().user.id };
 }
 
 test("presence service distinguishes connections and expires at the threshold", () => {
@@ -1576,6 +1622,136 @@ test("fresh authorized viewer replacement attaches to the existing session witho
   }
 });
 
+test("owner retirement preserves sharing availability and allows a fresh authorized session", async () => {
+  const server = await buildApp(
+    ":memory:",
+    3600,
+    "test",
+    undefined,
+    600,
+    45,
+    "http://localhost:5173",
+    "development-turn-key-id",
+    "development-turn-api-token",
+    [],
+    86_400,
+    undefined,
+    2_000,
+  );
+  const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const viewerLogin = await server.app.inject({
+    method: "POST",
+    url: "/auth/request-login",
+    payload: { email: `retire-recovery-${Date.now()}@example.com` },
+  });
+  const viewerVerification = await server.app.inject({
+    method: "POST",
+    url: "/auth/verify-login",
+    payload: { token: viewerLogin.json<{ developmentToken: string }>().developmentToken },
+  });
+  const viewerCookie = cookieValue(viewerVerification.headers["set-cookie"]);
+  const viewerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: viewerCookie },
+  });
+  server.authorization.grant(
+    ownerSession.json<{ user: { id: string } }>().user.id,
+    viewerSession.json<{ user: { id: string } }>().user.id,
+  );
+  await server.app.listen({ host: "127.0.0.1", port: 0 });
+  const address = server.app.server.address();
+  assert.ok(address && typeof address !== "string");
+  const wsUrl = `ws://127.0.0.1:${address.port}/ws`;
+  const owner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+  const viewer = new WebSocket(wsUrl, {
+    origin: "http://localhost:5173",
+    headers: { cookie: viewerCookie },
+  });
+  const sockets = [owner, viewer];
+  try {
+    const ownerAuth = nextMessage(owner);
+    const viewerAuth = nextMessage(viewer);
+    await Promise.all(sockets.map(waitForOpen));
+    owner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+    assert.equal((await viewerAuth).role, "viewer");
+
+    const ownerShareAck = nextMessage(owner);
+    const viewerState = nextMessage(viewer);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    await Promise.all([ownerShareAck, viewerState]);
+
+    const created = nextMessages(viewer, 2);
+    const viewerJoined = nextMessage(owner);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
+    const [stateMessage, sessionMessage] = await created;
+    assert.equal(stateMessage?.type, "device_sharing_state");
+    assert.equal(sessionMessage?.type, "session_created");
+    const oldSessionId = sessionMessage!.session_id as string;
+    assert.equal((await viewerJoined as { session_id: string }).session_id, oldSessionId);
+
+    const ownerLeft = nextMessage(owner);
+    const viewerLeft = nextMessage(viewer);
+    owner.send(JSON.stringify({ type: "retire_session", session_id: oldSessionId }));
+    assert.equal((await ownerLeft).reason, "temporary_disconnect");
+    assert.equal((await viewerLeft).reason, "temporary_disconnect");
+
+    const presence = await server.app.inject({
+      method: "GET",
+      url: "/presence",
+      headers: { cookie: device.cookie },
+    });
+    assert.deepEqual(
+      presence.json<{ devices: Array<{ screen: boolean; camera: boolean }> }>()
+        .devices.map(({ screen, camera }) => ({ screen, camera })),
+      [{ screen: true, camera: true }],
+    );
+
+    const ownerClosed = waitForClose(owner);
+    owner.close();
+    await ownerClosed;
+    const returningOwner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+    sockets.push(returningOwner);
+    const returningOwnerAuth = nextMessage(returningOwner);
+    await waitForOpen(returningOwner);
+    returningOwner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    assert.equal((await returningOwnerAuth).role, "owner");
+
+    const ownerRefresh = nextMessage(returningOwner);
+    const freshAvailability = nextMessage(viewer);
+    returningOwner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    assert.equal((await ownerRefresh).screen, true);
+    assert.deepEqual(await freshAvailability, {
+      type: "device_sharing_state",
+      device_id: device.deviceId,
+      screen: true,
+      camera: true,
+    });
+
+    const freshMessages = nextMessages(viewer, 2);
+    const freshJoined = nextMessage(returningOwner);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
+    const [freshState, freshSession] = await freshMessages;
+    assert.equal(freshState?.type, "device_sharing_state");
+    assert.equal(freshSession?.type, "session_created");
+    assert.notEqual(freshSession?.session_id, oldSessionId);
+    assert.equal(
+      (await freshJoined as { session_id: string }).session_id,
+      freshSession?.session_id,
+    );
+  } finally {
+    await Promise.all(sockets.map(terminateSocket));
+    await server.app.close();
+    server.close();
+  }
+});
+
 test("authorized viewers receive DEVICE_OFFLINE without revealing offline device ownership", async () => {
   const server = await buildApp(":memory:", 3600, "test", undefined, 600, 45);
   const device = await createDevice(server);
@@ -1642,5 +1818,625 @@ test("authorized viewers receive DEVICE_OFFLINE without revealing offline device
     await terminateSocket(denied);
     await server.app.close();
     server.close();
+  }
+});
+
+test("CLI revocation after retirement survives server restart until durable device acknowledgement", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "live-presence-revocation-"));
+  const databasePath = join(directory, "presence.sqlite");
+  let server = await buildApp(databasePath);
+  const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const ownerUserId = ownerSession.json<{ user: { id: string } }>().user.id;
+  const viewerEmail = `durable-revoke-${Date.now()}@example.com`;
+  const viewerAccount = await createViewer(server, viewerEmail);
+  server.authorization.grant(ownerUserId, viewerAccount.userId);
+  const sockets: WebSocket[] = [];
+
+  try {
+    await server.app.listen({ host: "127.0.0.1", port: 0 });
+    const address = server.app.server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `ws://127.0.0.1:${address.port}/ws`;
+    const owner = new WebSocket(url, { origin: "http://localhost:5173" });
+    const viewer = new WebSocket(url, {
+      origin: "http://localhost:5173",
+      headers: { cookie: viewerAccount.cookie },
+    });
+    sockets.push(owner, viewer);
+    const ownerAuth = nextMessage(owner);
+    const viewerAuth = nextMessage(viewer);
+    await Promise.all([waitForOpen(owner), waitForOpen(viewer)]);
+    owner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+    assert.equal((await viewerAuth).role, "viewer");
+
+    const ownerSharingAck = nextMessage(owner);
+    const viewerSharing = nextMessage(viewer);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    await Promise.all([ownerSharingAck, viewerSharing]);
+
+    const sessionMessages = nextMessages(viewer, 2);
+    const joined = nextMessage(owner);
+    viewer.send(JSON.stringify({
+      type: "create_session",
+      device_id: device.deviceId,
+      request_id: "durable-session-request",
+    }));
+    const [, created] = await sessionMessages;
+    assert.equal(created?.type, "session_created");
+    assert.equal(created?.request_id, "durable-session-request");
+    const sessionId = created!.session_id as string;
+    assert.equal((await joined).session_id, sessionId);
+
+    const retirementMessages = nextMessages(owner, 2);
+    owner.send(JSON.stringify({ type: "retire_session", session_id: sessionId }));
+    const retirement = await retirementMessages;
+    assert.ok(retirement.some((message) =>
+      message.type === "session_retired" &&
+      message.outcome === "retired" &&
+      message.session_id === sessionId));
+    const duplicateRetirement = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "retire_session", session_id: sessionId }));
+    assert.deepEqual(await duplicateRetirement, {
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "not_found",
+    });
+
+    const ownerClosed = waitForClose(owner);
+    owner.close();
+    await ownerClosed;
+    await terminateSocket(viewer);
+    await server.app.close();
+    server.close();
+    const userDatabase = new Database(databasePath);
+    const ownerEmail = userDatabase
+      .prepare("SELECT email FROM users WHERE id = ?")
+      .pluck()
+      .get(ownerUserId) as string;
+    userDatabase.close();
+    executeAccessCommand("revoke", [
+      "--owner-email", ownerEmail,
+      "--viewer-email", viewerEmail,
+    ], databasePath);
+    const durableDatabase = new Database(databasePath);
+    durableDatabase.prepare(
+      "UPDATE presence_revocation_tombstones SET created_at = ? WHERE session_id = ?",
+    ).run(Date.now() - 11 * 60 * 1000, sessionId);
+    durableDatabase.exec(`
+      CREATE TRIGGER reject_outbox_processing
+      BEFORE UPDATE OF processed_at ON presence_revocation_outbox
+      BEGIN SELECT RAISE(ABORT, 'outbox temporarily unavailable'); END;
+    `);
+    durableDatabase.close();
+
+    server = await buildApp(databasePath);
+    await server.app.listen({ host: "127.0.0.1", port: 0 });
+    const restartedAddress = server.app.server.address();
+    assert.ok(restartedAddress && typeof restartedAddress !== "string");
+    const returningOwner = new WebSocket(
+      `ws://127.0.0.1:${restartedAddress.port}/ws`,
+      { origin: "http://localhost:5173" },
+    );
+    sockets.push(returningOwner);
+    const returnedMessages = nextMessages(returningOwner, 2);
+    await waitForOpen(returningOwner);
+    returningOwner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    const [authenticated, revocation] = await returnedMessages;
+    assert.equal(authenticated?.type, "authenticated");
+    assert.deepEqual(revocation, {
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "authorization_revoked",
+    });
+    returningOwner.send(JSON.stringify({
+      type: "retire_session_ack",
+      session_id: sessionId,
+      outcome: "authorization_revoked",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const pendingDatabase = new Database(databasePath);
+    assert.equal(
+      pendingDatabase.prepare(
+        "SELECT COUNT(*) AS count FROM presence_revocation_tombstones WHERE session_id = ?",
+      ).pluck().get(sessionId) as number,
+      1,
+      "an acknowledgement must not clear an unprocessed revocation",
+    );
+    pendingDatabase.close();
+
+    const retryNotification = nextMessage(returningOwner);
+    const retryDatabase = new Database(databasePath);
+    retryDatabase.exec("DROP TRIGGER reject_outbox_processing");
+    retryDatabase.close();
+    assert.deepEqual(await retryNotification, {
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "authorization_revoked",
+    });
+
+    const retirementAfterAck = nextMessage(returningOwner);
+    returningOwner.send(JSON.stringify({
+      type: "retire_session_ack",
+      session_id: sessionId,
+      outcome: "authorization_revoked",
+    }));
+    returningOwner.send(JSON.stringify({ type: "retire_session", session_id: sessionId }));
+    assert.deepEqual(await retirementAfterAck, {
+      type: "session_retired",
+      session_id: sessionId,
+      outcome: "not_found",
+    });
+    returningOwner.send(JSON.stringify({
+      type: "retire_session_ack",
+      session_id: sessionId,
+      outcome: "authorization_revoked",
+    }));
+    const clearedRecords = new Database(databasePath);
+    assert.equal(
+      clearedRecords.prepare(
+        "SELECT COUNT(*) AS count FROM presence_revocation_tombstones WHERE session_id = ?",
+      ).pluck().get(sessionId) as number,
+      0,
+    );
+    assert.equal(
+      clearedRecords.prepare(
+        "SELECT COUNT(*) AS count FROM presence_revocation_outbox WHERE session_id = ?",
+      ).pluck().get(sessionId) as number,
+      0,
+    );
+    clearedRecords.close();
+
+    const reauthenticated = new WebSocket(
+      `ws://127.0.0.1:${restartedAddress.port}/ws`,
+      { origin: "http://localhost:5173" },
+    );
+    sockets.push(reauthenticated);
+    const authOnly = nextMessage(reauthenticated);
+    await waitForOpen(reauthenticated);
+    reauthenticated.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    assert.equal((await authOnly).type, "authenticated");
+    await assertNoMessage(reauthenticated);
+  } finally {
+    await Promise.all(sockets.map(terminateSocket));
+    await server.app.close();
+    server.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("revocation tombstones and acknowledgements are scoped to the owning device", async () => {
+  const server = await buildApp(":memory:");
+  const firstDevice = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: firstDevice.cookie },
+  });
+  const ownerUserId = ownerSession.json<{ user: { id: string } }>().user.id;
+  const secondDevice = await createAdditionalDevice(server, firstDevice.cookie);
+  const firstViewer = await createViewer(server, `device-one-${Date.now()}@example.com`);
+  const secondViewer = await createViewer(server, `device-two-${Date.now()}@example.com`);
+  server.authorization.grant(ownerUserId, firstViewer.userId);
+  server.authorization.grant(ownerUserId, secondViewer.userId);
+  const sockets: WebSocket[] = [];
+
+  try {
+    await server.app.listen({ host: "127.0.0.1", port: 0 });
+    const address = server.app.server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `ws://127.0.0.1:${address.port}/ws`;
+    const firstOwner = new WebSocket(url, { origin: "http://localhost:5173" });
+    const secondOwner = new WebSocket(url, { origin: "http://localhost:5173" });
+    const firstViewerSocket = new WebSocket(url, {
+      origin: "http://localhost:5173",
+      headers: { cookie: firstViewer.cookie },
+    });
+    const secondViewerSocket = new WebSocket(url, {
+      origin: "http://localhost:5173",
+      headers: { cookie: secondViewer.cookie },
+    });
+    sockets.push(firstOwner, secondOwner, firstViewerSocket, secondViewerSocket);
+    const ownerAuthentications = [nextMessage(firstOwner), nextMessage(secondOwner)];
+    const viewerAuthentications = [nextMessage(firstViewerSocket), nextMessage(secondViewerSocket)];
+    await Promise.all(sockets.map(waitForOpen));
+    firstOwner.send(JSON.stringify({ type: "auth", token: firstDevice.refreshToken }));
+    secondOwner.send(JSON.stringify({ type: "auth", token: secondDevice.refreshToken }));
+    await Promise.all(ownerAuthentications);
+    await Promise.all(viewerAuthentications);
+
+    const firstOwnerSharingAck = nextMessage(firstOwner);
+    const firstViewerState = nextMessage(firstViewerSocket);
+    const secondViewerState = nextMessage(secondViewerSocket);
+    firstOwner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    await Promise.all([firstOwnerSharingAck, firstViewerState, secondViewerState]);
+    const secondOwnerSharingAck = nextMessage(secondOwner);
+    const secondViewerStates = [nextMessage(firstViewerSocket), nextMessage(secondViewerSocket)];
+    secondOwner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: false }));
+    await Promise.all([secondOwnerSharingAck, ...secondViewerStates]);
+
+    const firstSessionResponse = nextMessages(firstViewerSocket, 2);
+    const firstJoined = nextMessage(firstOwner);
+    firstViewerSocket.send(JSON.stringify({
+      type: "create_session",
+      device_id: firstDevice.deviceId,
+    }));
+    const [, firstCreated] = await firstSessionResponse;
+    assert.equal(firstCreated?.type, "session_created");
+    const firstSessionId = firstCreated!.session_id as string;
+    assert.equal((await firstJoined).session_id, firstSessionId);
+
+    const secondSessionResponse = nextMessages(secondViewerSocket, 2);
+    const secondJoined = nextMessage(secondOwner);
+    secondViewerSocket.send(JSON.stringify({
+      type: "create_session",
+      device_id: secondDevice.deviceId,
+    }));
+    const [, secondCreated] = await secondSessionResponse;
+    assert.equal(secondCreated?.type, "session_created");
+    assert.equal((await secondJoined).session_id, secondCreated?.session_id);
+
+    const firstRetirement = nextMessages(firstOwner, 2);
+    firstOwner.send(JSON.stringify({ type: "retire_session", session_id: firstSessionId }));
+    assert.ok((await firstRetirement).some((message) =>
+      message.type === "session_retired" && message.outcome === "retired"));
+    server.authorization.revoke(ownerUserId, firstViewer.userId);
+
+    secondOwner.send(JSON.stringify({
+      type: "retire_session_ack",
+      session_id: firstSessionId,
+      outcome: "authorization_revoked",
+    }));
+    await assertNoMessage(secondOwner);
+    await assertNoMessage(secondViewerSocket);
+    const secondOwnerClosed = waitForClose(secondOwner);
+    secondOwner.close();
+    await secondOwnerClosed;
+    const secondOwnerAgain = new WebSocket(url, { origin: "http://localhost:5173" });
+    sockets.push(secondOwnerAgain);
+    const secondDeviceMessages = nextMessages(secondOwnerAgain, 2);
+    const secondViewerRecovery = nextMessage(secondViewerSocket);
+    await waitForOpen(secondOwnerAgain);
+    secondOwnerAgain.send(JSON.stringify({ type: "auth", token: secondDevice.refreshToken }));
+    const [secondAuthenticated, secondRecovery] = await secondDeviceMessages;
+    assert.equal(secondAuthenticated?.type, "authenticated");
+    assert.equal(secondRecovery?.type, "session_recovery");
+    assert.equal(secondRecovery?.session_id, secondCreated?.session_id);
+    assert.deepEqual(await secondViewerRecovery, secondRecovery);
+
+    const firstOwnerClosed = waitForClose(firstOwner);
+    firstOwner.close();
+    await firstOwnerClosed;
+    const firstOwnerAgain = new WebSocket(url, { origin: "http://localhost:5173" });
+    sockets.push(firstOwnerAgain);
+    const firstDeviceRevocation = nextMessages(firstOwnerAgain, 2);
+    await waitForOpen(firstOwnerAgain);
+    firstOwnerAgain.send(JSON.stringify({ type: "auth", token: firstDevice.refreshToken }));
+    const [authenticated, revocation] = await firstDeviceRevocation;
+    assert.equal(authenticated?.type, "authenticated");
+    assert.deepEqual(revocation, {
+      type: "session_retired",
+      session_id: firstSessionId,
+      outcome: "authorization_revoked",
+    });
+
+    const acknowledgedOutcome = nextMessage(firstOwnerAgain);
+    firstOwnerAgain.send(JSON.stringify({
+      type: "retire_session_ack",
+      session_id: firstSessionId,
+      outcome: "authorization_revoked",
+    }));
+    firstOwnerAgain.send(JSON.stringify({ type: "retire_session", session_id: firstSessionId }));
+    assert.deepEqual(await acknowledgedOutcome, {
+      type: "session_retired",
+      session_id: firstSessionId,
+      outcome: "not_found",
+    });
+    await assertNoMessage(secondOwner);
+    await assertNoMessage(secondViewerSocket);
+  } finally {
+    await Promise.all(sockets.map(terminateSocket));
+    await server.app.close();
+    server.close();
+  }
+});
+
+test("server sleep/wake lifecycle resumes the existing approved session without creating a new one", async () => {
+  const server = await buildApp(":memory:");
+  const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const ownerUserId = ownerSession.json<{ user: { id: string } }>().user.id;
+  const viewerAccount = await createViewer(server, `sleep-wake-${Date.now()}@example.com`);
+  server.authorization.grant(ownerUserId, viewerAccount.userId);
+  const sockets: WebSocket[] = [];
+
+  try {
+    await server.app.listen({ host: "127.0.0.1", port: 0 });
+    const address = server.app.server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `ws://127.0.0.1:${address.port}/ws`;
+    const owner = new WebSocket(url, { origin: "http://localhost:5173" });
+    const viewer = new WebSocket(url, {
+      origin: "http://localhost:5173",
+      headers: { cookie: viewerAccount.cookie },
+    });
+    sockets.push(owner, viewer);
+    const ownerAuth = nextMessage(owner);
+    const viewerAuth = nextMessage(viewer);
+    await Promise.all([waitForOpen(owner), waitForOpen(viewer)]);
+    owner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    await Promise.all([ownerAuth, viewerAuth]);
+
+    const ownerSharingAck = nextMessage(owner);
+    const viewerSharing = nextMessage(viewer);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    await Promise.all([ownerSharingAck, viewerSharing]);
+    const sessionMessages = nextMessages(viewer, 2);
+    const joined = nextMessage(owner);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
+    const [, created] = await sessionMessages;
+    assert.equal(created?.type, "session_created");
+    const sessionId = created!.session_id as string;
+    assert.equal((await joined).session_id, sessionId);
+
+    const ownerSleepMarker = nextMessage(owner);
+    const viewerSleepMarker = nextMessage(viewer);
+    owner.send(JSON.stringify({
+      type: "prepare_sleep",
+      session_id: sessionId,
+      request_id: "00000000-0000-4000-8000-000000000001",
+    }));
+    const [ownerMarked, viewerMarked] = await Promise.all([
+      ownerSleepMarker,
+      viewerSleepMarker,
+    ]);
+    assert.equal(ownerMarked?.type, "sleep_marked");
+    assert.equal(viewerMarked?.type, "sleep_marked");
+    assert.equal(ownerMarked?.session_id, sessionId);
+    assert.equal(viewerMarked?.session_id, sessionId);
+
+    const ownerClosed = waitForClose(owner);
+    const viewerClosed = waitForClose(viewer);
+    owner.close();
+    viewer.close();
+    await Promise.all([ownerClosed, viewerClosed]);
+
+    const wakingOwner = new WebSocket(url, { origin: "http://localhost:5173" });
+    const wakingViewer = new WebSocket(url, {
+      origin: "http://localhost:5173",
+      headers: { cookie: viewerAccount.cookie },
+    });
+    sockets.push(wakingOwner, wakingViewer);
+    const wakingOwnerAuth = nextMessage(wakingOwner);
+    const wakingViewerAuth = nextMessage(wakingViewer);
+    await Promise.all([waitForOpen(wakingOwner), waitForOpen(wakingViewer)]);
+    wakingOwner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    await Promise.all([wakingOwnerAuth, wakingViewerAuth]);
+
+    const ownerResumeMessages = nextMessages(wakingOwner, 2);
+    const viewerResumeMessages = nextMessages(wakingViewer, 2);
+    wakingOwner.send(JSON.stringify({
+      type: "resume_session",
+      session_id: sessionId,
+      epoch: ownerMarked?.epoch,
+      capability: ownerMarked?.capability,
+      request_id: "00000000-0000-4000-8000-000000000002",
+    }));
+    wakingViewer.send(JSON.stringify({
+      type: "resume_session",
+      session_id: sessionId,
+      epoch: viewerMarked?.epoch,
+      capability: viewerMarked?.capability,
+      request_id: "00000000-0000-4000-8000-000000000003",
+    }));
+    const [ownerPending, ownerResumed] = await ownerResumeMessages;
+    const [viewerPending, viewerResumed] = await viewerResumeMessages;
+    assert.equal(ownerPending?.type, "resume_pending");
+    assert.equal(viewerPending?.type, "resume_pending");
+    assert.deepEqual(ownerResumed, {
+      type: "session_resumed",
+      session_id: sessionId,
+      epoch: ownerMarked?.epoch,
+    });
+    assert.deepEqual(viewerResumed, ownerResumed);
+    await assertNoMessage(wakingOwner);
+    await assertNoMessage(wakingViewer);
+
+    const sharing = await server.app.inject({
+      method: "GET",
+      url: "/presence",
+      headers: { cookie: device.cookie },
+    });
+    assert.deepEqual(
+      sharing.json<{ devices: Array<{ screen: boolean; camera: boolean }> }>()
+        .devices.map(({ screen, camera }) => ({ screen, camera }))[0],
+      { screen: true, camera: true },
+    );
+  } finally {
+    await Promise.all(sockets.map(terminateSocket));
+    await server.app.close();
+    server.close();
+  }
+});
+
+test("session creation rechecks authorization atomically after a concurrent revocation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "live-presence-session-revocation-race-"));
+  const databasePath = join(directory, "presence.sqlite");
+  const server = await buildApp(databasePath);
+  const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const ownerUserId = ownerSession.json<{ user: { id: string } }>().user.id;
+  const viewerAccount = await createViewer(server, `binding-race-${Date.now()}@example.com`);
+  server.authorization.grant(ownerUserId, viewerAccount.userId);
+  const sockets: WebSocket[] = [];
+
+  try {
+    await server.app.listen({ host: "127.0.0.1", port: 0 });
+    const address = server.app.server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `ws://127.0.0.1:${address.port}/ws`;
+    const owner = new WebSocket(url, { origin: "http://localhost:5173" });
+    const viewer = new WebSocket(url, {
+      origin: "http://localhost:5173",
+      headers: { cookie: viewerAccount.cookie },
+    });
+    sockets.push(owner, viewer);
+    const ownerAuth = nextMessage(owner);
+    const viewerAuth = nextMessage(viewer);
+    await Promise.all([waitForOpen(owner), waitForOpen(viewer)]);
+    owner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    await Promise.all([ownerAuth, viewerAuth]);
+
+    const ownerSharingAck = nextMessage(owner);
+    const viewerSharing = nextMessage(viewer);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: false }));
+    await Promise.all([ownerSharingAck, viewerSharing]);
+
+    const canAccess = server.authorization.canAccess.bind(server.authorization);
+    let injectedRevocation = false;
+    server.authorization.canAccess = (checkedOwnerId, checkedViewerId) => {
+      const active = canAccess(checkedOwnerId, checkedViewerId);
+      if (
+        active &&
+        !injectedRevocation &&
+        checkedOwnerId === ownerUserId &&
+        checkedViewerId === viewerAccount.userId
+      ) {
+        injectedRevocation = true;
+        server.authorization.revoke(ownerUserId, viewerAccount.userId);
+      }
+      return active;
+    };
+
+    const rejected = nextMessage(viewer);
+    viewer.send(JSON.stringify({
+      type: "create_session",
+      device_id: device.deviceId,
+    }));
+    assert.deepEqual(await rejected, {
+      type: "error",
+      code: "NOT_AUTHORIZED",
+    });
+    assert.equal(injectedRevocation, true);
+
+    const database = new Database(databasePath);
+    assert.equal(
+      database.prepare(
+        "SELECT COUNT(*) FROM presence_authorization_bindings WHERE owner_user_id = ? AND device_id = ? AND viewer_user_id = ?",
+      ).pluck().get(ownerUserId, device.deviceId, viewerAccount.userId),
+      0,
+    );
+    assert.equal(
+      database.prepare(
+        "SELECT COUNT(*) FROM presence_revocation_tombstones WHERE owner_user_id = ? AND device_id = ? AND viewer_user_id = ?",
+      ).pluck().get(ownerUserId, device.deviceId, viewerAccount.userId),
+      0,
+      "revocation before binding must not produce a session tombstone",
+    );
+    database.close();
+    await assertNoMessage(viewer);
+  } finally {
+    await Promise.all(sockets.map(terminateSocket));
+    await server.app.close();
+    server.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("session creation fails safely under SQLite write contention and succeeds after release", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "live-presence-sqlite-contention-"));
+  const databasePath = join(directory, "presence.sqlite");
+  const server = await buildApp(databasePath);
+  const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const ownerUserId = ownerSession.json<{ user: { id: string } }>().user.id;
+  const viewerAccount = await createViewer(server, `sqlite-contention-${Date.now()}@example.com`);
+  server.authorization.grant(ownerUserId, viewerAccount.userId);
+  const sockets: WebSocket[] = [];
+  const lockConnection = new Database(databasePath);
+  let lockHeld = false;
+
+  try {
+    await server.app.listen({ host: "127.0.0.1", port: 0 });
+    const address = server.app.server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `ws://127.0.0.1:${address.port}/ws`;
+    const owner = new WebSocket(url, { origin: "http://localhost:5173" });
+    const viewer = new WebSocket(url, {
+      origin: "http://localhost:5173",
+      headers: { cookie: viewerAccount.cookie },
+    });
+    sockets.push(owner, viewer);
+    const ownerAuth = nextMessage(owner);
+    const viewerAuth = nextMessage(viewer);
+    await Promise.all([waitForOpen(owner), waitForOpen(viewer)]);
+    owner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    await Promise.all([ownerAuth, viewerAuth]);
+
+    const ownerSharingAck = nextMessage(owner);
+    const viewerSharing = nextMessage(viewer);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    await Promise.all([ownerSharingAck, viewerSharing]);
+
+    lockConnection.exec("BEGIN IMMEDIATE");
+    lockHeld = true;
+    const rejected = nextMessage(viewer, 10_000);
+    viewer.send(JSON.stringify({
+      type: "create_session",
+      device_id: device.deviceId,
+      request_id: "00000000-0000-4000-8000-000000000001",
+    }));
+    assert.deepEqual(await rejected, { type: "error", code: "SERVER_ERROR" });
+    assert.equal(
+      lockConnection.prepare("SELECT COUNT(*) FROM presence_authorization_bindings")
+        .pluck().get(),
+      0,
+      "failed binding transaction must not insert an authorization binding",
+    );
+
+    lockConnection.exec("ROLLBACK");
+    lockHeld = false;
+    const createdMessages = nextMessages(viewer, 2);
+    const ownerJoined = nextMessage(owner);
+    viewer.send(JSON.stringify({
+      type: "create_session",
+      device_id: device.deviceId,
+      request_id: "00000000-0000-4000-8000-000000000002",
+    }));
+    const responses = await createdMessages;
+    assert.ok(responses.some((message) =>
+      message.type === "session_created" &&
+      message.request_id === "00000000-0000-4000-8000-000000000002"));
+    assert.equal(responses.some((message) => message.type === "session_attached"), false);
+    assert.equal((await ownerJoined).type, "viewer_joined");
+    assert.equal(
+      lockConnection.prepare("SELECT COUNT(*) FROM presence_authorization_bindings")
+        .pluck().get(),
+      1,
+    );
+  } finally {
+    if (lockHeld) lockConnection.exec("ROLLBACK");
+    lockConnection.close();
+    await Promise.all(sockets.map(terminateSocket));
+    await server.app.close();
+    server.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });

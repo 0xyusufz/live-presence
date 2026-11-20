@@ -3,11 +3,24 @@ import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { WebSocket, WebSocketServer } from "ws";
+import { and, asc, eq, isNull } from "drizzle-orm";
 import type { AuthService } from "../auth/service.js";
+import {
+  MAX_PRESENCE_REVOCATION_RECORDS,
+  type AppDatabase,
+} from "../db/index.js";
 import { DeviceAuthError, DeviceService } from "../devices/service.js";
 import { PresenceService, type PresenceConnectionCloseCause } from "./service.js";
-import { ViewerAuthorizationService } from "../authorization/service.js";
+import {
+  AuthorizationError,
+  ViewerAuthorizationService,
+} from "../authorization/service.js";
 import { ResumeSessionStore } from "./resume.js";
+import {
+  presenceAuthorizationBindings,
+  presenceRevocationOutbox,
+  presenceRevocationTombstones,
+} from "../db/schema.js";
 import {
   parseClientMessage,
   type ClientMessage,
@@ -103,6 +116,7 @@ export async function registerPresenceRoutes(
   presence: PresenceService,
   authorization: ViewerAuthorizationService,
   allowedOrigin: string,
+  db: AppDatabase,
   networkRecoveryGraceMs = VIEWER_DISCONNECT_GRACE_MS,
 ): Promise<void> {
   app.get("/presence", async (request, reply) => {
@@ -145,7 +159,7 @@ export async function registerPresenceRoutes(
   };
   const notifySessionRecovery = (session: Session): void => {
     if (!authorization.canAccess(session.ownerUserId, session.viewerUserId)) {
-      endSession(session.id, "authorization_revoked");
+      authorization.revoke(session.ownerUserId, session.viewerUserId);
       return;
     }
     const recoveryAttemptId = randomUUID();
@@ -195,6 +209,7 @@ export async function registerPresenceRoutes(
   };
   const connections = new Map<WebSocket, Connection>();
   const latestOwnerSockets = new Map<string, WebSocket>();
+  const ownerSharingStateSockets = new WeakSet<WebSocket>();
   const sessions = new Map<string, Session>();
   const sessionByDevice = new Map<string, string>();
   const shareStates = new Map<string, { screen: boolean; camera: boolean }>();
@@ -220,8 +235,44 @@ export async function registerPresenceRoutes(
 
   const send = (socket: WebSocket, message: ServerMessage | ClientMessage): boolean => {
     if (socket.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify(message));
-    return true;
+    try {
+      socket.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      console.warn(JSON.stringify({
+        source: "backend",
+        event: "websocket-send-failed",
+        error: error instanceof Error ? error.message : "unknown error",
+      }));
+      return false;
+    }
+  };
+  const getRevocationTombstone = (sessionId: string) =>
+    db.select()
+      .from(presenceRevocationTombstones)
+      .where(eq(presenceRevocationTombstones.sessionId, sessionId))
+      .get();
+  const clearRevocationTombstone = (
+    sessionId: string,
+    ownerUserId: string,
+    deviceId: string,
+  ): void => {
+    const operation = db.select()
+      .from(presenceRevocationOutbox)
+      .where(and(
+        eq(presenceRevocationOutbox.sessionId, sessionId),
+        eq(presenceRevocationOutbox.ownerUserId, ownerUserId),
+        eq(presenceRevocationOutbox.deviceId, deviceId),
+      ))
+      .get();
+    if (!operation || operation.processedAt === null) return;
+    db.delete(presenceRevocationTombstones)
+      .where(and(
+        eq(presenceRevocationTombstones.sessionId, sessionId),
+        eq(presenceRevocationTombstones.ownerUserId, ownerUserId),
+        eq(presenceRevocationTombstones.deviceId, deviceId),
+      ))
+      .run();
   };
   const notifyAuthorizedViewers = (
     ownerUserId: string,
@@ -273,9 +324,23 @@ export async function registerPresenceRoutes(
       ...(socket ? { socketConnectionGeneration: socketConnectionGenerations.get(socket) } : {}),
     }));
   };
-  const endSession = (sessionId: string, reason: string, preserveSharingState = false): void => {
+  const endSession = (
+    sessionId: string,
+    reason: string,
+    preserveSharingState = false,
+    viewerLeftReason = reason,
+  ): void => {
     const session = sessions.get(sessionId);
     if (!session) return;
+    if (reason === "sharing_stopped" || (reason === "closed" && !preserveSharingState)) {
+      db.delete(presenceAuthorizationBindings)
+        .where(and(
+          eq(presenceAuthorizationBindings.deviceId, session.deviceId),
+          eq(presenceAuthorizationBindings.viewerUserId, session.viewerUserId),
+          eq(presenceAuthorizationBindings.sessionId, session.id),
+        ))
+        .run();
+    }
     sessions.delete(sessionId);
     if (sessionByDevice.get(session.deviceId) === sessionId) sessionByDevice.delete(session.deviceId);
     if (session.viewerGraceTimer) clearTimeout(session.viewerGraceTimer);
@@ -299,17 +364,93 @@ export async function registerPresenceRoutes(
       reason,
       sharingStateCleared: !preserveSharingState,
     }));
-    const left = { type: "viewer_left" as const, session_id: sessionId, viewer_user_id: session.viewerUserId, reason };
+    const left = {
+      type: "viewer_left" as const,
+      session_id: sessionId,
+      viewer_user_id: session.viewerUserId,
+      reason: viewerLeftReason,
+    };
     if (session.owner) send(session.owner.socket, left);
     if (session.viewer) send(session.viewer.socket, left);
   };
-  authorization.setRevocationHandler((ownerUserId, viewerUserId) => {
-    for (const [id, session] of sessions) {
-      if (session.ownerUserId === ownerUserId && session.viewerUserId === viewerUserId) {
-        endSession(id, "authorization_revoked");
+  const processPendingRevocations = (): Set<string> => {
+    const completed = new Set<string>();
+    let operations;
+    try {
+      operations = db.select()
+        .from(presenceRevocationOutbox)
+        .where(isNull(presenceRevocationOutbox.processedAt))
+        .orderBy(
+          asc(presenceRevocationOutbox.createdAt),
+          asc(presenceRevocationOutbox.sessionId),
+        )
+        .limit(100)
+        .all();
+    } catch (error) {
+      console.error(JSON.stringify({
+        source: "backend",
+        event: "presence_revocation_outbox_read_failed",
+        error: error instanceof Error ? error.message : "unknown error",
+      }));
+      return completed;
+    }
+    for (const operation of operations) {
+      try {
+        const session = sessions.get(operation.sessionId);
+        if (session) {
+          if (
+            session.ownerUserId !== operation.ownerUserId ||
+            session.deviceId !== operation.deviceId ||
+            session.viewerUserId !== operation.viewerUserId
+          ) {
+            console.error(JSON.stringify({
+              source: "backend",
+              event: "presence_revocation_outbox_identity_mismatch",
+              sessionId: operation.sessionId,
+            }));
+            continue;
+          }
+          endSession(session.id, "authorization_revoked");
+        }
+        db.update(presenceRevocationOutbox)
+          .set({ processedAt: Date.now() })
+          .where(and(
+            eq(presenceRevocationOutbox.sessionId, operation.sessionId),
+            isNull(presenceRevocationOutbox.processedAt),
+          ))
+          .run();
+        completed.add(operation.sessionId);
+        const ownerSocket = latestOwnerSockets.get(operation.deviceId);
+        const ownerConnection = ownerSocket ? connections.get(ownerSocket) : undefined;
+        if (
+          ownerSocket &&
+          ownerConnection?.userId === operation.ownerUserId &&
+          ownerConnection.deviceId === operation.deviceId
+        ) {
+          send(ownerSocket, {
+            type: "session_retired",
+            session_id: operation.sessionId,
+            outcome: "authorization_revoked",
+          });
+        }
+      } catch (error) {
+        console.error(JSON.stringify({
+          source: "backend",
+          event: "presence_revocation_outbox_retry",
+          sessionId: operation.sessionId,
+          error: error instanceof Error ? error.message : "unknown error",
+        }));
       }
     }
+    return completed;
+  };
+  authorization.setRevocationHandler(() => {
+    processPendingRevocations();
   });
+  const revocationRetryTimer = setInterval(processPendingRevocations, 1_000);
+  revocationRetryTimer.unref();
+  processPendingRevocations();
+  app.addHook("onClose", async () => clearInterval(revocationRetryTimer));
 
   const upgrade = (
     request: IncomingMessage,
@@ -433,6 +574,22 @@ export async function registerPresenceRoutes(
                 reattachmentSucceeded: false,
               }));
             }
+            const processedRevocations = processPendingRevocations();
+            const tombstones = db.select()
+              .from(presenceRevocationTombstones)
+              .where(and(
+                eq(presenceRevocationTombstones.ownerUserId, connection.userId),
+                eq(presenceRevocationTombstones.deviceId, connection.deviceId),
+              ))
+              .all();
+            for (const tombstone of tombstones) {
+              if (processedRevocations.has(tombstone.sessionId)) continue;
+              send(socket, {
+                type: "session_retired",
+                session_id: tombstone.sessionId,
+                outcome: "authorization_revoked",
+              });
+            }
             for (const recoverable of recoverableSessions) {
               if (recoverable.ownerGraceTimer) clearTimeout(recoverable.ownerGraceTimer);
               recoverable.ownerGraceTimer = undefined;
@@ -512,6 +669,7 @@ export async function registerPresenceRoutes(
           }));
           return;
         }
+        ownerSharingStateSockets.add(socket);
         setSharingState(
           connection.deviceId,
           { screen: message.screen, camera: message.camera },
@@ -628,6 +786,7 @@ export async function registerPresenceRoutes(
               ...(ownerRecoveryRemainingMs === undefined
                 ? {}
                 : { owner_recovery_remaining_ms: ownerRecoveryRemainingMs }),
+              ...(message.request_id === undefined ? {} : { request_id: message.request_id }),
             });
             if (knownSessionReconnect) {
               notifySessionRecovery(currentSession);
@@ -645,6 +804,21 @@ export async function registerPresenceRoutes(
           }
           const owner = [...connections.values()].find((candidate) => candidate.role === "owner" && candidate.deviceId === deviceId);
           if (!owner) { send(socket, { type: "error", code: "DEVICE_OFFLINE" }); return; }
+          if (!ownerSharingStateSockets.has(owner.socket)) {
+            send(socket, {
+              type: "device_sharing_state",
+              device_id: deviceId,
+              screen: false,
+              camera: false,
+            });
+            console.info(JSON.stringify({
+              source: "backend",
+              event: "create-session-waiting",
+              deviceId,
+              result: "OWNER_SHARING_STATE_UNCONFIRMED",
+            }));
+            return;
+          }
           const sessionId = randomUUID();
           console.info(JSON.stringify({
             source: "backend",
@@ -664,13 +838,50 @@ export async function registerPresenceRoutes(
             requests: new Map<string, "screen" | "camera">(),
             sleepEpoch: 0,
           };
+          try {
+            authorization.bindAuthorizedSession(
+              session.ownerUserId,
+              session.deviceId,
+              session.viewerUserId,
+              session.id,
+            );
+          } catch (error) {
+            if (error instanceof AuthorizationError) {
+              send(socket, { type: "error", code: "NOT_AUTHORIZED" });
+              return;
+            }
+            const capacityExhausted = error instanceof Error &&
+              error.message.includes("PRESENCE_REVOCATION_CAPACITY_EXHAUSTED");
+            if (capacityExhausted) {
+              console.warn(JSON.stringify({
+                source: "backend",
+                event: "presence_revocation_capacity_exhausted",
+                capacity: MAX_PRESENCE_REVOCATION_RECORDS,
+                remediation: "acknowledge pending revocations or reduce active authorized relationships",
+              }));
+              send(socket, { type: "error", code: "PRESENCE_CAPACITY_EXHAUSTED" });
+            } else {
+              console.error(JSON.stringify({
+                source: "backend",
+                event: "presence_authorization_binding_failed",
+                error: error instanceof Error ? error.message : "unknown error",
+              }));
+              send(socket, { type: "error", code: "SERVER_ERROR" });
+            }
+            return;
+          }
           sessions.set(sessionId, session); sessionByDevice.set(deviceId, sessionId);
           send(socket, {
             type: "device_sharing_state",
             device_id: deviceId,
             ...currentSharingState,
           });
-          send(socket, { type: "session_created", session_id: sessionId, device_id: deviceId });
+          send(socket, {
+            type: "session_created",
+            session_id: sessionId,
+            device_id: deviceId,
+            ...(message.request_id === undefined ? {} : { request_id: message.request_id }),
+          });
           send(owner.socket, { type: "viewer_joined", session_id: sessionId, viewer_user_id: connection.userId });
           console.info(JSON.stringify({
             source: "backend",
@@ -780,15 +991,56 @@ export async function registerPresenceRoutes(
             send(session.owner.socket, { type: "session_resumed", session_id: session.id, epoch: rotated.epoch });
             send(session.viewer.socket, { type: "session_resumed", session_id: session.id, epoch: rotated.epoch });
           }
-        } else if (type === "leave_session" || type === "offer" || type === "answer" || type === "ice_candidate" || type === "share_request" || type === "share_request_cancel" || type === "share_request_decision") {
+        } else if (type === "retire_session" || type === "retire_session_ack" || type === "leave_session" || type === "offer" || type === "answer" || type === "ice_candidate" || type === "share_request" || type === "share_request_cancel" || type === "share_request_decision") {
           const sessionId = message.session_id;
+          if (type === "retire_session_ack") {
+            if (connection.role !== "owner") {
+              send(socket, { type: "error", code: "WRONG_ROLE" });
+              return;
+            }
+            if (
+              connection.deviceId &&
+              latestOwnerSockets.get(connection.deviceId) === socket &&
+              message.outcome === "authorization_revoked"
+            ) {
+              clearRevocationTombstone(sessionId, connection.userId, connection.deviceId);
+            }
+            return;
+          }
           const session = typeof sessionId === "string" ? sessions.get(sessionId) : undefined;
+          if (type === "retire_session" && !session) {
+            if (connection.role !== "owner") {
+              send(socket, { type: "error", code: "WRONG_ROLE" });
+              return;
+            }
+            const tombstone = getRevocationTombstone(sessionId);
+            if (tombstone &&
+              tombstone.ownerUserId === connection.userId &&
+              tombstone.deviceId === connection.deviceId) {
+              send(socket, {
+                type: "session_retired",
+                session_id: sessionId,
+                outcome: "authorization_revoked",
+              });
+              return;
+            }
+            send(socket, { type: "session_retired", session_id: sessionId, outcome: "not_found" });
+            return;
+          }
           if (!session || (session.owner?.socket !== socket && session.viewer?.socket !== socket)) {
             send(socket, { type: "error", code: "NOT_AUTHORIZED" }); return;
           }
+          if (type === "retire_session" && session.owner?.socket !== socket) {
+            send(socket, { type: "error", code: "WRONG_ROLE" });
+            return;
+          }
           if (!authorization.canAccess(session.ownerUserId, session.viewerUserId)) {
-            endSession(session.id, "authorization_revoked");
-            send(socket, { type: "error", code: "NOT_AUTHORIZED" });
+            authorization.revoke(session.ownerUserId, session.viewerUserId);
+            return;
+          }
+          if (type === "retire_session") {
+            endSession(session.id, "recovery_timeout", true, "temporary_disconnect");
+            send(socket, { type: "session_retired", session_id: session.id, outcome: "retired" });
             return;
           }
           if (type === "leave_session") {
@@ -911,7 +1163,11 @@ export async function registerPresenceRoutes(
               }
               if (!session.viewerGraceTimer) {
                 session.viewerGraceTimer = setTimeout(
-                  () => endSession(id, "viewer_grace_expired"),
+                  () => endSession(
+                    id,
+                    "viewer_grace_expired",
+                    Boolean(session.owner),
+                  ),
                   networkRecoveryGraceMs,
                 );
                 session.viewerGraceTimer.unref();
@@ -1021,6 +1277,7 @@ export async function registerPresenceRoutes(
       if (session.viewerGraceTimer) clearTimeout(session.viewerGraceTimer);
       if (session.sleepTimer) clearTimeout(session.sleepTimer);
     }
+
     for (const socket of webSocketServer.clients) {
       if (socket.readyState === WebSocket.OPEN) socket.close(1001, "server shutting down");
     }

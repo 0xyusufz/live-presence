@@ -9,6 +9,33 @@ const negotiationId = "negotiation-1";
 test("protocol parser accepts documented snake_case messages", () => {
   assert.deepEqual(parseServerMessage({ type: "heartbeat_ack" }), { type: "heartbeat_ack" });
   assert.deepEqual(parseServerMessage({
+    type: "session_retired",
+    session_id: sessionId,
+    outcome: "retired",
+  }), {
+    type: "session_retired",
+    session_id: sessionId,
+    outcome: "retired",
+  });
+  assert.deepEqual(parseServerMessage({
+    type: "session_retired",
+    session_id: sessionId,
+    outcome: "not_found",
+  }), {
+    type: "session_retired",
+    session_id: sessionId,
+    outcome: "not_found",
+  });
+  assert.deepEqual(parseServerMessage({
+    type: "session_retired",
+    session_id: sessionId,
+    outcome: "authorization_revoked",
+  }), {
+    type: "session_retired",
+    session_id: sessionId,
+    outcome: "authorization_revoked",
+  });
+  assert.deepEqual(parseServerMessage({
     type: "session_recovery",
     session_id: sessionId,
     recovery_attempt_id: "recovery-attempt-1",
@@ -20,6 +47,39 @@ test("protocol parser accepts documented snake_case messages", () => {
   assert.deepEqual(parseClientMessage({ type: "create_session", device_id: deviceId }), {
     type: "create_session",
     device_id: deviceId,
+  });
+  assert.deepEqual(parseClientMessage({
+    type: "create_session",
+    device_id: deviceId,
+    request_id: "session-request-1",
+  }), {
+    type: "create_session",
+    device_id: deviceId,
+    request_id: "session-request-1",
+  });
+  assert.deepEqual(parseServerMessage({
+    type: "session_created",
+    session_id: sessionId,
+    device_id: deviceId,
+    request_id: "session-request-1",
+  }), {
+    type: "session_created",
+    session_id: sessionId,
+    device_id: deviceId,
+    request_id: "session-request-1",
+  });
+  assert.deepEqual(parseClientMessage({ type: "retire_session", session_id: sessionId }), {
+    type: "retire_session",
+    session_id: sessionId,
+  });
+  assert.deepEqual(parseClientMessage({
+    type: "retire_session_ack",
+    session_id: sessionId,
+    outcome: "authorization_revoked",
+  }), {
+    type: "retire_session_ack",
+    session_id: sessionId,
+    outcome: "authorization_revoked",
   });
   assert.deepEqual(parseClientMessage({
     type: "offer",
@@ -55,6 +115,7 @@ test("protocol parser accepts a valid owner recovery grace on session attachment
     screen: true,
     camera: false,
     owner_recovery_remaining_ms: 45_000,
+    request_id: "session-request-1",
   }), {
     type: "session_attached",
     session_id: sessionId,
@@ -62,6 +123,7 @@ test("protocol parser accepts a valid owner recovery grace on session attachment
     screen: true,
     camera: false,
     owner_recovery_remaining_ms: 45_000,
+    request_id: "session-request-1",
   });
   assert.equal(parseServerMessage({
     type: "session_attached",
