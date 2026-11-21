@@ -20,6 +20,11 @@ import { SignalingPeerGeneration } from "./main/signaling-peer-generation.js";
 import { registerSignalingIpcHandlers } from "./main/signaling-ipc-handlers.js";
 import { createSignalingConnectHandler } from "./main/signaling-connect-handler.js";
 import { WindowRestorer } from "./main/window-restoration.js";
+import {
+  canAcceptRecoveryStart,
+  canAcceptRecoveryTerminal,
+  isValidRecoveryAttemptId,
+} from "./main/sleep-recovery-state.js";
 import type { AppEvent, SocketEvent } from "./ipc-contract.js";
 
 protocol.registerSchemesAsPrivileged([
@@ -31,6 +36,7 @@ const WEB_ORIGIN = process.env.LIVE_PRESENCE_WEB_ORIGIN ?? "http://localhost:517
 const HEARTBEAT_INTERVAL_MS = 1_000;
 const HEARTBEAT_EXPIRY_MS = 4_000;
 const CLEANUP_ACK_MS = 2_000;
+const SLEEP_RECOVERY_DECISION_MS = 10_000;
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
 declare const MAIN_WINDOW_VITE_NAME: string;
@@ -48,6 +54,10 @@ let stopping = false;
 let quittingAfterCleanup = false;
 let sleepMarkerAcknowledged = false;
 let systemSuspended = false;
+let sleepRecoveryCycleId = 0;
+let sleepRecoveryTimer: NodeJS.Timeout | undefined;
+let sleepRecoveryState: "idle" | "started" | "completed" | "failed" | "timed_out" = "idle";
+let sleepRecoveryAttemptId: string | undefined;
 let activeCaptureAttemptId: string | undefined;
 let indicatorCreation: Promise<void> | undefined;
 
@@ -273,6 +283,11 @@ async function stopSharing(reason: string, quitAfter = false): Promise<void> {
     return;
   }
   stopping = true;
+  sleepRecoveryCycleId += 1;
+  if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
+  sleepRecoveryTimer = undefined;
+  sleepRecoveryState = "idle";
+  sleepRecoveryAttemptId = undefined;
   signalingPeerGeneration.invalidate();
   quittingAfterCleanup ||= quitAfter;
   const needsRendererCleanup = shareActive || capturePending;
@@ -465,6 +480,11 @@ function installIpcHandlers(): void {
   ipcMain.handle("capture:screen-active", async (event, active: unknown) => {
     if (!mainSender(event) || typeof active !== "boolean") throw new Error("invalid IPC request");
     if (!active) {
+      sleepRecoveryCycleId += 1;
+      if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
+      sleepRecoveryTimer = undefined;
+      sleepRecoveryState = "idle";
+      sleepRecoveryAttemptId = undefined;
       signalingPeerGeneration.invalidate();
       shareActive = false;
       capturePending = false;
@@ -519,8 +539,80 @@ function installIpcHandlers(): void {
     if (!mainSender(event)) return;
     cleanupWaiter?.();
   });
-  ipcMain.on("system:sleep-marker-result", (event, accepted: unknown) => {
-    if (mainSender(event) && typeof accepted === "boolean") sleepMarkerAcknowledged = accepted;
+  ipcMain.on("system:sleep-marker-result", (event, cycleId: unknown, accepted: unknown) => {
+    if (mainSender(event) && typeof cycleId === "number" &&
+      cycleId === sleepRecoveryCycleId && typeof accepted === "boolean") {
+      sleepMarkerAcknowledged = accepted;
+    }
+  });
+  ipcMain.on("system:sleep-recovery-result", (
+    event,
+    cycleId: unknown,
+    recoveryAttemptId: unknown,
+    phase: unknown,
+  ) => {
+    if (!mainSender(event) || typeof cycleId !== "number" ||
+      !isValidRecoveryAttemptId(recoveryAttemptId) ||
+      !["eligible", "started", "completed", "failed", "timed_out"].includes(String(phase)) ||
+      cycleId !== sleepRecoveryCycleId) return;
+    if (phase === "eligible") {
+      if (!shareActive || sleepRecoveryState !== "started" ||
+        !canAcceptRecoveryStart(sleepRecoveryState, sleepRecoveryAttemptId, recoveryAttemptId)) return;
+      sleepRecoveryAttemptId = recoveryAttemptId;
+      emitAppEvent({
+        type: "sleep-recovery-attempt-accepted",
+        cycleId,
+        recoveryAttemptId,
+      });
+      return;
+    }
+    if (phase === "started") {
+      if (sleepRecoveryAttemptId !== recoveryAttemptId) return;
+      return;
+    }
+    if (!canAcceptRecoveryTerminal(
+      sleepRecoveryState,
+      cycleId,
+      sleepRecoveryCycleId,
+      sleepRecoveryAttemptId,
+      recoveryAttemptId,
+      phase,
+    )) return;
+    if (phase === "completed") {
+      if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
+      sleepRecoveryTimer = undefined;
+      sleepRecoveryState = "completed";
+      emitAppEvent({
+        type: "sleep-recovery-result",
+        cycleId,
+        recoveryAttemptId,
+        phase: "completed",
+        accepted: true,
+      });
+    } else if (phase === "failed") {
+      if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
+      sleepRecoveryTimer = undefined;
+      sleepRecoveryState = "failed";
+      emitAppEvent({
+        type: "sleep-recovery-result",
+        cycleId,
+        recoveryAttemptId,
+        phase: "failed",
+        accepted: true,
+      });
+    } else if (phase === "timed_out") {
+      if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
+      sleepRecoveryTimer = undefined;
+      sleepRecoveryState = "timed_out";
+      sleepRecoveryAttemptId = undefined;
+      emitAppEvent({
+        type: "sleep-recovery-result",
+        cycleId,
+        recoveryAttemptId,
+        phase: "timed_out",
+        accepted: true,
+      });
+    }
   });
   ipcMain.on("indicator:stop", (event) => {
     if (indicatorWindow && event.sender === indicatorWindow.webContents) void stopSharing("indicator-stop");
@@ -630,21 +722,35 @@ app.whenReady().then(async () => {
 
   powerMonitor.on("suspend", () => {
     systemSuspended = true;
+    if (!shareActive && !capturePending) return;
     sleepMarkerAcknowledged = false;
-    emitAppEvent({ type: "suspend" });
+    sleepRecoveryCycleId += 1;
+    if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
+    sleepRecoveryTimer = undefined;
+    sleepRecoveryState = "idle";
+    sleepRecoveryAttemptId = undefined;
+    emitAppEvent({ type: "suspend", cycleId: sleepRecoveryCycleId });
   });
   powerMonitor.on("resume", () => {
     lastHeartbeat = Date.now();
     systemSuspended = false;
-    if (shareActive && !sleepMarkerAcknowledged) {
-      void stopSharing("sleep-continuity-unavailable");
-      return;
-    }
     if (capturePending && !shareActive) {
       void stopSharing("capture-interrupted-by-sleep");
       return;
     }
-    emitAppEvent({ type: "resume" });
+    if (shareActive) {
+      if (sleepRecoveryState !== "idle") return;
+      sleepRecoveryState = "started";
+      if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
+      sleepRecoveryTimer = setTimeout(() => {
+        sleepRecoveryTimer = undefined;
+        if (!shareActive || sleepRecoveryState !== "started") return;
+        sleepRecoveryState = "timed_out";
+        sleepRecoveryAttemptId = undefined;
+        emitAppEvent({ type: "sleep-recovery-timeout", cycleId: sleepRecoveryCycleId });
+      }, SLEEP_RECOVERY_DECISION_MS);
+    }
+    if (shareActive) emitAppEvent({ type: "resume", cycleId: sleepRecoveryCycleId });
     sleepMarkerAcknowledged = false;
   });
   app.on("activate", () => {

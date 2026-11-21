@@ -2251,6 +2251,34 @@ test("server sleep/wake lifecycle resumes the existing approved session without 
     await assertNoMessage(wakingOwner);
     await assertNoMessage(wakingViewer);
 
+    const completedOwnerClosed = waitForClose(wakingOwner);
+    wakingOwner.close();
+    await completedOwnerClosed;
+    const reattachedOwner = new WebSocket(url, { origin: "http://localhost:5173" });
+    sockets.push(reattachedOwner);
+    const reattachedMessages = nextMessages(reattachedOwner, 2);
+    await waitForOpen(reattachedOwner);
+    reattachedOwner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    const [reattachedAuth, recovery] = await reattachedMessages;
+    assert.equal(reattachedAuth?.type, "authenticated");
+    assert.equal(recovery?.type, "session_recovery");
+    assert.equal(recovery?.session_id, sessionId);
+
+    const statusResponse = nextMessage(reattachedOwner);
+    reattachedOwner.send(JSON.stringify({
+      type: "resume_status",
+      session_id: sessionId,
+      epoch: ownerMarked?.epoch,
+      request_id: "00000000-0000-4000-8000-000000000002",
+    }));
+    assert.deepEqual(await statusResponse, {
+      type: "resume_status",
+      session_id: sessionId,
+      epoch: ownerMarked?.epoch,
+      request_id: "00000000-0000-4000-8000-000000000002",
+      status: "completed",
+    });
+
     const sharing = await server.app.inject({
       method: "GET",
       url: "/presence",

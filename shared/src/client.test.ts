@@ -1996,6 +1996,140 @@ test("desktop retries a restart after no answer and permits the second attempt",
   client.close();
 });
 
+test("abandonSleepRecovery preserves an open signaling socket and recreates peer recovery", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  const { client, socket, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    {
+      isSharingActive: () => true,
+      prepareOwnerPeer: async (peer) => {
+        await peer.replaceTrack("screen", screenTrack);
+      },
+    },
+  );
+  await client.setSharingState(true, false);
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+
+  client.abandonSleepRecovery();
+  assert.equal(connection.closed, true);
+  assert.equal(socket.readyState, 1);
+  assert.equal(client.lifecycle, "RECONNECTING");
+  const abandonedInternal = client as unknown as {
+    recoverySessionId: string | undefined;
+  };
+  assert.equal(
+    abandonedInternal.recoverySessionId,
+    "00000000-0000-0000-0000-000000000002",
+  );
+  connection.closed = false;
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "post-abandon-recovery",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  peerConnection.closed = false;
+  assert.equal(peerConnection.offerCalls, 2);
+  assert.equal(peerConnection.closed, false);
+  assert.equal(
+    peerConnection.replaceCalls.some((call) =>
+      call.index === 0 && call.track === screenTrack),
+    true,
+  );
+  client.close();
+});
+
+test("desktop wake recovers the approved session after sleep marking times out", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    {
+    isSharingActive: () => true,
+    },
+  );
+
+  await client.setSharingState(true, false);
+  const marker = client.prepareForSleep();
+  scheduler.runDelay(2_000);
+  await assert.rejects(marker, /not acknowledged/);
+  client.resumeAfterWake();
+
+  assert.equal(socket.readyState, 3);
+  assert.equal(peerConnection.closed, false);
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "sleep-recovery-attempt",
+    }),
+  });
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 2);
+  assert.equal(peerConnection.closed, false);
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      sdp: "sleep-recovery-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  peerConnection.connectionState = "connected";
+  peerConnection.onconnectionstatechange?.();
+  assert.equal(client.lifecycle, "CONNECTED");
+  client.close();
+});
+
+test("desktop resume sends one capability request for duplicate wake notifications", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => true,
+  });
+
+  await client.setSharingState(true, false);
+  const marker = client.prepareForSleep();
+  const markerRequest = JSON.parse(socket.sent.at(-1)!) as { request_id: string };
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "sleep_marked",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 1,
+      capability: "resume-capability",
+      expires_at: 60_000,
+      request_id: markerRequest.request_id,
+    }),
+  });
+  await marker;
+
+  client.resumeAfterWake();
+  client.resumeAfterWake();
+  assert.equal(
+    socket.sent.filter((data) => JSON.parse(data).type === "resume_session").length,
+    1,
+  );
+  client.close();
+});
+
 test("desktop retries an ICE restart offer failure once without replacing the peer", async () => {
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();
@@ -3774,7 +3908,7 @@ test("recovery timeout retires the captured session after closePeer(true)", asyn
     scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
     await new Promise((resolve) => setImmediate(resolve));
 
-    assert.equal(internal.recoverySessionId, undefined);
+    assert.equal(internal.recoverySessionId, originalSessionId);
     assert.equal(internal.retiredSessionIds.has(originalSessionId), true);
     const retireMessages = socket.sent
       .map((raw) => JSON.parse(raw) as Record<string, unknown>)
@@ -3844,7 +3978,7 @@ test("desktop recovery timeout flushes pending retirement after authentication a
   scheduler.runDelay(NETWORK_RECOVERY_TIMEOUT_MS);
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(internal.recoverySessionId, undefined);
+  assert.equal(internal.recoverySessionId, timedOutSessionId);
   assert.equal(internal.pendingSessionRetirements.has(timedOutSessionId), true);
   assert.equal(internal.retiredSessionIds.has(timedOutSessionId), true);
 
@@ -6335,17 +6469,596 @@ test("viewer retries a lost sleep-resume acknowledgement idempotently", async ()
   sockets[2]!.open();
   sockets[2]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
   await new Promise((resolve) => setImmediate(resolve));
-  const retriedResume = JSON.parse(sockets[2]!.sent.at(-1)!) as Record<string, unknown>;
+  const statusRequest = JSON.parse(sockets[2]!.sent.at(-1)!) as Record<string, unknown>;
 
+  assert.equal(statusRequest.type, "resume_status");
+  assert.equal(statusRequest.session_id, sessionId);
+  assert.equal(statusRequest.request_id, firstResume.request_id);
+  sockets[2]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_status",
+      session_id: sessionId,
+      epoch: 1,
+      request_id: firstResume.request_id,
+      status: "retryable",
+    }),
+  });
+  const retriedResume = JSON.parse(sockets[2]!.sent.at(-1)!) as Record<string, unknown>;
   assert.equal(retriedResume.type, "resume_session");
-  assert.equal(retriedResume.session_id, sessionId);
   assert.equal(retriedResume.capability, firstResume.capability);
   assert.equal(retriedResume.request_id, firstResume.request_id);
   assert.equal(sockets[2]!.sent.filter((data) => JSON.parse(data).type === "create_session").length, 0);
   viewer.close();
 });
 
-test("expired viewer sleep-resume capability fails closed without creating a new session", async () => {
+test("viewer reconciles pending resume status by replaying the rotated capability", async () => {
+  const { viewer, scheduler, sockets, sessionId } = await createSleepMarkedViewer();
+  viewer.resumeAfterWake();
+  const firstResume = JSON.parse(sockets[0]!.sent.at(-1)!) as Record<string, string>;
+  sockets[0]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_pending",
+      session_id: sessionId,
+      epoch: 1,
+      capability: "rotated-before-disconnect",
+      expires_at: 60_000,
+      request_id: firstResume.request_id,
+    }),
+  });
+  sockets[0]!.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstStatus = JSON.parse(sockets[1]!.sent.at(-1)!) as Record<string, string>;
+  assert.equal(firstStatus.type, "resume_status");
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_status",
+      session_id: sessionId,
+      epoch: 1,
+      request_id: firstStatus.request_id,
+      status: "pending",
+      capability: "rotated-viewer-capability",
+      expires_at: 60_000,
+    }),
+  });
+  const replay = JSON.parse(sockets[1]!.sent.at(-1)!) as Record<string, string>;
+  assert.deepEqual({
+    type: replay.type,
+    session_id: replay.session_id,
+    capability: replay.capability,
+    request_id: replay.request_id,
+  }, {
+    type: "resume_session",
+    session_id: sessionId,
+    capability: "rotated-viewer-capability",
+    request_id: firstStatus.request_id,
+  });
+  viewer.close();
+});
+
+test("owner reconciles pending resume status by replaying the rotated capability", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, sockets } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => true,
+  });
+  await client.setSharingState(true, false);
+  const marker = client.prepareForSleep();
+  const markerRequest = JSON.parse(sockets[0]!.sent.at(-1)!) as Record<string, string>;
+  sockets[0]!.onmessage?.({
+    data: JSON.stringify({
+      type: "sleep_marked",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 1,
+      capability: "owner-capability",
+      expires_at: 60_000,
+      request_id: markerRequest.request_id,
+    }),
+  });
+  await marker;
+  client.resumeAfterWake();
+  const firstResume = JSON.parse(sockets[0]!.sent.at(-1)!) as Record<string, string>;
+  sockets[0]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_pending",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 1,
+      capability: "rotated-before-disconnect",
+      expires_at: 60_000,
+      request_id: firstResume.request_id,
+    }),
+  });
+  sockets[0]!.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstStatus = JSON.parse(sockets[1]!.sent.at(-1)!) as Record<string, string>;
+  assert.equal(firstStatus.type, "resume_status");
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_status",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 1,
+      request_id: firstStatus.request_id,
+      status: "pending",
+      capability: "rotated-owner-capability",
+      expires_at: 60_000,
+    }),
+  });
+  const replay = JSON.parse(sockets[1]!.sent.at(-1)!) as Record<string, string>;
+  assert.equal(replay.type, "resume_session");
+  assert.equal(replay.capability, "rotated-owner-capability");
+  assert.equal(replay.request_id, firstStatus.request_id);
+  client.close();
+});
+
+test("SLEEP_NOT_ALLOWED rejects only its matching pending owner marker", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const diagnostics: DesktopDiagnostic[] = [];
+  const { client, socket } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => true,
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+  });
+  await client.setSharingState(true, false);
+
+  const firstMarker = client.prepareForSleep();
+  const firstRequest = JSON.parse(socket.sent.at(-1)!) as Record<string, string>;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "error",
+      code: "SLEEP_NOT_ALLOWED",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      request_id: firstRequest.request_id,
+    }),
+  });
+  await assert.rejects(firstMarker, /SLEEP_NOT_ALLOWED/);
+  assert.notEqual(client.lifecycle, "FAILED");
+  assert.equal(connection.closed, false);
+  assert.equal(
+    diagnostics.some((diagnostic) =>
+      diagnostic.event === "sleep_marker_error_received" &&
+      diagnostic.correlationId === firstRequest.request_id &&
+      diagnostic.reason?.includes("matched pending sleep marker")),
+    true,
+  );
+
+  // A duplicate response for the old marker must not affect a later marker.
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "error",
+      code: "SLEEP_NOT_ALLOWED",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      request_id: firstRequest.request_id,
+    }),
+  });
+  const secondMarker = client.prepareForSleep();
+  let secondSettled = false;
+  void secondMarker.finally(() => { secondSettled = true; });
+  const secondRequest = JSON.parse(socket.sent.at(-1)!) as Record<string, string>;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "error",
+      code: "SLEEP_NOT_ALLOWED",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      request_id: firstRequest.request_id,
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondSettled, false);
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "sleep_marked",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 2,
+      capability: "new-owner-capability",
+      expires_at: 60_000,
+      request_id: secondRequest.request_id,
+    }),
+  });
+  await secondMarker;
+  assert.notEqual(client.lifecycle, "FAILED");
+  client.close();
+});
+
+test("owner RESUME_INVALID reconnects without stopping approved capture", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket } = await connectedDesktop(scheduler, connection, undefined, {
+    isSharingActive: () => true,
+  });
+  await client.setSharingState(true, false);
+  const marker = client.prepareForSleep();
+  const markerRequest = JSON.parse(socket.sent.at(-1)!) as Record<string, string>;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "sleep_marked",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 1,
+      capability: "owner-capability",
+      expires_at: 60_000,
+      request_id: markerRequest.request_id,
+    }),
+  });
+  await marker;
+  socket.onmessage?.({ data: JSON.stringify({ type: "error", code: "RESUME_INVALID" }) });
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.ok(scheduler.timers.size >= 1);
+  assert.equal(connection.closed, false);
+  client.close();
+});
+
+test("viewer reconciles completed resume after missing session_resumed", async () => {
+  const { viewer, scheduler, sockets, sessionId, connections } = await createSleepMarkedViewer();
+  viewer.resumeAfterWake();
+  const firstResume = JSON.parse(sockets[0]!.sent.at(-1)!) as Record<string, string>;
+  sockets[0]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_pending",
+      session_id: sessionId,
+      epoch: 1,
+      capability: "rotated-viewer-capability",
+      expires_at: 60_000,
+      request_id: firstResume.request_id,
+    }),
+  });
+  sockets[0]!.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  const statusRequest = JSON.parse(sockets[1]!.sent.at(-1)!) as Record<string, string>;
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_status",
+      session_id: sessionId,
+      epoch: 1,
+      request_id: statusRequest.request_id,
+      status: "completed",
+    }),
+  });
+  const attach = JSON.parse(sockets[1]!.sent.at(-1)!) as Record<string, string>;
+  assert.equal(attach.type, "create_session");
+  assert.equal(attach.active_session_id, sessionId);
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_attached",
+      session_id: sessionId,
+      device_id: "00000000-0000-0000-0000-000000000001",
+      screen: true,
+      camera: true,
+      request_id: attach.request_id,
+    }),
+  });
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "completed-resume-negotiation",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+  viewer.close();
+});
+
+test("owner reconciles completed resume after missing session_resumed", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+  const screenTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  const cameraTrack: WebRtcTrack = { kind: "video", readyState: "live" };
+  let prepareCalls = 0;
+  const { client, sockets, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    {
+      isSharingActive: () => true,
+      prepareOwnerPeer: async (peer) => {
+        prepareCalls += 1;
+        await peer.replaceTrack("screen", screenTrack);
+        await peer.replaceTrack("camera", cameraTrack);
+      },
+    },
+  );
+  await client.setSharingState(true, true);
+  assert.equal(prepareCalls, 1);
+  assert.deepEqual(peerConnection.replaceCalls, [
+    { index: 0, track: screenTrack },
+    { index: 1, track: cameraTrack },
+  ]);
+  const marker = client.prepareForSleep();
+  const markerRequest = JSON.parse(sockets[0]!.sent.at(-1)!) as Record<string, string>;
+  sockets[0]!.onmessage?.({
+    data: JSON.stringify({
+      type: "sleep_marked",
+      session_id: sessionId,
+      epoch: 1,
+      capability: "owner-capability",
+      expires_at: 60_000,
+      request_id: markerRequest.request_id,
+    }),
+  });
+  await marker;
+  client.resumeAfterWake();
+  const firstResume = JSON.parse(sockets[0]!.sent.at(-1)!) as Record<string, string>;
+  sockets[0]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_pending",
+      session_id: sessionId,
+      epoch: 1,
+      capability: "rotated-owner-capability",
+      expires_at: 60_000,
+      request_id: firstResume.request_id,
+    }),
+  });
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+  sockets[0]!.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({ type: "authenticated", role: "owner", device_id: "device" }),
+  });
+  // The server emits session_recovery independently of resume_status. The
+  // owner must use the existing session and peer rather than creating a new one.
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: sessionId,
+      recovery_attempt_id: "owner-recovery-after-completed-resume",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const statusRequest = sockets[1]!.sent
+    .map((message) => JSON.parse(message) as Record<string, string>)
+    .reverse()
+    .find((message: Record<string, string>) => message.type === "resume_status");
+  assert.ok(statusRequest);
+  assert.equal(statusRequest.session_id, sessionId);
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 2);
+
+  // Duplicate server recovery notifications must not start another negotiation.
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: sessionId,
+      recovery_attempt_id: "owner-recovery-after-completed-resume",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 2);
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_status",
+      session_id: sessionId,
+      epoch: 1,
+      request_id: statusRequest.request_id,
+      status: "completed",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.lifecycle, "RECONNECTING");
+  assert.equal(peerConnection.offerCalls, 2);
+
+  // A late duplicate status response is ignored and cannot restart recovery.
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_status",
+      session_id: sessionId,
+      epoch: 1,
+      request_id: statusRequest.request_id,
+      status: "completed",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, 2);
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: sessionId,
+      sdp: "recovered-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  peerConnection.connectionState = "connected";
+  peerConnection.onconnectionstatechange?.();
+  assert.equal(client.lifecycle, "CONNECTED");
+  assert.equal(peerConnection.closed, false);
+  assert.equal(prepareCalls, 1);
+  assert.ok(sockets[1]!.sent.every((message) => JSON.parse(message).type !== "create_session"));
+  assert.ok(sockets[1]!.sent
+    .map((message) => JSON.parse(message) as Record<string, unknown>)
+    .filter((message) => message.type === "offer")
+    .every((message) => message.session_id === sessionId));
+
+  // Stop invalidates the recovery cycle; late recovery events cannot restart sharing.
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+  await client.stopSharingSession();
+  const offersAfterStop = peerConnection.offerCalls;
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: sessionId,
+      recovery_attempt_id: "late-recovery-after-stop",
+    }),
+  });
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "resume_status",
+      session_id: sessionId,
+      epoch: 1,
+      request_id: statusRequest.request_id,
+      status: "completed",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, offersAfterStop);
+  assert.equal(client.lifecycle, "IDLE");
+  assert.equal(connection.closed, true);
+  client.close();
+});
+
+test("owner ignores duplicate and late session_resumed completions", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    { isSharingActive: () => true },
+  );
+  await client.setSharingState(true, false);
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_resumed",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 1,
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstOffers = peerConnection.offerCalls;
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_resumed",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 1,
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, firstOffers);
+
+  await client.stopSharingSession();
+  const offersAfterStop = peerConnection.offerCalls;
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_resumed",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      epoch: 1,
+    }),
+  });
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "late-obsolete-attempt",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, offersAfterStop);
+  assert.equal(peerConnection.closed, true);
+  assert.equal(sockets.length, 1);
+  client.close();
+});
+
+test("owner ignores old recovery completion after a newer sleep/wake cycle", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    { isSharingActive: () => true },
+  );
+  await client.setSharingState(true, false);
+
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "old-cycle-attempt",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "new-cycle-attempt",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const offers = peerConnection.offerCalls;
+
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      negotiation_id: "old-cycle-attempt",
+      sdp: "old-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(peerConnection.offerCalls, offers);
+  assert.equal(peerConnection.closed, false);
+  client.close();
+});
+
+test("owner timeout cannot fire after successful recovery", async () => {
+  const scheduler = new ManualScheduler();
+  const connection = new MockConnection();
+  const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
+    scheduler,
+    connection,
+    undefined,
+    { isSharingActive: () => true, recoveryTimeoutMs: 120_000 },
+  );
+  await client.setSharingState(true, false);
+  peerConnection.connectionState = "disconnected";
+  peerConnection.onconnectionstatechange?.();
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_recovery",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      recovery_attempt_id: "successful-before-timeout",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.runNext(), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "answer",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      sdp: "successful-answer",
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  peerConnection.connectionState = "connected";
+  peerConnection.onconnectionstatechange?.();
+  assert.equal(client.lifecycle, "CONNECTED");
+  assert.equal([...scheduler.timers.values()].some((timer) => timer.delay === 120_000), false);
+  assert.equal(sockets.length, 1);
+  client.close();
+});
+
+test("expired viewer sleep-resume capability falls back to authorized session creation", async () => {
   const { viewer, scheduler, sockets } = await createSleepMarkedViewer();
   scheduler.nowValue = 60_000;
   sockets[0]!.disconnect();
@@ -6355,13 +7068,17 @@ test("expired viewer sleep-resume capability fails closed without creating a new
   sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(viewer.lifecycle, "FAILED");
-  assert.equal(sockets[1]!.sent.some((data) => JSON.parse(data).type === "create_session"), false);
+  assert.equal(viewer.lifecycle, "CONNECTED");
+  const createRequest = sockets[1]!.sent
+    .map((data) => JSON.parse(data) as Record<string, unknown>)
+    .find((message) => message.type === "create_session");
+  assert.equal(createRequest?.type, "create_session");
+  assert.equal(createRequest?.active_session_id, "00000000-0000-0000-0000-000000000002");
   assert.equal(sockets[1]!.sent.some((data) => JSON.parse(data).type === "resume_session"), false);
   viewer.close();
 });
 
-test("rejected viewer sleep-resume capability remains failed and is not bypassed", async () => {
+test("rejected viewer sleep-resume capability falls back to authorized session creation", async () => {
   const { viewer, scheduler, sockets } = await createSleepMarkedViewer();
   sockets[0]!.disconnect();
   assert.equal(scheduler.runNext(), 1_500);
@@ -6372,13 +7089,66 @@ test("rejected viewer sleep-resume capability remains failed and is not bypassed
   assert.equal(JSON.parse(sockets[1]!.sent.at(-1)!).type, "resume_session");
 
   sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "error", code: "RESUME_INVALID" }) });
-  assert.equal(viewer.lifecycle, "FAILED");
-  assert.equal(sockets[1]!.sent.some((data) => JSON.parse(data).type === "create_session"), false);
+  assert.equal(viewer.lifecycle, "RECONNECTING");
+  assert.equal(sockets[1]!.sent.some((data) => JSON.parse(data).type === "create_session"), true);
+  assert.equal(
+    JSON.parse(sockets[1]!.sent.find((data) => JSON.parse(data).type === "create_session")!).active_session_id,
+    "00000000-0000-0000-0000-000000000002",
+  );
+  viewer.close();
+});
+
+test("viewer unauthorized resumed reattachment does not bypass authorization or create another session", async () => {
+  const { viewer, scheduler, sockets } = await createSleepMarkedViewer();
+  sockets[0]!.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  const resumeRequest = sockets[1]!.sent
+    .map((data) => JSON.parse(data) as Record<string, unknown>)
+    .find((message) => message.type === "resume_session");
+  assert.equal(resumeRequest?.type, "resume_session");
+
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "error", code: "NOT_AUTHORIZED" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    sockets[1]!.sent.filter((data) => JSON.parse(data).type === "create_session").length,
+    0,
+  );
   assert.equal(
     sockets[1]!.sent.filter((data) => JSON.parse(data).type === "resume_session").length,
     1,
   );
-  assert.match(viewer.failure?.message ?? "", /RESUME_INVALID/);
+  viewer.close();
+});
+
+test("viewer retired resumed session is rejected without unrelated session creation", async () => {
+  const { viewer, scheduler, sockets, sessionId } = await createSleepMarkedViewer();
+  viewer.resumeAfterWake();
+  sockets[0]!.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "error", code: "RESUME_INVALID" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  const createRequests = sockets[1]!.sent
+    .map((data) => JSON.parse(data) as Record<string, unknown>)
+    .filter((message) => message.type === "create_session");
+  assert.equal(createRequests.length, 1);
+  assert.equal(createRequests[0]?.active_session_id, sessionId);
+
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "error", code: "SESSION_NOT_FOUND" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.equal(
+    sockets[1]!.sent.filter((data) => JSON.parse(data).type === "create_session").length,
+    1,
+  );
   viewer.close();
 });
 

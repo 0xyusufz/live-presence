@@ -30,7 +30,10 @@ const bridge: LivePresenceBridge = {
   setCameraIntent: (active) => ipcRenderer.invoke("capture:camera-intent", active) as Promise<void>,
   reportHeartbeat: () => ipcRenderer.send("watchdog:heartbeat"),
   acknowledgeCleanup: () => ipcRenderer.send("capture:cleanup-ack"),
-  reportSleepMarker: (accepted) => ipcRenderer.send("system:sleep-marker-result", accepted),
+  reportSleepMarker: (cycleId, accepted) =>
+    ipcRenderer.send("system:sleep-marker-result", cycleId, accepted),
+  reportSleepRecovery: (cycleId, recoveryAttemptId, phase) =>
+    ipcRenderer.send("system:sleep-recovery-result", cycleId, recoveryAttemptId, phase),
   notifySharingResumed: () => ipcRenderer.send("notification:sharing-resumed"),
   reportCaptureDiagnostic: (event, details = {}) => ipcRenderer.send("capture:diagnostic", event, details),
   stopFromIndicator: () => ipcRenderer.send("indicator:stop"),

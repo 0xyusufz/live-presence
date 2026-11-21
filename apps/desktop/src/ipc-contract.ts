@@ -38,6 +38,15 @@ export type CaptureDiagnosticEvent =
   | "sharing_state_update_sent"
   | "sharing_state_update_not_sent"
   | "sharing_state_update_confirmed"
+  | "sleep_marker_prepare_started"
+  | "sleep_marker_prepare_acknowledged"
+  | "sleep_marker_prepare_failed"
+  | "sleep_marker_error_received"
+  | "screen_track_state_before_false_publish"
+  | "peer_closed"
+  | "sleep_recovery_started"
+  | "sleep_recovery_track_unavailable"
+  | "sleep_recovery_result"
   | "owner_signaling_transport";
 
 export type SharingPublicationOutcome = "socket_not_open" | "send_rejected" | "sent";
@@ -158,9 +167,15 @@ export type CaptureDiagnosticReason =
   | "ended_event"
   | "track_muted"
   | "track_not_live"
+  | "explicit_stop"
+  | "capture_stop"
   | "superseded_attempt";
 
 export type CaptureDiagnosticDetails = {
+  cycleId?: number;
+  recoveryAttemptId?: string;
+  sessionId?: string;
+  recoveryPhase?: string;
   attemptId?: string;
   correlationId?: string;
   requestId?: number;
@@ -231,8 +246,17 @@ export type SocketEvent =
 
 export type AppEvent =
   | { type: "stop-sharing"; reason: string }
-  | { type: "suspend" }
-  | { type: "resume" }
+  | { type: "suspend"; cycleId: number }
+  | { type: "resume"; cycleId: number }
+  | { type: "sleep-recovery-timeout"; cycleId: number }
+  | { type: "sleep-recovery-attempt-accepted"; cycleId: number; recoveryAttemptId: string }
+  | {
+      type: "sleep-recovery-result";
+      cycleId: number;
+      recoveryAttemptId: string;
+      phase: "completed" | "failed" | "timed_out";
+      accepted: boolean;
+    }
   | { type: "indicator-ready"; ready: boolean }
   | { type: "indicator-state"; screen: boolean; camera: boolean };
 
@@ -256,7 +280,12 @@ export type LivePresenceBridge = {
   setCameraIntent(active: boolean): Promise<void>;
   reportHeartbeat(): void;
   acknowledgeCleanup(): void;
-  reportSleepMarker(accepted: boolean): void;
+  reportSleepMarker(cycleId: number, accepted: boolean): void;
+  reportSleepRecovery(
+    cycleId: number,
+    recoveryAttemptId: string,
+    phase: "eligible" | "started" | "completed" | "failed" | "timed_out",
+  ): void;
   notifySharingResumed(): void;
   reportCaptureDiagnostic(event: CaptureDiagnosticEvent, details?: CaptureDiagnosticDetails): void;
   stopFromIndicator(): void;

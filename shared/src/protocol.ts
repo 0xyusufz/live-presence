@@ -13,6 +13,7 @@ export type ClientMessage =
   | { type: "leave_session"; session_id: string }
   | { type: "prepare_sleep"; session_id: string; request_id: string }
   | { type: "resume_session"; session_id: string; epoch: number; capability: string; request_id: string }
+  | { type: "resume_status"; session_id: string; epoch: number; request_id: string }
   | { type: "offer"; session_id: string; negotiation_id: string; sdp: string; track_map?: TrackMap }
   | { type: "answer"; session_id: string; negotiation_id: string; sdp: string; track_map?: TrackMap }
   | { type: "ice_candidate"; session_id: string; negotiation_id: string; candidate: unknown }
@@ -28,6 +29,15 @@ export type ServerMessage =
   | { type: "device_sharing_state"; device_id: string; screen: boolean; camera: boolean }
   | { type: "sleep_marked"; session_id: string; epoch: number; capability: string; expires_at: number; request_id: string }
   | { type: "resume_pending"; session_id: string; epoch: number; capability: string; expires_at: number; request_id: string }
+  | {
+    type: "resume_status";
+    session_id: string;
+    epoch: number;
+    request_id: string;
+    status: "retryable" | "pending" | "completed" | "expired" | "invalid";
+    capability?: string;
+    expires_at?: number;
+  }
   | { type: "session_resumed"; session_id: string; epoch: number }
   | { type: "session_recovery"; session_id: string; recovery_attempt_id?: string }
   | { type: "session_created"; session_id: string; device_id: string; request_id?: string }
@@ -46,7 +56,7 @@ export type ServerMessage =
   | { type: "share_request"; session_id: string; request_id: string; kind: MediaKind; viewer_user_id: string }
   | { type: "share_request_cancel"; session_id: string; request_id: string }
   | { type: "share_request_state"; session_id: string; request_id: string; kind: MediaKind; state: "ALLOWED" | "DENIED" | "CANCELLED" }
-  | { type: "error"; code: string }
+  | { type: "error"; code: string; session_id?: string; request_id?: string }
   | { type: "offer"; session_id: string; negotiation_id: string; sdp: string; track_map?: TrackMap }
   | { type: "answer"; session_id: string; negotiation_id: string; sdp: string; track_map?: TrackMap }
   | { type: "ice_candidate"; session_id: string; negotiation_id: string; candidate: unknown };
@@ -141,6 +151,11 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
         validSession(item.session_id) && Number.isSafeInteger(item.epoch) && (item.epoch as number) > 0 &&
         string(item.capability, MAX_CAPABILITY) && string(item.request_id, 128) && ID.test(item.request_id)
         ? { type: "resume_session", session_id: item.session_id, epoch: item.epoch as number, capability: item.capability, request_id: item.request_id } : null;
+    case "resume_status":
+      return exactKeys(item, ["type", "session_id", "epoch", "request_id"]) &&
+        validSession(item.session_id) && Number.isSafeInteger(item.epoch) && (item.epoch as number) > 0 &&
+        string(item.request_id, 128) && ID.test(item.request_id)
+        ? { type: "resume_status", session_id: item.session_id, epoch: item.epoch as number, request_id: item.request_id } : null;
     case "offer":
     case "answer":
       return validSession(item.session_id) &&
@@ -232,6 +247,29 @@ export function parseServerMessage(value: unknown): ServerMessage | null {
           validSession(session) && Number.isSafeInteger(item.epoch) && (item.epoch as number) > 0
           ? { type: "session_resumed", session_id: session, epoch: item.epoch as number }
           : null;
+      case "resume_status":
+        return exactKeys(
+          item,
+          item.capability === undefined
+            ? ["type", "session_id", "epoch", "request_id", "status"]
+            : ["type", "session_id", "epoch", "request_id", "status", "capability", "expires_at"],
+        ) &&
+          validSession(session) &&
+          Number.isSafeInteger(item.epoch) && (item.epoch as number) > 0 &&
+          string(item.request_id, 128) && ID.test(item.request_id) &&
+          (item.status === "retryable" || item.status === "pending" ||
+            item.status === "completed" || item.status === "expired" || item.status === "invalid") &&
+          (item.capability === undefined ||
+            (string(item.capability, MAX_CAPABILITY) && Number.isSafeInteger(item.expires_at) && (item.expires_at as number) > 0))
+          ? {
+            type: "resume_status",
+            session_id: session,
+            epoch: item.epoch as number,
+            request_id: item.request_id,
+            status: item.status,
+            ...(item.capability === undefined ? {} : { capability: item.capability, expires_at: item.expires_at as number }),
+          }
+          : null;
       case "session_recovery":
         return exactKeys(
           item,
@@ -320,7 +358,28 @@ export function parseServerMessage(value: unknown): ServerMessage | null {
           (item.state === "ALLOWED" || item.state === "DENIED" || item.state === "CANCELLED")
           ? { type: "share_request_state", session_id: session, request_id: item.request_id, kind: item.kind, state: item.state } : null;
       case "error":
-        return exactKeys(item, ["type", "code"]) && string(item.code, 128) ? { type: "error", code: item.code } : null;
+        return (
+          exactKeys(
+            item,
+            [
+              "type",
+              "code",
+              ...(item.session_id === undefined ? [] : ["session_id"]),
+              ...(item.request_id === undefined ? [] : ["request_id"]),
+            ],
+          ) &&
+          string(item.code, 128) &&
+          (item.session_id === undefined || validSession(item.session_id)) &&
+          (item.request_id === undefined ||
+            (string(item.request_id, 128) && ID.test(item.request_id)))
+        )
+          ? {
+            type: "error",
+            code: item.code,
+            ...(item.session_id === undefined ? {} : { session_id: item.session_id as string }),
+            ...(item.request_id === undefined ? {} : { request_id: item.request_id as string }),
+          }
+          : null;
       case "offer":
       case "answer":
         return exactKeys(

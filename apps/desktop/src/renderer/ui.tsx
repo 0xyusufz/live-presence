@@ -16,6 +16,8 @@ import {
   isLiveCameraTrack,
   removeApprovedCameraTrack,
   replaceApprovedCameraTrack,
+  detachOwnerClientAfterCaptureStop,
+  reuseOrCreateOwnerClient,
   setApprovedCameraTrack,
   sharingStatus,
   stopOwnerCapture,
@@ -161,41 +163,72 @@ function ShareWindow(): JSX.Element {
   const [credentialSaved, setCredentialSaved] = useState<boolean | undefined>();
   const [credentialInput, setCredentialInput] = useState("");
   const [serverUrl, setServerUrl] = useState("");
+  const sleepRecoveryCycle = useRef<number | undefined>(undefined);
+  const sleepRecoveryAttemptId = useRef<string | undefined>(undefined);
+  const sleepRecoveryState = useRef<"idle" | "eligible" | "started" | "completed" | "failed" | "timed_out">("idle");
+
+  function requestSleepRecoveryCompletion(recoveryAttemptId?: string): void {
+    if (
+      sleepRecoveryCycle.current === undefined ||
+      typeof recoveryAttemptId !== "string" ||
+      recoveryAttemptId.length === 0 ||
+      (sleepRecoveryState.current !== "eligible" && sleepRecoveryState.current !== "started")
+    ) return;
+    if (recoveryAttemptId !== sleepRecoveryAttemptId.current) return;
+    reportCaptureDiagnostic("sleep_recovery_started", {
+      cycleId: sleepRecoveryCycle.current,
+      recoveryAttemptId,
+      recoveryPhase: "completed",
+      screen: capture.current.screen?.readyState === "live",
+      signalingState: capture.current.client?.getSignalingState(),
+    });
+    window.livePresence.reportSleepRecovery(
+      sleepRecoveryCycle.current,
+      recoveryAttemptId,
+      "completed",
+    );
+  }
 
   function ensureOwnerClient(): DesktopWebRtcClient {
     const current = capture.current;
-    if (current.client) return current.client;
-    const client = new DesktopWebRtcClient({
-      socketFactory: makeSocket,
-      peerFactory: createBrowserPeer,
-      managedAuthentication: true,
-      loadManagedIceServers: () => window.livePresence.loadIceServers(),
-      isSharingActive: () => Boolean(
-        capture.current.screen &&
-        capture.current.screen.readyState === "live" &&
-        capture.current.generation > 0
-      ),
-      isCameraActive: () => Boolean(
-        capture.current.camera &&
-        capture.current.camera.readyState === "live" &&
-        capture.current.generation > 0
-      ),
-      getSharingGeneration: () => capture.current.generation,
-      prepareOwnerPeer: (peer) =>
-        attachApprovedTracks(peer, capture.current, capture.current.generation),
-      onSharingResumed: () => {
-        setMessage("Connected / Sharing resumed");
-        window.livePresence.notifySharingResumed();
-      },
-      onOwnerSessionEnded: (reason) => {
-        if (reason === "authorization_revoked") {
-          void stopCurrent(
-            "Viewer authorization was revoked; sharing was stopped.",
-            true,
-          );
+    return reuseOrCreateOwnerClient(current, () => {
+      const client = new DesktopWebRtcClient({
+        socketFactory: makeSocket,
+        peerFactory: createBrowserPeer,
+        managedAuthentication: true,
+        loadManagedIceServers: () => window.livePresence.loadIceServers(),
+        isSharingActive: () => Boolean(
+          capture.current.screen &&
+          capture.current.screen.readyState === "live" &&
+          capture.current.generation > 0
+        ),
+        isCameraActive: () => Boolean(
+          capture.current.camera &&
+          capture.current.camera.readyState === "live" &&
+          capture.current.generation > 0
+        ),
+        getSharingGeneration: () => capture.current.generation,
+        prepareOwnerPeer: (peer) =>
+          attachApprovedTracks(peer, capture.current, capture.current.generation),
+        onSharingResumed: (recoveryAttemptId) => {
+          requestSleepRecoveryCompletion(recoveryAttemptId);
+        },
+        onOwnerSessionEnded: (reason) => {
+          if (reason === "authorization_revoked") {
+            void stopCurrent(
+              "Viewer authorization was revoked; sharing was stopped.",
+              true,
+            );
+          }
+        },
+        onDiagnostic: (diagnostic) => {
+        if (
+          (sleepRecoveryState.current === "eligible" || sleepRecoveryState.current === "started") &&
+          diagnostic.event === "recovery" &&
+          diagnostic.recoveryPhase === "completed"
+        ) {
+          requestSleepRecoveryCompletion(diagnostic.recoveryAttemptId);
         }
-      },
-      onDiagnostic: (diagnostic) => {
         const sharingStateEvent = sharingStateSendEvent(
           diagnostic.event,
           diagnostic.publicationOutcome,
@@ -285,10 +318,10 @@ function ShareWindow(): JSX.Element {
           setMessage,
         );
       },
+      });
+      void client.setSharingState(false, false).catch(() => undefined);
+      return client;
     });
-    current.client = client;
-    void client.setSharingState(false, false).catch(() => undefined);
-    return client;
   }
 
   useEffect(() => {
@@ -331,18 +364,121 @@ function ShareWindow(): JSX.Element {
       if (event.type === "stop-sharing") void stopCurrent("Sharing stopped for safety.");
       if (event.type === "indicator-ready") setIndicatorPrepared(event.ready);
       if (event.type === "suspend") {
+        sleepRecoveryCycle.current = event.cycleId;
+        sleepRecoveryAttemptId.current = undefined;
+        sleepRecoveryState.current = "idle";
         const client = capture.current.client;
         if (!client) {
-          window.livePresence.reportSleepMarker(false);
+          window.livePresence.reportSleepMarker(event.cycleId, false);
           return;
         }
+        reportCaptureDiagnostic("sleep_marker_prepare_started", {
+          screen: capture.current.screen?.readyState === "live",
+          signalingState: client.getSignalingState(),
+        });
         void client.prepareForSleep().then(
-          () => window.livePresence.reportSleepMarker(true),
-          () => window.livePresence.reportSleepMarker(false),
+          () => {
+            reportCaptureDiagnostic("sleep_marker_prepare_acknowledged", {
+              screen: capture.current.screen?.readyState === "live",
+              signalingState: client.getSignalingState(),
+            });
+            window.livePresence.reportSleepMarker(event.cycleId, true);
+          },
+          () => {
+            reportCaptureDiagnostic("sleep_marker_prepare_failed", {
+              screen: capture.current.screen?.readyState === "live",
+              signalingState: client.getSignalingState(),
+            });
+          },
         );
       }
+      if (event.type === "sleep-recovery-result") {
+        if (
+          !event.accepted ||
+          sleepRecoveryCycle.current !== event.cycleId ||
+          sleepRecoveryAttemptId.current !== event.recoveryAttemptId ||
+          sleepRecoveryState.current !== "started"
+        ) return;
+        if (event.phase === "failed") {
+          sleepRecoveryState.current = "failed";
+          setMessage("Unable to resume sharing after sleep.");
+          return;
+        }
+        if (event.phase !== "completed") return;
+        sleepRecoveryState.current = "completed";
+        setMessage("Connected / Sharing resumed");
+        window.livePresence.notifySharingResumed();
+      }
+      if (event.type === "sleep-recovery-attempt-accepted") {
+        if (
+          sleepRecoveryCycle.current !== event.cycleId ||
+          sleepRecoveryAttemptId.current !== event.recoveryAttemptId ||
+          sleepRecoveryState.current !== "eligible"
+        ) return;
+        const client = capture.current.client;
+        if (!client || capture.current.screen?.readyState !== "live") {
+          sleepRecoveryState.current = "failed";
+          window.livePresence.reportSleepRecovery(event.cycleId, event.recoveryAttemptId, "failed");
+          return;
+        }
+        sleepRecoveryState.current = "started";
+        reportCaptureDiagnostic("sleep_recovery_started", {
+          cycleId: event.cycleId,
+          recoveryAttemptId: event.recoveryAttemptId,
+          recoveryPhase: "started",
+          screen: capture.current.screen.readyState === "live",
+          signalingState: client.getSignalingState(),
+        });
+        window.livePresence.reportSleepRecovery(event.cycleId, event.recoveryAttemptId, "started");
+        client.resumeAfterWake(event.recoveryAttemptId);
+      }
       if (event.type === "resume") {
-        capture.current.client?.resumeAfterWake();
+        const current = capture.current;
+        const client = current.client;
+        if (!client && !current.screen && !current.preparingScreen && current.generation === 0) return;
+        const eligible = Boolean(
+          client &&
+          current.screen &&
+          current.screen.readyState === "live",
+        );
+        if (
+          sleepRecoveryCycle.current === event.cycleId &&
+          sleepRecoveryState.current !== "idle"
+        ) return;
+        sleepRecoveryCycle.current = event.cycleId;
+        sleepRecoveryAttemptId.current = crypto.randomUUID();
+        sleepRecoveryState.current = eligible ? "eligible" : "failed";
+        reportCaptureDiagnostic(
+          eligible ? "sleep_recovery_started" : "sleep_recovery_track_unavailable",
+          {
+            cycleId: event.cycleId,
+            recoveryPhase: eligible ? "eligible" : "failed",
+            screen: current.screen?.readyState === "live",
+            signalingState: client?.getSignalingState(),
+          },
+        );
+        window.livePresence.reportSleepRecovery(
+          event.cycleId,
+          sleepRecoveryAttemptId.current,
+          "eligible",
+        );
+        if (!eligible) {
+          void stopCurrent("Screen sharing ended during sleep.");
+          return;
+        }
+      }
+      if (event.type === "sleep-recovery-timeout") {
+        if (sleepRecoveryCycle.current !== event.cycleId) return;
+        if (sleepRecoveryState.current !== "started" && sleepRecoveryState.current !== "eligible") return;
+        sleepRecoveryState.current = "timed_out";
+        capture.current.client?.abandonSleepRecovery();
+        setMessage("Connection interrupted; sharing remains active while reconnection continues.");
+        reportCaptureDiagnostic("sleep_recovery_started", {
+          cycleId: event.cycleId,
+          recoveryPhase: "timed_out",
+          screen: capture.current.screen?.readyState === "live",
+          signalingState: capture.current.client?.getSignalingState(),
+        });
       }
     });
     return () => {
@@ -353,13 +489,33 @@ function ShareWindow(): JSX.Element {
   }, []);
 
   async function stopCurrent(reason?: string, stopClient = true): Promise<void> {
+    sleepRecoveryState.current = "idle";
+    sleepRecoveryCycle.current = undefined;
+    sleepRecoveryAttemptId.current = undefined;
     const current = capture.current;
+    if (current.screen) {
+      reportCaptureDiagnostic("screen_track_state_before_false_publish", {
+        stage: "before_signaling_update",
+        readyState: current.screen.readyState === "live"
+          ? "live"
+          : current.screen.readyState === "ended"
+            ? "ended"
+            : "unavailable",
+        enabled: current.screen.enabled,
+        muted: current.screen.muted,
+        screen: false,
+        camera: false,
+        reason: reason === "The screen capture ended."
+          ? "ended_event"
+          : "capture_stop",
+      }, current.attemptId);
+    }
     const { screen, camera } = invalidateCapture(current);
     current.attemptId = undefined;
     current.cameraPending = false;
     current.preparingScreen = false;
     if (stopClient) {
-      try { void current.client?.stopSharingSession().catch(() => undefined); } catch { /* the socket may already be closed */ }
+      detachOwnerClientAfterCaptureStop(current, true);
     }
     setScreenSharing(false);
     setCameraSharing(false);

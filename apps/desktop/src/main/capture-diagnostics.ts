@@ -276,6 +276,16 @@ export class CaptureDiagnostics {
     const safe: CaptureDiagnosticDetails = {};
     for (const [key, value] of Object.entries(input)) {
       switch (key) {
+        case "cycleId":
+          if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) safe.cycleId = value;
+          break;
+        case "recoveryAttemptId":
+        case "sessionId":
+          if (isCaptureAttemptId(value)) safe[key] = value;
+          break;
+        case "recoveryPhase":
+          if (typeof value === "string" && value.length <= 100) safe.recoveryPhase = value;
+          break;
         case "attemptId":
           if (isCaptureAttemptId(value)) safe.attemptId = value;
           break;

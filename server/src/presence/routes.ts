@@ -346,8 +346,10 @@ export async function registerPresenceRoutes(
     if (session.viewerGraceTimer) clearTimeout(session.viewerGraceTimer);
     if (session.ownerGraceTimer) clearTimeout(session.ownerGraceTimer);
     if (session.sleepTimer) clearTimeout(session.sleepTimer);
-    resumeStore.invalidate(sessionId);
-    if (!preserveSharingState) {
+    if (reason === "sleep_expired") resumeStore.expire(sessionId, Date.now());
+    else resumeStore.invalidate(sessionId);
+    const retainCaptureAfterSleepExpiry = reason === "sleep_expired";
+    if (!preserveSharingState && !retainCaptureAfterSleepExpiry) {
       const previousSharingState = shareStates.get(session.deviceId);
       const inactive = { screen: false, camera: false };
       setSharingState(session.deviceId, inactive, `session-ended:${reason}`, undefined, sessionId);
@@ -362,7 +364,7 @@ export async function registerPresenceRoutes(
       deviceId: session.deviceId,
       sessionId,
       reason,
-      sharingStateCleared: !preserveSharingState,
+      sharingStateCleared: !preserveSharingState && !retainCaptureAfterSleepExpiry,
     }));
     const left = {
       type: "viewer_left" as const,
@@ -899,7 +901,13 @@ export async function registerPresenceRoutes(
             !session || session.owner?.socket !== socket || !session.viewer ||
             !shareStates.get(session.deviceId)?.screen
           ) {
-            send(socket, { type: "error", code: "SLEEP_NOT_ALLOWED" }); return;
+            send(socket, {
+              type: "error",
+              code: "SLEEP_NOT_ALLOWED",
+              session_id: message.session_id,
+              request_id: message.request_id,
+            });
+            return;
           }
           if (session.sleepCapabilities) {
             if (session.sleepRequestId !== message.request_id) {
@@ -914,6 +922,7 @@ export async function registerPresenceRoutes(
               Date.now(),
               SLEEP_RESUME_WINDOW_MS,
               session.sleepEpoch,
+              session.deviceId,
             );
             session.sleepRequestId = message.request_id;
             session.sleepCapabilities = {
@@ -945,7 +954,7 @@ export async function registerPresenceRoutes(
             expires_at: sleep.expiresAt,
             request_id: message.request_id,
           });
-        } else if (type === "resume_session") {
+        } else if (type === "resume_status" || type === "resume_session") {
           const session = sessions.get(message.session_id);
           const role = session && connection.role === "owner" &&
             connection.deviceId === session.deviceId
@@ -954,6 +963,28 @@ export async function registerPresenceRoutes(
               connection.userId === session.viewerUserId
               ? "viewer"
               : undefined;
+          if (type === "resume_status") {
+            const status = resumeStore.status(
+              message.session_id,
+              role ?? (connection.role === "owner" ? "owner" : "viewer"),
+              connection.userId,
+              message.epoch,
+              message.request_id,
+              Date.now(),
+              connection.deviceId,
+            );
+            send(socket, {
+              type: "resume_status",
+              session_id: message.session_id,
+              epoch: message.epoch,
+              request_id: message.request_id,
+              status: status.status,
+              ...("capability" in status
+                ? { capability: status.capability, expires_at: status.expiresAt }
+                : {}),
+            });
+            return;
+          }
           if (
             !session || !role || !session.sleepCapabilities ||
             session.sleepCapabilities.epoch !== message.epoch ||
@@ -985,7 +1016,7 @@ export async function registerPresenceRoutes(
           if (rotated.bothReady && session.owner && session.viewer) {
             if (session.sleepTimer) clearTimeout(session.sleepTimer);
             session.sleepTimer = undefined;
-            resumeStore.invalidate(session.id);
+            resumeStore.complete(session.id, Date.now());
             session.sleepCapabilities = undefined;
             session.sleepRequestId = undefined;
             send(session.owner.socket, { type: "session_resumed", session_id: session.id, epoch: rotated.epoch });

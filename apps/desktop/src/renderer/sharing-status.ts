@@ -39,6 +39,41 @@ export function invalidateCapture<T extends WebRtcTrack>(
   return tracks;
 }
 
+export function detachOwnerClientAfterCaptureStop<
+  TClient extends {
+    stopSharingSession(): Promise<void>;
+    close(): void;
+  },
+>(current: { client?: TClient }, stopClient = true): void {
+  const client = current.client;
+  if (!stopClient || !client) return;
+  current.client = undefined;
+  try {
+    void client.stopSharingSession().catch(() => undefined);
+  } catch {
+    // A stale transport may already be closed.
+  }
+  client.close();
+}
+
+export function reuseOrCreateOwnerClient<
+  TClient extends { lifecycle: string; close(): void },
+>(current: { client?: TClient }, create: () => TClient): TClient {
+  const existing = current.client;
+  if (
+    existing &&
+    existing.lifecycle !== "FAILED" &&
+    existing.lifecycle !== "CLOSING" &&
+    existing.lifecycle !== "CLOSED"
+  ) {
+    return existing;
+  }
+  if (existing) existing.close();
+  const created = create();
+  current.client = created;
+  return created;
+}
+
 export async function attachApprovedTracks(
   peer: Pick<WebRtcPeer, "replaceTrack">,
   current: CaptureTrackState,

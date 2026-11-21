@@ -4,9 +4,11 @@ import {
   attachApprovedTracks,
   acquireLiveScreenTrack,
   confirmLiveScreenCapture,
+  detachOwnerClientAfterCaptureStop,
   inspectScreenVideoTracks,
   removeApprovedCameraTrack,
   replaceApprovedCameraTrack,
+  reuseOrCreateOwnerClient,
   sharingStatus,
   setApprovedCameraTrack,
   stopCapturedTracks,
@@ -30,6 +32,63 @@ test("desktop sharing status never reports idle while capture is live", () => {
 test("desktop sharing status distinguishes preparation and stopped capture", () => {
   assert.equal(sharingStatus("preparing", "IDLE", false), "Preparing");
   assert.equal(sharingStatus("idle", "CONNECTED", false), "Not sharing");
+});
+
+test("capture stop detaches the owner client and an explicit share creates a fresh usable client", () => {
+  let stopCalls = 0;
+  let closeCalls = 0;
+  const staleClient = {
+    lifecycle: "FAILED",
+    async stopSharingSession() { stopCalls += 1; },
+    close() { closeCalls += 1; },
+  };
+  const current: { client?: typeof staleClient } = { client: staleClient };
+
+  detachOwnerClientAfterCaptureStop(current, true);
+  assert.equal(current.client, undefined);
+  assert.equal(stopCalls, 1);
+  assert.equal(closeCalls, 1);
+
+  let createCalls = 0;
+  const freshClient = {
+    lifecycle: "IDLE",
+    close() {},
+  };
+  const reused = reuseOrCreateOwnerClient(current, () => {
+    createCalls += 1;
+    return freshClient;
+  });
+  assert.equal(reused, freshClient);
+  assert.equal(current.client, freshClient);
+  assert.equal(createCalls, 1);
+
+  const reusedAgain = reuseOrCreateOwnerClient(current, () => {
+    throw new Error("must not create a duplicate client");
+  });
+  assert.equal(reusedAgain, freshClient);
+});
+
+test("terminal owner clients are closed and never reused", () => {
+  for (const lifecycle of ["FAILED", "CLOSING", "CLOSED"] as const) {
+    let closeCalls = 0;
+    let createCalls = 0;
+    const stale = {
+      lifecycle,
+      close() { closeCalls += 1; },
+    };
+    const current: { client?: typeof stale } = { client: stale };
+    const fresh = {
+      lifecycle: "IDLE",
+      close() {},
+    };
+    const result = reuseOrCreateOwnerClient(current, () => {
+      createCalls += 1;
+      return fresh;
+    });
+    assert.equal(result, fresh);
+    assert.equal(closeCalls, 1);
+    assert.equal(createCalls, 1);
+  }
 });
 
 test("stopping sharing ends both independently captured media tracks", () => {
