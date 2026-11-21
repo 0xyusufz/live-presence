@@ -319,8 +319,18 @@ function ShareWindow(): JSX.Element {
         );
       },
       });
-      void client.setSharingState(false, false).catch(() => undefined);
       return client;
+    }, (client) => {
+      if (
+        !capture.current.screen ||
+        capture.current.screen.readyState !== "live" ||
+        capture.current.generation === 0
+      ) {
+        void client.setSharingState(false, false).catch(() => undefined);
+      }
+      void client.start().catch(() => {
+        setMessage("Owner presence could not connect; retrying.");
+      });
     });
   }
 
@@ -336,10 +346,7 @@ function ShareWindow(): JSX.Element {
       setServerUrl(url);
       setIndicatorPrepared(indicatorAvailable);
       if (hasCredential) {
-        const client = ensureOwnerClient();
-        void client.start().catch(() => {
-          if (active) setMessage("Owner presence could not connect; retrying.");
-        });
+        ensureOwnerClient();
       }
     }).catch(() => {
       if (active) setMessage("Desktop setup could not be loaded.");
@@ -547,10 +554,7 @@ function ShareWindow(): JSX.Element {
       setCredentialInput("");
       setCredentialSaved(true);
       setMessage("Device credential saved securely.");
-      const client = ensureOwnerClient();
-      void client.start().catch(() => {
-        setMessage("Owner presence could not connect; retrying.");
-      });
+      ensureOwnerClient();
     } catch {
       setMessage("The device credential could not be saved.");
     }

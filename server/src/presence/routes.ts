@@ -804,8 +804,19 @@ export async function registerPresenceRoutes(
             }
             return;
           }
-          const owner = [...connections.values()].find((candidate) => candidate.role === "owner" && candidate.deviceId === deviceId);
-          if (!owner) { send(socket, { type: "error", code: "DEVICE_OFFLINE" }); return; }
+          const latestOwnerSocket = latestOwnerSockets.get(deviceId);
+          const owner = latestOwnerSocket
+            ? connections.get(latestOwnerSocket)
+            : undefined;
+          if (
+            !owner ||
+            owner.role !== "owner" ||
+            owner.deviceId !== deviceId ||
+            owner.socket.readyState !== WebSocket.OPEN
+          ) {
+            send(socket, { type: "error", code: "DEVICE_OFFLINE" });
+            return;
+          }
           if (!ownerSharingStateSockets.has(owner.socket)) {
             send(socket, {
               type: "device_sharing_state",

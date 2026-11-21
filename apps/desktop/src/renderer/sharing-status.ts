@@ -58,7 +58,11 @@ export function detachOwnerClientAfterCaptureStop<
 
 export function reuseOrCreateOwnerClient<
   TClient extends { lifecycle: string; close(): void },
->(current: { client?: TClient }, create: () => TClient): TClient {
+>(
+  current: { client?: TClient },
+  create: () => TClient,
+  startCreated?: (client: TClient) => void,
+): TClient {
   const existing = current.client;
   if (
     existing &&
@@ -71,6 +75,7 @@ export function reuseOrCreateOwnerClient<
   if (existing) existing.close();
   const created = create();
   current.client = created;
+  startCreated?.(created);
   return created;
 }
 

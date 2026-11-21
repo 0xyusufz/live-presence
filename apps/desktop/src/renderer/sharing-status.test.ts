@@ -50,6 +50,7 @@ test("capture stop detaches the owner client and an explicit share creates a fre
   assert.equal(closeCalls, 1);
 
   let createCalls = 0;
+  let startCalls = 0;
   const freshClient = {
     lifecycle: "IDLE",
     close() {},
@@ -57,14 +58,15 @@ test("capture stop detaches the owner client and an explicit share creates a fre
   const reused = reuseOrCreateOwnerClient(current, () => {
     createCalls += 1;
     return freshClient;
-  });
+  }, () => { startCalls += 1; });
   assert.equal(reused, freshClient);
   assert.equal(current.client, freshClient);
   assert.equal(createCalls, 1);
+  assert.equal(startCalls, 1);
 
   const reusedAgain = reuseOrCreateOwnerClient(current, () => {
     throw new Error("must not create a duplicate client");
-  });
+  }, () => { throw new Error("must not start an existing client"); });
   assert.equal(reusedAgain, freshClient);
 });
 

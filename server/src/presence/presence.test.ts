@@ -148,6 +148,118 @@ test("an old owner screen-off after replacement cannot clear the active session"
   }
 });
 
+test("viewer create_session uses the latest authenticated owner socket while replacement overlaps", async () => {
+  const server = await buildApp(":memory:", 3600, "test");
+  const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const viewerLogin = await server.app.inject({
+    method: "POST",
+    url: "/auth/request-login",
+    payload: { email: `latest-owner-${Date.now()}@example.com` },
+  });
+  const viewerVerification = await server.app.inject({
+    method: "POST",
+    url: "/auth/verify-login",
+    payload: { token: viewerLogin.json<{ developmentToken: string }>().developmentToken },
+  });
+  const viewerCookie = cookieValue(viewerVerification.headers["set-cookie"]);
+  const viewerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: viewerCookie },
+  });
+  server.authorization.grant(
+    ownerSession.json<{ user: { id: string } }>().user.id,
+    viewerSession.json<{ user: { id: string } }>().user.id,
+  );
+  await server.app.listen({ host: "127.0.0.1", port: 0 });
+  const address = server.app.server.address();
+  assert.ok(address && typeof address !== "string");
+  const wsUrl = `ws://127.0.0.1:${address.port}/ws`;
+  const oldOwner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+  const replacementOwner = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+  const viewer = new WebSocket(wsUrl, {
+    origin: "http://localhost:5173",
+    headers: { cookie: viewerCookie },
+  });
+  const sockets = [oldOwner, replacementOwner, viewer];
+  const viewerAuth = nextMessage(viewer);
+  const originalClose = WebSocket.prototype.close;
+  WebSocket.prototype.close = function (
+    this: WebSocket,
+    code?: number,
+    reason?: string | Buffer,
+  ): void {
+    if (code === 1008 && reason?.toString() === "owner connection replaced") return;
+    originalClose.call(this, code, reason);
+  };
+
+  try {
+    await Promise.all([
+      waitForOpen(oldOwner),
+      waitForOpen(replacementOwner),
+      waitForOpen(viewer),
+    ]);
+    const oldAuth = nextMessage(oldOwner);
+    oldOwner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    assert.equal((await oldAuth).role, "owner");
+    assert.equal((await viewerAuth).role, "viewer");
+
+    const replacementAuth = nextMessage(replacementOwner);
+    replacementOwner.send(JSON.stringify({ type: "auth", token: device.refreshToken }));
+    const authenticated = await replacementAuth;
+    assert.equal(authenticated.type, "authenticated");
+    assert.equal(authenticated.role, "owner");
+
+    const replacementAck = nextMessage(replacementOwner);
+    replacementOwner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: true }));
+    assert.equal((await replacementAck).type, "sharing_state_updated");
+
+    const viewerMessages = nextMessages(viewer, 2);
+    const replacementJoined = nextMessage(replacementOwner);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
+    const [, created] = await viewerMessages;
+    assert.equal(created?.type, "session_created");
+    const sessionId = created?.session_id;
+
+    assert.deepEqual(await replacementJoined, {
+      type: "viewer_joined",
+      session_id: sessionId,
+      viewer_user_id: viewerSession.json<{ user: { id: string } }>().user.id,
+    });
+
+    oldOwner.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }));
+    await assertNoMessage(oldOwner);
+    const oldOwnerClosed = waitForClose(oldOwner);
+    oldOwner.close();
+    assert.equal((await oldOwnerClosed), 1005);
+
+    const presence = await server.app.inject({
+      method: "GET",
+      url: "/presence",
+      headers: { cookie: device.cookie },
+    });
+    assert.deepEqual(
+      presence.json<{ devices: Array<{ screen: boolean; camera: boolean }> }>()
+        .devices.map(({ screen, camera }) => ({ screen, camera }))[0],
+      { screen: true, camera: true },
+    );
+
+    const replacementAckStillOpen = nextMessage(replacementOwner);
+    replacementOwner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: false }));
+    assert.equal((await replacementAckStillOpen).type, "sharing_state_updated");
+  } finally {
+    WebSocket.prototype.close = originalClose;
+    await Promise.all(sockets.map(terminateSocket));
+    await server.app.close();
+    server.close();
+  }
+});
+
 function cookieValue(value: string | string[] | undefined): string {
   assert.ok(value);
   return (Array.isArray(value) ? value[0] : value).split(";")[0]!;
