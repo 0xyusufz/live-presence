@@ -287,9 +287,10 @@ export type SocketEvent =
   | { type: "error"; message: string; connectionGeneration: number };
 
 export type AppEvent =
-  | { type: "stop-sharing"; reason: string }
-  | { type: "suspend"; cycleId: number }
+  | { type: "stop-sharing"; reason: string; wakeChoiceCycleId?: number }
+  | { type: "suspend"; cycleId: number; sharingActive: boolean }
   | { type: "resume"; cycleId: number }
+  | { type: "wake-sharing-choice"; cycleId: number }
   | { type: "sleep-recovery-timeout"; cycleId: number }
   | { type: "sleep-recovery-attempt-accepted"; cycleId: number; recoveryAttemptId: string }
   | {
@@ -328,6 +329,10 @@ export type LivePresenceBridge = {
     recoveryAttemptId: string,
     phase: "eligible" | "started" | "completed" | "failed" | "timed_out",
   ): void;
+  restoreApplicationWindow(): void;
+  registerDisplayedWakeSharingChoice(cycleId: number): void;
+  completeWakeSharingChoice(cycleId: number): void;
+  reportAppEventsReady(): void;
   notifySharingResumed(): void;
   reportCaptureDiagnostic(event: CaptureDiagnosticEvent, details?: CaptureDiagnosticDetails): void;
   stopFromIndicator(): void;

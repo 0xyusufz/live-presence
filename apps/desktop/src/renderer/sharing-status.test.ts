@@ -4,6 +4,8 @@ import type { CaptureCleanupReason } from "../ipc-contract.js";
 import {
   attachApprovedTracks,
   acquireLiveScreenTrack,
+  beginScreenCapturePreparation,
+  canStartWakeSharingChoice,
   confirmLiveScreenCapture,
   detachOwnerClientAfterCaptureStop,
   inspectScreenVideoTracks,
@@ -12,7 +14,9 @@ import {
   reuseOrCreateOwnerClient,
   sharingStatus,
   setApprovedCameraTrack,
+  startCameraAfterScreenActivation,
   stopCapturedTracks,
+  stopOwnerCapture,
 } from "./sharing-status.js";
 
 function deferred<T>() {
@@ -33,6 +37,46 @@ test("desktop sharing status never reports idle while capture is live", () => {
 test("desktop sharing status distinguishes preparation and stopped capture", () => {
   assert.equal(sharingStatus("preparing", "IDLE", false), "Preparing");
   assert.equal(sharingStatus("idle", "CONNECTED", false), "Not sharing");
+});
+
+test("screen capture preparation is reserved once while the picker is pending", () => {
+  const current: { preparingScreen?: boolean } = {};
+  assert.equal(beginScreenCapturePreparation(current, false), true);
+  assert.equal(current.preparingScreen, true);
+  assert.equal(beginScreenCapturePreparation(current, false), false);
+  assert.equal(beginScreenCapturePreparation(current, true), false);
+});
+
+test("wake-sharing choices remain disabled until indicator readiness is confirmed", () => {
+  assert.equal(canStartWakeSharingChoice(false, false), false);
+  assert.equal(canStartWakeSharingChoice(true, false), true);
+  assert.equal(canStartWakeSharingChoice(true, true), false);
+});
+
+test("combined sharing starts the camera only after screen sharing activates", async () => {
+  const calls: string[] = [];
+  const started = await startCameraAfterScreenActivation(
+    async () => {
+      calls.push("screen-start");
+      await Promise.resolve();
+      calls.push("screen-active");
+      return true;
+    },
+    async () => { calls.push("camera-start"); },
+  );
+  assert.equal(started, true);
+  assert.deepEqual(calls, ["screen-start", "screen-active", "camera-start"]);
+
+  calls.length = 0;
+  const failed = await startCameraAfterScreenActivation(
+    async () => {
+      calls.push("screen-failed");
+      return false;
+    },
+    async () => { calls.push("camera-start"); },
+  );
+  assert.equal(failed, false);
+  assert.deepEqual(calls, ["screen-failed"]);
 });
 
 test("capture stop detaches the owner client and an explicit share creates a fresh usable client", () => {
@@ -125,6 +169,52 @@ test("stopping sharing ends both independently captured media tracks", () => {
     { stop: () => stopped.push("camera") },
   );
   assert.deepEqual(stopped, ["screen", "camera"]);
+});
+
+test("capture cleanup offers the wake choice only after both tracks and intents are cleared", async () => {
+  const steps: string[] = [];
+  const screen = { stop: () => steps.push("screen-stopped") };
+  const camera = { stop: () => steps.push("camera-stopped") };
+  const cleanupFailed = await stopOwnerCapture(
+    screen,
+    camera,
+    async () => {
+      assert.deepEqual(steps, ["screen-stopped", "camera-stopped"]);
+      steps.push("camera-intent-cleared");
+    },
+    async () => {
+      assert.deepEqual(steps, ["screen-stopped", "camera-stopped", "camera-intent-cleared"]);
+      steps.push("screen-intent-cleared");
+    },
+    () => steps.push("cleanup-acknowledged"),
+    () => steps.push("wake-choice-offered"),
+  );
+  assert.equal(cleanupFailed, false);
+  assert.deepEqual(steps, [
+    "screen-stopped",
+    "camera-stopped",
+    "camera-intent-cleared",
+    "screen-intent-cleared",
+    "cleanup-acknowledged",
+    "wake-choice-offered",
+  ]);
+
+  const failedSteps: string[] = [];
+  const failedCleanup = await stopOwnerCapture(
+    { stop: () => failedSteps.push("screen-stopped") },
+    { stop: () => failedSteps.push("camera-stopped") },
+    async () => { throw new Error("camera intent cleanup failed"); },
+    async () => { failedSteps.push("screen-intent-cleared"); },
+    () => failedSteps.push("cleanup-acknowledged"),
+    () => failedSteps.push("wake-choice-offered"),
+  );
+  assert.equal(failedCleanup, true);
+  assert.deepEqual(failedSteps, [
+    "screen-stopped",
+    "camera-stopped",
+    "screen-intent-cleared",
+    "cleanup-acknowledged",
+  ]);
 });
 
 test("failed display capture cannot proceed to the active-confirmation boundary", async () => {

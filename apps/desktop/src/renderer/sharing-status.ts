@@ -10,6 +10,31 @@ type CaptureTrackState<T extends WebRtcTrack = WebRtcTrack> = {
   cameraMutation?: Promise<void>;
 };
 
+export function beginScreenCapturePreparation(
+  current: { screen?: unknown; preparingScreen?: boolean },
+  screenSharing: boolean,
+): boolean {
+  if (screenSharing || current.screen || current.preparingScreen) return false;
+  current.preparingScreen = true;
+  return true;
+}
+
+export async function startCameraAfterScreenActivation(
+  startScreen: () => Promise<boolean>,
+  startCamera: () => Promise<void>,
+): Promise<boolean> {
+  if (!await startScreen()) return false;
+  await startCamera();
+  return true;
+}
+
+export function canStartWakeSharingChoice(
+  indicatorReady: boolean,
+  selectionInFlight: boolean,
+): boolean {
+  return indicatorReady && !selectionInFlight;
+}
+
 export function handleTerminalCaptureFailure(
   current: {
     failureHandled?: boolean;
@@ -231,6 +256,7 @@ export async function stopOwnerCapture(
   clearCameraIntent: () => Promise<void>,
   clearScreenIntent: () => Promise<void>,
   acknowledgeCleanup: () => void,
+  onCleanupSucceeded?: () => void,
 ): Promise<boolean> {
   stopCapturedTracks(screen, camera);
   const results = await Promise.allSettled([
@@ -238,7 +264,9 @@ export async function stopOwnerCapture(
     clearScreenIntent(),
   ]);
   acknowledgeCleanup();
-  return results.some((result) => result.status === "rejected");
+  const cleanupFailed = results.some((result) => result.status === "rejected");
+  if (!cleanupFailed) onCleanupSucceeded?.();
+  return cleanupFailed;
 }
 
 export async function acquireLiveScreenTrack(

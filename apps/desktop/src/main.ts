@@ -25,7 +25,15 @@ import { WindowRestorer } from "./main/window-restoration.js";
 import {
   canAcceptRecoveryStart,
   canAcceptRecoveryTerminal,
+  cancelWakeSharingChoiceCycle,
+  completeWakeSharingChoice,
   isValidRecoveryAttemptId,
+  queueWakeSharingChoiceCandidate,
+  registerWakeSharingChoiceCandidate,
+  resetWakeSharingChoiceDelivery,
+  shouldOfferWakeSharingChoice,
+  takeWakeSharingChoiceForDelivery,
+  type WakeSharingChoiceDeliveryState,
 } from "./main/sleep-recovery-state.js";
 import type { AppEvent, SocketEvent } from "./ipc-contract.js";
 
@@ -63,6 +71,11 @@ let sleepRecoveryState: "idle" | "started" | "completed" | "failed" | "timed_out
 let sleepRecoveryAttemptId: string | undefined;
 let activeCaptureAttemptId: string | undefined;
 let indicatorCreation: Promise<void> | undefined;
+let sharingActiveBeforeSleep = false;
+let sharingBeforeSleepCycleId: number | undefined;
+let wakeChoiceCandidateCycleId: number | undefined;
+let mainWindowAppEventsReady = false;
+const wakeSharingChoiceDelivery: WakeSharingChoiceDeliveryState = {};
 
 const credentials = new SafeStorageCredentialStore(app.getPath("userData"));
 const captureDiagnostics = new CaptureDiagnostics(() => join(app.getPath("userData"), "screen-capture.log"));
@@ -109,6 +122,22 @@ function appFrame(sender: Electron.WebContents, frame: Electron.WebFrameMain | n
 
 function mainSender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent): boolean {
   return Boolean(mainWindow && event.sender === mainWindow.webContents && appFrame(event.sender, event.senderFrame));
+}
+
+function deliverPendingWakeSharingChoice(): void {
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) return;
+  const cycleId = takeWakeSharingChoiceForDelivery(
+    wakeSharingChoiceDelivery,
+    mainWindowAppEventsReady,
+  );
+  if (cycleId === undefined) return;
+  try {
+    window.webContents.send("app:event", { type: "wake-sharing-choice", cycleId } satisfies AppEvent);
+  } catch (error) {
+    resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
+    console.error("Could not deliver the pending wake-sharing choice.", error);
+  }
 }
 
 function pickerSender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent): boolean {
@@ -240,10 +269,15 @@ async function ensureIndicator(): Promise<void> {
   }
 }
 
-function restoreApplicationWindow(): void {
-  void mainWindowRestorer.restore()
-    .then(ensureIndicator)
-    .catch(() => console.error("Could not restore the application window."));
+async function restoreApplicationWindow(): Promise<boolean> {
+  try {
+    await mainWindowRestorer.restore();
+    await ensureIndicator();
+    return true;
+  } catch (error) {
+    console.error("Could not restore the application window.", error);
+    return false;
+  }
 }
 
 function showIndicator(): boolean {
@@ -286,6 +320,16 @@ async function stopSharing(reason: string, quitAfter = false): Promise<void> {
     return;
   }
   stopping = true;
+  const wakeChoiceCycleId =
+    wakeSharingChoiceDelivery.pendingCycleId ?? wakeChoiceCandidateCycleId;
+  if (wakeChoiceCycleId !== undefined) {
+    completeWakeSharingChoice(wakeSharingChoiceDelivery, wakeChoiceCycleId);
+    if (wakeChoiceCandidateCycleId === wakeChoiceCycleId) {
+      wakeChoiceCandidateCycleId = undefined;
+    }
+  }
+  sharingActiveBeforeSleep = false;
+  sharingBeforeSleepCycleId = undefined;
   sleepRecoveryCycleId += 1;
   if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
   sleepRecoveryTimer = undefined;
@@ -299,6 +343,9 @@ async function stopSharing(reason: string, quitAfter = false): Promise<void> {
   cameraIntent = false;
   picker.cancel();
   if (!needsRendererCleanup && !quittingAfterCleanup) {
+    if (wakeChoiceCycleId !== undefined) {
+      emitAppEvent({ type: "stop-sharing", reason, wakeChoiceCycleId });
+    }
     hideIndicator();
     stopping = false;
     return;
@@ -311,7 +358,7 @@ async function stopSharing(reason: string, quitAfter = false): Promise<void> {
     };
     cleanupTimer = setTimeout(resolve, CLEANUP_ACK_MS);
   });
-  emitAppEvent({ type: "stop-sharing", reason });
+  emitAppEvent({ type: "stop-sharing", reason, wakeChoiceCycleId });
   await ack;
   if (cleanupTimer) clearTimeout(cleanupTimer);
   cleanupTimer = undefined;
@@ -351,6 +398,31 @@ function validateWebOrigin(value: string): string {
 }
 
 function installIpcHandlers(): void {
+  ipcMain.on("app:events-ready", (event) => {
+    if (!mainSender(event)) return;
+    mainWindowAppEventsReady = true;
+    deliverPendingWakeSharingChoice();
+  });
+  ipcMain.on("wake-sharing-choice:complete", (event, cycleId: unknown) => {
+    if (!mainSender(event) || typeof cycleId !== "number" || !Number.isSafeInteger(cycleId)) return;
+    wakeChoiceCandidateCycleId = cancelWakeSharingChoiceCycle(
+      wakeSharingChoiceDelivery,
+      wakeChoiceCandidateCycleId,
+      cycleId,
+    );
+  });
+  ipcMain.on("wake-sharing-choice:register", (event, cycleId: unknown) => {
+    if (!mainSender(event) || typeof cycleId !== "number" || !Number.isSafeInteger(cycleId)) return;
+    registerWakeSharingChoiceCandidate(
+      wakeSharingChoiceDelivery,
+      wakeChoiceCandidateCycleId,
+      cycleId,
+    );
+  });
+  ipcMain.on("window:restore", (event) => {
+    if (!mainSender(event)) return;
+    void restoreApplicationWindow();
+  });
   ipcMain.on("capture:diagnostic", (event, name: unknown, details: unknown) => {
     if (!mainSender(event) || typeof name !== "string" || name.length > 100 ||
       name === "owner_signaling_transport" ||
@@ -585,6 +657,7 @@ function installIpcHandlers(): void {
       if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
       sleepRecoveryTimer = undefined;
       sleepRecoveryState = "completed";
+      if (wakeChoiceCandidateCycleId === cycleId) wakeChoiceCandidateCycleId = undefined;
       emitAppEvent({
         type: "sleep-recovery-result",
         cycleId,
@@ -658,11 +731,22 @@ async function createMainWindow(): Promise<BrowserWindow> {
     title: "Live Presence",
   });
   mainWindow = window;
+  mainWindowAppEventsReady = false;
+  resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
+  window.webContents.on("did-start-loading", () => {
+    if (mainWindow !== window) return;
+    mainWindowAppEventsReady = false;
+    resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
+  });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, url) => {
     if (!url.startsWith("app://bundle/")) event.preventDefault();
   });
   window.webContents.on("render-process-gone", () => {
+    if (mainWindow === window) {
+      mainWindowAppEventsReady = false;
+      resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
+    }
     if (shareActive || capturePending) void stopSharing("renderer-crashed", true);
     else {
       transport?.close();
@@ -681,6 +765,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
   window.on("closed", () => {
     if (mainWindow !== window) return;
     mainWindow = undefined;
+    mainWindowAppEventsReady = false;
+    resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
     if (!shareActive && !capturePending) {
       transport?.close();
       transport = undefined;
@@ -726,6 +812,9 @@ app.whenReady().then(async () => {
   powerMonitor.on("suspend", () => {
     systemSuspended = true;
     sleepRecoveryCycleId += 1;
+    sharingActiveBeforeSleep = shareActive;
+    sharingBeforeSleepCycleId = shareActive ? sleepRecoveryCycleId : undefined;
+    if (shareActive) wakeChoiceCandidateCycleId = sleepRecoveryCycleId;
     suspendedAtMs = Date.now();
     captureDiagnostics.log("system_suspend", {
       cycleId: sleepRecoveryCycleId,
@@ -740,9 +829,17 @@ app.whenReady().then(async () => {
     sleepRecoveryTimer = undefined;
     sleepRecoveryState = "idle";
     sleepRecoveryAttemptId = undefined;
-    emitAppEvent({ type: "suspend", cycleId: sleepRecoveryCycleId });
+    emitAppEvent({
+      type: "suspend",
+      cycleId: sleepRecoveryCycleId,
+      sharingActive: shareActive,
+    });
   });
-  powerMonitor.on("resume", () => {
+  powerMonitor.on("resume", async () => {
+    const wasSharingActive = sharingActiveBeforeSleep;
+    const wakeChoiceCycleId = sharingBeforeSleepCycleId;
+    sharingActiveBeforeSleep = false;
+    sharingBeforeSleepCycleId = undefined;
     lastHeartbeat = Date.now();
     systemSuspended = false;
     let screenPermissionStatus: "not-determined" | "granted" | "denied" | "restricted" | "unknown" = "unknown";
@@ -788,6 +885,18 @@ app.whenReady().then(async () => {
       }, SLEEP_RECOVERY_DECISION_MS);
     }
     if (shareActive) emitAppEvent({ type: "resume", cycleId: sleepRecoveryCycleId });
+    else if (
+      wakeChoiceCycleId !== undefined &&
+      shouldOfferWakeSharingChoice(wasSharingActive, true, false, false)
+    ) {
+      if (queueWakeSharingChoiceCandidate(
+        wakeSharingChoiceDelivery,
+        wakeChoiceCandidateCycleId,
+        wakeChoiceCycleId,
+      )) {
+        deliverPendingWakeSharingChoice();
+      }
+    }
     sleepMarkerAcknowledged = false;
   });
   powerMonitor.on("lock-screen", () => {

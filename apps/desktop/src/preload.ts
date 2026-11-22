@@ -34,12 +34,18 @@ const bridge: LivePresenceBridge = {
     ipcRenderer.send("system:sleep-marker-result", cycleId, accepted),
   reportSleepRecovery: (cycleId, recoveryAttemptId, phase) =>
     ipcRenderer.send("system:sleep-recovery-result", cycleId, recoveryAttemptId, phase),
+  restoreApplicationWindow: () => ipcRenderer.send("window:restore"),
+  registerDisplayedWakeSharingChoice: (cycleId) =>
+    ipcRenderer.send("wake-sharing-choice:register", cycleId),
+  completeWakeSharingChoice: (cycleId) => ipcRenderer.send("wake-sharing-choice:complete", cycleId),
+  reportAppEventsReady: () => ipcRenderer.send("app:events-ready"),
   notifySharingResumed: () => ipcRenderer.send("notification:sharing-resumed"),
   reportCaptureDiagnostic: (event, details = {}) => ipcRenderer.send("capture:diagnostic", event, details),
   stopFromIndicator: () => ipcRenderer.send("indicator:stop"),
   onAppEvent: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, value: AppEvent) => callback(value);
     ipcRenderer.on("app:event", listener);
+    bridge.reportAppEventsReady();
     return () => ipcRenderer.removeListener("app:event", listener);
   },
 };

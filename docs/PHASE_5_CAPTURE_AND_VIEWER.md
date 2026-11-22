@@ -61,7 +61,11 @@ before the new offer. A screen track that ended, an expired/unavailable
 capability, or a server restart fails safely; no track is silently reacquired.
 The desktop shows the `Connected / Sharing resumed` notification only after
 the resumed peer becomes connected. A new viewer request is never
-automatically approved.
+automatically approved. If sharing was active before sleep but the old
+capture/session has ended by wake, the desktop restores its window and offers
+Screen only, Screen + camera, or Not now. These choices use the existing local
+capture flows; capture starts only after an explicit selection. Successful
+automatic recovery does not show the popup, and crash/relaunch remains IDLE.
 
 ## Development and packaging
 

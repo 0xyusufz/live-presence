@@ -8,6 +8,8 @@ import { createBrowserPeer } from "./webrtc-adapter.js";
 import {
   attachApprovedTracks,
   acquireLiveScreenTrack,
+  beginScreenCapturePreparation,
+  canStartWakeSharingChoice,
   confirmLiveScreenCapture,
   handleTerminalCaptureFailure,
   invalidateCapture,
@@ -20,6 +22,7 @@ import {
   reuseOrCreateOwnerClient,
   setApprovedCameraTrack,
   sharingStatus,
+  startCameraAfterScreenActivation,
   stopOwnerCapture,
 } from "./sharing-status.js";
 import { createSignalingSocket } from "./signaling-socket.js";
@@ -28,6 +31,11 @@ import {
   captureCleanupDiagnostic,
   trackLifecycleDiagnostic,
 } from "./capture-lifecycle-diagnostics.js";
+import {
+  isDefinitiveSleepRecoveryFailure,
+  isNewWakeSharingChoiceCycle,
+  shouldOfferWakeSharingChoice,
+} from "../main/sleep-recovery-state.js";
 import {
   displayCaptureFailureCategory,
   displayCaptureFailureMessage,
@@ -170,10 +178,38 @@ function ShareWindow(): JSX.Element {
   const [credentialSaved, setCredentialSaved] = useState<boolean | undefined>();
   const [credentialInput, setCredentialInput] = useState("");
   const [serverUrl, setServerUrl] = useState("");
+  const [wakeChoiceOpen, setWakeChoiceOpen] = useState(false);
   const sleepRecoveryCycle = useRef<number | undefined>(undefined);
   const sleepRecoveryAttemptId = useRef<string | undefined>(undefined);
   const sleepRecoveryState = useRef<"idle" | "eligible" | "started" | "completed" | "failed" | "timed_out">("idle");
   const suspendStartedAt = useRef<number | undefined>(undefined);
+  const wakeChoiceCycle = useRef<number | undefined>(undefined);
+  const wakeChoiceObserved = useRef(false);
+  const lastWakeChoiceCycle = useRef<number | undefined>(undefined);
+  const wakeChoiceSelectionInFlight = useRef(false);
+
+  function showWakeSharingChoice(cycleId: number): void {
+    const alreadyOffered = !isNewWakeSharingChoiceCycle(cycleId, lastWakeChoiceCycle.current);
+    if (!shouldOfferWakeSharingChoice(
+      wakeChoiceCycle.current === cycleId,
+      true,
+      sleepRecoveryState.current === "completed",
+      alreadyOffered,
+    )) return;
+    lastWakeChoiceCycle.current = cycleId;
+    window.livePresence.registerDisplayedWakeSharingChoice(cycleId);
+    window.livePresence.restoreApplicationWindow();
+    setWakeChoiceOpen(true);
+  }
+
+  function cancelWakeSharingChoice(cycleId: number | undefined): boolean {
+    if (cycleId === undefined || wakeChoiceCycle.current !== cycleId) return false;
+    window.livePresence.completeWakeSharingChoice(cycleId);
+    wakeChoiceCycle.current = undefined;
+    wakeChoiceObserved.current = false;
+    setWakeChoiceOpen(false);
+    return true;
+  }
 
   function reportTrackLifecycle(
     track: MediaStreamTrack,
@@ -261,6 +297,7 @@ function ShareWindow(): JSX.Element {
               "Viewer authorization was revoked; sharing was stopped.",
               true,
               "safety_stop",
+              wakeChoiceCycle.current,
             );
           }
         },
@@ -425,9 +462,18 @@ function ShareWindow(): JSX.Element {
       }
     }, 750);
     const removeEvents = window.livePresence.onAppEvent((event) => {
-      if (event.type === "stop-sharing") void stopCurrent("Sharing stopped for safety.", true, "safety_stop");
+      if (event.type === "stop-sharing") {
+        void stopCurrent(
+          "Sharing stopped for safety.",
+          true,
+          "safety_stop",
+          event.wakeChoiceCycleId,
+        );
+      }
       if (event.type === "indicator-ready") setIndicatorPrepared(event.ready);
       if (event.type === "suspend") {
+        wakeChoiceCycle.current = event.sharingActive ? event.cycleId : undefined;
+        wakeChoiceObserved.current = false;
         sleepRecoveryCycle.current = event.cycleId;
         sleepRecoveryAttemptId.current = undefined;
         sleepRecoveryState.current = "idle";
@@ -490,7 +536,7 @@ function ShareWindow(): JSX.Element {
           sleepRecoveryAttemptId.current !== event.recoveryAttemptId ||
           sleepRecoveryState.current !== "started"
         ) return;
-        if (event.phase === "failed") {
+        if (isDefinitiveSleepRecoveryFailure(event.phase)) {
           sleepRecoveryState.current = "failed";
           reportCaptureDiagnostic("sleep_recovery_result", {
             ...captureTrackDiagnosticDetails(),
@@ -499,10 +545,13 @@ function ShareWindow(): JSX.Element {
             recoveryPhase: "failed",
           });
           setMessage("Unable to resume sharing after sleep.");
+          void stopCurrent("Unable to resume sharing after sleep.", true, "resume_ineligible");
           return;
         }
         if (event.phase !== "completed") return;
         sleepRecoveryState.current = "completed";
+        wakeChoiceCycle.current = undefined;
+        wakeChoiceObserved.current = false;
         reportCaptureDiagnostic("sleep_recovery_result", {
           ...captureTrackDiagnosticDetails(),
           cycleId: event.cycleId,
@@ -542,10 +591,17 @@ function ShareWindow(): JSX.Element {
         window.livePresence.reportSleepRecovery(event.cycleId, event.recoveryAttemptId, "started");
         client.resumeAfterWake(event.recoveryAttemptId);
       }
+      if (event.type === "wake-sharing-choice") {
+        wakeChoiceCycle.current = event.cycleId;
+        wakeChoiceObserved.current = true;
+        showWakeSharingChoice(event.cycleId);
+      }
       if (event.type === "resume") {
         const current = capture.current;
         const client = current.client;
         if (!client && !current.screen && !current.preparingScreen && current.generation === 0) return;
+        wakeChoiceCycle.current = event.cycleId;
+        wakeChoiceObserved.current = true;
         const eligible = Boolean(
           client &&
           current.screen &&
@@ -621,8 +677,21 @@ function ShareWindow(): JSX.Element {
     reason: string | undefined,
     stopClient: boolean,
     cleanupReason: CaptureCleanupReason,
+    wakeChoiceCancellationCycleId?: number,
   ): Promise<void> {
     const current = capture.current;
+    const wakeChoiceToOffer = wakeChoiceObserved.current &&
+      wakeChoiceCycle.current !== undefined &&
+      (cleanupReason === "track_ended" ||
+        cleanupReason === "resume_ineligible" ||
+        cleanupReason === "terminal_failure")
+      ? wakeChoiceCycle.current
+      : undefined;
+    if (cleanupReason === "explicit_user_stop") {
+      cancelWakeSharingChoice(wakeChoiceCycle.current);
+    } else if (cleanupReason === "safety_stop") {
+      cancelWakeSharingChoice(wakeChoiceCancellationCycleId);
+    }
     reportCaptureDiagnostic("capture_cleanup", captureCleanupDiagnostic(
       current.screen,
       current.camera,
@@ -667,6 +736,9 @@ function ShareWindow(): JSX.Element {
       () => window.livePresence.setCameraIntent(false),
       () => window.livePresence.setScreenActive(false),
       () => window.livePresence.acknowledgeCleanup(),
+      () => {
+        if (wakeChoiceToOffer !== undefined) showWakeSharingChoice(wakeChoiceToOffer);
+      },
     );
     if (cleanupFailed) {
       setMessage(reason
@@ -674,6 +746,28 @@ function ShareWindow(): JSX.Element {
         : "Local media stopped; main-process cleanup is being enforced.");
     } else if (reason) {
       setMessage(reason);
+    }
+  }
+
+  function dismissWakeSharingChoice(): void {
+    cancelWakeSharingChoice(wakeChoiceCycle.current);
+  }
+
+  async function chooseWakeSharingOption(option: "screen" | "screen-camera"): Promise<void> {
+    if (!canStartWakeSharingChoice(indicatorPrepared, wakeChoiceSelectionInFlight.current)) return;
+    wakeChoiceSelectionInFlight.current = true;
+    dismissWakeSharingChoice();
+    try {
+      if (option === "screen") {
+        await startScreenShare();
+      } else {
+        await startCameraAfterScreenActivation(
+          startScreenShare,
+          toggleCamera,
+        );
+      }
+    } finally {
+      wakeChoiceSelectionInFlight.current = false;
     }
   }
 
@@ -694,12 +788,11 @@ function ShareWindow(): JSX.Element {
     }
   }
 
-  function startScreenShare(): void {
-    if (screenSharing || capture.current.screen) return;
+  async function startScreenShare(): Promise<boolean> {
+    if (!beginScreenCapturePreparation(capture.current, screenSharing)) return false;
     const generation = ++capture.current.generation;
     const attemptId = crypto.randomUUID();
     capture.current.attemptId = attemptId;
-    capture.current.preparingScreen = true;
     capture.current.failed = false;
     capture.current.failureHandled = false;
     setMessage("");
@@ -717,14 +810,14 @@ function ShareWindow(): JSX.Element {
       camera: false,
       stage: "local_user_action",
     }, attemptId);
-    window.livePresence.beginScreenCapture(attemptId);
-    reportCaptureDiagnostic("screen_display_media_request_started", {
-      screen: false,
-      camera: false,
-      stage: "display_media_request",
-    }, attemptId);
     let request: Promise<MediaStream>;
     try {
+      window.livePresence.beginScreenCapture(attemptId);
+      reportCaptureDiagnostic("screen_display_media_request_started", {
+        screen: false,
+        camera: false,
+        stage: "display_media_request",
+      }, attemptId);
       request = navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
     } catch (error) {
       reportCaptureDiagnostic("screen_display_media_request_failed", {
@@ -732,27 +825,30 @@ function ShareWindow(): JSX.Element {
         errorCategory: "display_media_failed",
         errorCode: diagnosticErrorCode(error),
       }, attemptId);
-      void stopCurrent("Screen sharing could not be started.", true, "setup_failure")
+      await stopCurrent("Screen sharing could not be started.", true, "setup_failure")
         .catch(() => setMessage("Screen sharing could not be started; local cleanup was requested."));
-      return;
+      return false;
     }
-    void finishScreenShare(request, generation, attemptId).catch(async (error: unknown) => {
+    try {
+      return await finishScreenShare(request, generation, attemptId);
+    } catch (error: unknown) {
       reportCaptureDiagnostic("screen_sharing_activation_failed", {
         stage: "capture_operation",
         errorCategory: "capture_unexpected_failure",
         errorCode: diagnosticErrorCode(error),
       }, attemptId);
-      if (capture.current.generation !== generation) return;
+      if (capture.current.generation !== generation) return false;
       await stopCurrent("Screen sharing could not be completed.", true, "setup_failure").catch(() => undefined);
       setMessage("Screen sharing could not be completed. Local media cleanup was requested.");
-    });
+      return false;
+    }
   }
 
   async function finishScreenShare(
     request: Promise<MediaStream>,
     generation: number,
     attemptId: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let screen: MediaStreamTrack;
     let stream: MediaStream;
     try {
@@ -774,7 +870,7 @@ function ShareWindow(): JSX.Element {
         const message = displayCaptureFailureMessage(error);
         await stopCurrent(message, true, "setup_failure").catch(() => setMessage(message));
       }
-      return;
+      return false;
     }
 
     try {
@@ -811,7 +907,7 @@ function ShareWindow(): JSX.Element {
         const message = displayCaptureFailureMessage(error);
         await stopCurrent(message, true, "setup_failure").catch(() => setMessage(message));
       }
-      return;
+      return false;
     }
     if (capture.current.generation !== generation) {
       reportCaptureDiagnostic("screen_track_unavailable", {
@@ -822,7 +918,7 @@ function ShareWindow(): JSX.Element {
         muted: screen.muted,
       }, attemptId);
       screen.stop();
-      return;
+      return false;
     }
     capture.current.screen = screen;
     capture.current.preparingScreen = false;
@@ -875,7 +971,7 @@ function ShareWindow(): JSX.Element {
           true,
           screen.readyState === "ended" ? "track_ended" : "setup_failure",
         );
-        return;
+        return false;
       }
       const client = ensureOwnerClient();
       reportCaptureDiagnostic("sharing_state_activation_requested", {
@@ -885,8 +981,9 @@ function ShareWindow(): JSX.Element {
       }, attemptId);
       await client.setSharingState(true, false);
       setState("CONNECTING");
-      if (capture.current.generation !== generation) return;
+      if (capture.current.generation !== generation) return false;
       setState(client.lifecycle);
+      return true;
     } catch (error) {
       if (capture.current.generation === generation) {
         reportCaptureDiagnostic("screen_sharing_activation_failed", {
@@ -909,6 +1006,7 @@ function ShareWindow(): JSX.Element {
         }));
         await stopCurrent("Sharing could not connect.", true, "setup_failure");
       }
+      return false;
     }
   }
 
@@ -1068,7 +1166,10 @@ function ShareWindow(): JSX.Element {
         </p>
         <p>{serverUrl || "Signaling server not configured"}</p>
         <div className="actions">
-          <button disabled={screenSharing || credentialSaved === false || !indicatorPrepared} onClick={startScreenShare}>
+          <button
+            disabled={screenSharing || capture.current.preparingScreen || credentialSaved === false || !indicatorPrepared}
+            onClick={() => void startScreenShare()}
+          >
             Share Screen
           </button>
           <button className="secondary" disabled={!screenSharing} onClick={() => void toggleCamera()}>
@@ -1084,6 +1185,42 @@ function ShareWindow(): JSX.Element {
         </div>
         {cameraSharing && <p className="camera-note">Camera is sharing independently. Audio is not captured.</p>}
       </section>
+      {wakeChoiceOpen && (
+        <div className="wake-choice-backdrop">
+          <section
+            className="wake-choice"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="wake-choice-title"
+            aria-describedby="wake-choice-description"
+          >
+            <h2 id="wake-choice-title">What would you like to share?</h2>
+            <p id="wake-choice-description">Choose what to share again. Nothing starts until you choose.</p>
+            <div className="wake-choice-actions">
+              <button
+                disabled={!canStartWakeSharingChoice(
+                  indicatorPrepared,
+                  wakeChoiceSelectionInFlight.current,
+                )}
+                onClick={() => void chooseWakeSharingOption("screen")}
+              >
+                Screen only
+              </button>
+              <button
+                className="secondary"
+                disabled={!canStartWakeSharingChoice(
+                  indicatorPrepared,
+                  wakeChoiceSelectionInFlight.current,
+                )}
+                onClick={() => void chooseWakeSharingOption("screen-camera")}
+              >
+                Screen + camera
+              </button>
+              <button className="stop" onClick={dismissWakeSharingChoice}>Not now</button>
+            </div>
+          </section>
+        </div>
+      )}
       <p className="notice" role="status">{message}</p>
       <footer>Media is sent peer-to-peer when possible. The server handles signaling only.</footer>
     </main>
