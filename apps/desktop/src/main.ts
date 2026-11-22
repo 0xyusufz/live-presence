@@ -35,7 +35,11 @@ import {
   takeWakeSharingChoiceForDelivery,
   type WakeSharingChoiceDeliveryState,
 } from "./main/sleep-recovery-state.js";
-import type { AppEvent, SocketEvent } from "./ipc-contract.js";
+import type {
+  AppEvent,
+  SocketEvent,
+  WakeSharingChoiceOption,
+} from "./ipc-contract.js";
 
 protocol.registerSchemesAsPrivileged([
   { scheme: "app", privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: false } },
@@ -75,6 +79,15 @@ let sharingActiveBeforeSleep = false;
 let sharingBeforeSleepCycleId: number | undefined;
 let wakeChoiceCandidateCycleId: number | undefined;
 let mainWindowAppEventsReady = false;
+let mainWindowWakeChoiceHandlerReady = false;
+let wakeSharingOverlayWindow: BrowserWindow | undefined;
+let wakeChoiceOverlayCycleId: number | undefined;
+let wakeChoiceOverlayRequestedCycleId: number | undefined;
+let wakeChoiceOverlaySelectionCycleId: number | undefined;
+let wakeChoiceOverlayReady = false;
+let wakeChoiceOverlayDeliveredCycleId: number | undefined;
+let wakeChoiceOverlayReloadAttemptedCycleId: number | undefined;
+let wakeChoiceActivationSuppressionCycleId: number | undefined;
 const wakeSharingChoiceDelivery: WakeSharingChoiceDeliveryState = {};
 
 const credentials = new SafeStorageCredentialStore(app.getPath("userData"));
@@ -124,12 +137,194 @@ function mainSender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent):
   return Boolean(mainWindow && event.sender === mainWindow.webContents && appFrame(event.sender, event.senderFrame));
 }
 
+function wakeSharingOverlaySender(event: Electron.IpcMainEvent): boolean {
+  return Boolean(
+    wakeSharingOverlayWindow &&
+    !wakeSharingOverlayWindow.isDestroyed() &&
+    event.sender === wakeSharingOverlayWindow.webContents &&
+    appFrame(event.sender, event.senderFrame),
+  );
+}
+
+function isWakeSharingChoiceOption(value: unknown): value is WakeSharingChoiceOption {
+  return value === "screen" || value === "screen-camera";
+}
+
+function updateWakeSharingOverlayChoice(): boolean {
+  const window = wakeSharingOverlayWindow;
+  const cycleId = wakeChoiceOverlayCycleId;
+  if (
+    !window ||
+    window.isDestroyed() ||
+    !wakeChoiceOverlayReady ||
+    cycleId === undefined ||
+    wakeSharingChoiceDelivery.pendingCycleId !== cycleId
+  ) return false;
+  try {
+    window.webContents.send("wake-sharing-overlay:choice", {
+      cycleId,
+      canChoose: indicatorReady && mainWindowWakeChoiceHandlerReady,
+    });
+    return true;
+  } catch (error) {
+    console.error("Could not update the wake-sharing overlay choice.", error);
+    return false;
+  }
+}
+
+function deliverWakeSharingOverlayChoice(): void {
+  const window = wakeSharingOverlayWindow;
+  const cycleId = wakeChoiceOverlayCycleId;
+  if (
+    !window ||
+    window.isDestroyed() ||
+    !wakeChoiceOverlayReady ||
+    cycleId === undefined ||
+    wakeChoiceOverlayDeliveredCycleId === cycleId ||
+    wakeSharingChoiceDelivery.pendingCycleId !== cycleId
+  ) return;
+  if (!updateWakeSharingOverlayChoice()) {
+    wakeChoiceOverlayDeliveredCycleId = undefined;
+    return;
+  }
+  wakeChoiceOverlayDeliveredCycleId = cycleId;
+}
+
+function destroyWakeSharingOverlay(cycleId: number, preserveActivationSuppression = false): void {
+  if (wakeChoiceOverlayCycleId !== cycleId) return;
+  const window = wakeSharingOverlayWindow;
+  if (wakeChoiceOverlayRequestedCycleId === cycleId) {
+    wakeChoiceOverlayRequestedCycleId = undefined;
+  }
+  wakeChoiceOverlayCycleId = undefined;
+  wakeChoiceOverlaySelectionCycleId = undefined;
+  wakeChoiceOverlayReady = false;
+  wakeChoiceOverlayDeliveredCycleId = undefined;
+  wakeChoiceOverlayReloadAttemptedCycleId = undefined;
+  if (!preserveActivationSuppression && wakeChoiceActivationSuppressionCycleId === cycleId) {
+    wakeChoiceActivationSuppressionCycleId = undefined;
+  }
+  if (wakeSharingOverlayWindow === window) wakeSharingOverlayWindow = undefined;
+  if (window && !window.isDestroyed()) window.destroy();
+}
+
+function cancelWakeSharingChoice(cycleId: number, notifyRenderer = false): void {
+  wakeChoiceCandidateCycleId = cancelWakeSharingChoiceCycle(
+    wakeSharingChoiceDelivery,
+    wakeChoiceCandidateCycleId,
+    cycleId,
+  );
+  if (wakeChoiceOverlayRequestedCycleId === cycleId) {
+    wakeChoiceOverlayRequestedCycleId = undefined;
+  }
+  if (wakeChoiceActivationSuppressionCycleId === cycleId) {
+    wakeChoiceActivationSuppressionCycleId = undefined;
+  }
+  if (wakeChoiceOverlayCycleId === cycleId) destroyWakeSharingOverlay(cycleId);
+  if (notifyRenderer && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("app:event", {
+      type: "wake-sharing-choice-dismissed",
+      cycleId,
+    } satisfies AppEvent);
+  }
+}
+
+function createWakeSharingOverlay(cycleId: number): void {
+  if (
+    process.platform !== "darwin" ||
+    wakeChoiceOverlayRequestedCycleId !== cycleId ||
+    wakeChoiceCandidateCycleId !== cycleId ||
+    wakeSharingChoiceDelivery.pendingCycleId !== cycleId ||
+    !mainWindowWakeChoiceHandlerReady
+  ) return;
+  if (
+    wakeChoiceOverlayCycleId === cycleId &&
+    wakeSharingOverlayWindow &&
+    !wakeSharingOverlayWindow.isDestroyed()
+  ) return;
+
+  try {
+    const width = 420;
+    const height = 300;
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    const window = new BrowserWindow({
+      ...windowOptions(width, height, join(__dirname, "wake-sharing-overlay-preload.js")),
+      x: Math.round(display.workArea.x + (display.workArea.width - width) / 2),
+      y: Math.round(display.workArea.y + (display.workArea.height - height) / 2),
+      type: "panel",
+      frame: false,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      skipTaskbar: true,
+      acceptFirstMouse: true,
+      alwaysOnTop: true,
+      title: "Live Presence sharing choice",
+    });
+    wakeSharingOverlayWindow = window;
+    wakeChoiceOverlayCycleId = cycleId;
+    wakeChoiceOverlaySelectionCycleId = undefined;
+    wakeChoiceOverlayReady = false;
+    wakeChoiceOverlayDeliveredCycleId = undefined;
+    wakeChoiceOverlayReloadAttemptedCycleId = undefined;
+    wakeChoiceActivationSuppressionCycleId = cycleId;
+
+    window.setAlwaysOnTop(true, "floating");
+    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    window.webContents.on("will-navigate", (event, url) => {
+      if (!url.startsWith("app://bundle/")) event.preventDefault();
+    });
+    window.webContents.on("did-start-loading", () => {
+      if (wakeSharingOverlayWindow !== window || wakeChoiceOverlayCycleId !== cycleId) return;
+      wakeChoiceOverlayReady = false;
+      wakeChoiceOverlayDeliveredCycleId = undefined;
+    });
+    window.webContents.on("render-process-gone", () => {
+      if (
+        wakeSharingOverlayWindow !== window ||
+        wakeChoiceOverlayCycleId !== cycleId ||
+        wakeSharingChoiceDelivery.pendingCycleId !== cycleId
+      ) return;
+      if (wakeChoiceOverlayReloadAttemptedCycleId === cycleId) {
+        console.error("The wake-sharing overlay renderer exited again during recovery.");
+        cancelWakeSharingChoice(cycleId, true);
+        return;
+      }
+      wakeChoiceOverlayReloadAttemptedCycleId = cycleId;
+      window.webContents.reload();
+    });
+    window.on("closed", () => {
+      const wasCurrentWindow = wakeSharingOverlayWindow === window;
+      if (wasCurrentWindow) wakeSharingOverlayWindow = undefined;
+      if (
+        wasCurrentWindow &&
+        wakeChoiceOverlayCycleId === cycleId &&
+        wakeSharingChoiceDelivery.pendingCycleId === cycleId &&
+        wakeChoiceOverlaySelectionCycleId !== cycleId
+      ) {
+        createWakeSharingOverlay(cycleId);
+      }
+    });
+
+    window.showInactive();
+    void window.loadURL("app://bundle/wake-sharing-overlay").catch((error: unknown) => {
+      console.error("Could not load the wake-sharing overlay.", error);
+      if (wakeChoiceOverlayCycleId === cycleId) cancelWakeSharingChoice(cycleId, true);
+    });
+  } catch (error) {
+    console.error("Could not create the wake-sharing overlay.", error);
+    cancelWakeSharingChoice(cycleId, true);
+  }
+}
+
 function deliverPendingWakeSharingChoice(): void {
   const window = mainWindow;
   if (!window || window.isDestroyed()) return;
   const cycleId = takeWakeSharingChoiceForDelivery(
     wakeSharingChoiceDelivery,
-    mainWindowAppEventsReady,
+    mainWindowAppEventsReady && mainWindowWakeChoiceHandlerReady,
   );
   if (cycleId === undefined) return;
   try {
@@ -204,13 +399,17 @@ async function installAppProtocol(): Promise<void> {
   });
 }
 
-function windowOptions(width: number, height: number): Electron.BrowserWindowConstructorOptions {
+function windowOptions(
+  width: number,
+  height: number,
+  preload = join(__dirname, "preload.js"),
+): Electron.BrowserWindowConstructorOptions {
   return {
     width,
     height,
     show: false,
     webPreferences: {
-      preload: join(__dirname, "preload.js"),
+      preload,
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
@@ -236,6 +435,7 @@ async function createIndicator(): Promise<void> {
     indicatorWindow = undefined;
     indicatorReady = false;
     emitAppEvent({ type: "indicator-ready", ready: false });
+    updateWakeSharingOverlayChoice();
     if (shareActive || capturePending) void stopSharing("indicator-closed", true);
   });
   window.webContents.on("render-process-gone", () => {
@@ -254,6 +454,7 @@ async function createIndicator(): Promise<void> {
   indicatorReady = true;
   window.hide();
   emitAppEvent({ type: "indicator-ready", ready: true });
+  updateWakeSharingOverlayChoice();
 }
 
 async function ensureIndicator(): Promise<void> {
@@ -271,6 +472,9 @@ async function ensureIndicator(): Promise<void> {
 
 async function restoreApplicationWindow(): Promise<boolean> {
   try {
+    if (process.platform === "darwin" && wakeChoiceActivationSuppressionCycleId !== undefined) {
+      return false;
+    }
     await mainWindowRestorer.restore();
     await ensureIndicator();
     return true;
@@ -298,6 +502,11 @@ function hideIndicator(): void {
 }
 
 function forceRendererTermination(): void {
+  const wakeChoiceCycleId =
+    wakeChoiceOverlayCycleId ??
+    wakeSharingChoiceDelivery.pendingCycleId ??
+    wakeChoiceCandidateCycleId;
+  if (wakeChoiceCycleId !== undefined) cancelWakeSharingChoice(wakeChoiceCycleId);
   signalingPeerGeneration.invalidate();
   transport?.close();
   transport = undefined;
@@ -321,12 +530,12 @@ async function stopSharing(reason: string, quitAfter = false): Promise<void> {
   }
   stopping = true;
   const wakeChoiceCycleId =
-    wakeSharingChoiceDelivery.pendingCycleId ?? wakeChoiceCandidateCycleId;
+    wakeSharingChoiceDelivery.pendingCycleId ??
+    wakeChoiceCandidateCycleId ??
+    wakeChoiceOverlayCycleId;
+  wakeChoiceActivationSuppressionCycleId = undefined;
   if (wakeChoiceCycleId !== undefined) {
-    completeWakeSharingChoice(wakeSharingChoiceDelivery, wakeChoiceCycleId);
-    if (wakeChoiceCandidateCycleId === wakeChoiceCycleId) {
-      wakeChoiceCandidateCycleId = undefined;
-    }
+    cancelWakeSharingChoice(wakeChoiceCycleId);
   }
   sharingActiveBeforeSleep = false;
   sharingBeforeSleepCycleId = undefined;
@@ -403,21 +612,115 @@ function installIpcHandlers(): void {
     mainWindowAppEventsReady = true;
     deliverPendingWakeSharingChoice();
   });
+  ipcMain.on("wake-sharing-choice:handler-ready", (event) => {
+    if (!mainSender(event)) return;
+    mainWindowWakeChoiceHandlerReady = true;
+    deliverPendingWakeSharingChoice();
+    const cycleId = wakeChoiceOverlayRequestedCycleId;
+    if (cycleId !== undefined) createWakeSharingOverlay(cycleId);
+    updateWakeSharingOverlayChoice();
+  });
   ipcMain.on("wake-sharing-choice:complete", (event, cycleId: unknown) => {
     if (!mainSender(event) || typeof cycleId !== "number" || !Number.isSafeInteger(cycleId)) return;
+    if (wakeChoiceOverlayRequestedCycleId === cycleId) {
+      wakeChoiceOverlayRequestedCycleId = undefined;
+    }
     wakeChoiceCandidateCycleId = cancelWakeSharingChoiceCycle(
       wakeSharingChoiceDelivery,
       wakeChoiceCandidateCycleId,
       cycleId,
     );
+    if (wakeChoiceOverlayCycleId === cycleId) {
+      if (wakeChoiceOverlaySelectionCycleId === cycleId) {
+        if (wakeSharingOverlayWindow && !wakeSharingOverlayWindow.isDestroyed()) {
+          wakeSharingOverlayWindow.hide();
+        }
+      } else {
+        destroyWakeSharingOverlay(cycleId);
+      }
+    }
   });
   ipcMain.on("wake-sharing-choice:register", (event, cycleId: unknown) => {
     if (!mainSender(event) || typeof cycleId !== "number" || !Number.isSafeInteger(cycleId)) return;
-    registerWakeSharingChoiceCandidate(
+    if (!registerWakeSharingChoiceCandidate(
       wakeSharingChoiceDelivery,
       wakeChoiceCandidateCycleId,
       cycleId,
-    );
+    )) return;
+    if (process.platform === "darwin") wakeChoiceOverlayRequestedCycleId = cycleId;
+    createWakeSharingOverlay(cycleId);
+  });
+  ipcMain.on("wake-sharing-overlay:ready", (event) => {
+    if (!wakeSharingOverlaySender(event)) return;
+    wakeChoiceOverlayReady = true;
+    deliverWakeSharingOverlayChoice();
+  });
+  ipcMain.on("wake-sharing-overlay:select", (event, cycleId: unknown, option: unknown) => {
+    if (
+      !wakeSharingOverlaySender(event) ||
+      typeof cycleId !== "number" ||
+      !Number.isSafeInteger(cycleId) ||
+      !isWakeSharingChoiceOption(option) ||
+      cycleId !== wakeChoiceOverlayCycleId ||
+      cycleId !== wakeChoiceCandidateCycleId ||
+      cycleId !== wakeSharingChoiceDelivery.pendingCycleId ||
+      cycleId !== wakeChoiceOverlayDeliveredCycleId ||
+      !wakeChoiceOverlayReady ||
+      wakeChoiceOverlaySelectionCycleId !== undefined ||
+      !mainWindow ||
+      mainWindow.isDestroyed() ||
+      !indicatorReady ||
+      !mainWindowWakeChoiceHandlerReady
+    ) return;
+    wakeChoiceOverlaySelectionCycleId = cycleId;
+    const handlerCall =
+      `window.__livePresenceWakeSharingChoice?.(${cycleId},${JSON.stringify(option)})`;
+    void mainWindow.webContents.executeJavaScript(handlerCall, true).then((accepted: unknown) => {
+      if (wakeChoiceOverlaySelectionCycleId !== cycleId) return;
+      if (accepted !== true) {
+        wakeChoiceOverlaySelectionCycleId = undefined;
+        if (wakeSharingChoiceDelivery.pendingCycleId === cycleId) {
+          wakeChoiceOverlayDeliveredCycleId = undefined;
+          deliverWakeSharingOverlayChoice();
+        } else {
+          destroyWakeSharingOverlay(cycleId, true);
+        }
+        return;
+      }
+      wakeChoiceCandidateCycleId = cancelWakeSharingChoiceCycle(
+        wakeSharingChoiceDelivery,
+        wakeChoiceCandidateCycleId,
+        cycleId,
+      );
+      destroyWakeSharingOverlay(cycleId, true);
+    }).catch((error: unknown) => {
+      if (wakeChoiceOverlaySelectionCycleId !== cycleId) return;
+      wakeChoiceOverlaySelectionCycleId = undefined;
+      console.error("Could not start the selected wake-sharing action.", error);
+      if (wakeSharingChoiceDelivery.pendingCycleId === cycleId) {
+        if (wakeSharingOverlayWindow && !wakeSharingOverlayWindow.isDestroyed()) {
+          wakeSharingOverlayWindow.showInactive();
+        }
+        wakeChoiceOverlayDeliveredCycleId = undefined;
+        deliverWakeSharingOverlayChoice();
+      } else {
+        destroyWakeSharingOverlay(cycleId, true);
+      }
+    });
+  });
+  ipcMain.on("wake-sharing-overlay:dismiss", (event, cycleId: unknown) => {
+    if (
+      !wakeSharingOverlaySender(event) ||
+      typeof cycleId !== "number" ||
+      !Number.isSafeInteger(cycleId) ||
+      cycleId !== wakeChoiceOverlayCycleId ||
+      cycleId !== wakeChoiceCandidateCycleId ||
+      cycleId !== wakeSharingChoiceDelivery.pendingCycleId ||
+      cycleId !== wakeChoiceOverlayDeliveredCycleId ||
+      !wakeChoiceOverlayReady ||
+      wakeChoiceOverlaySelectionCycleId === cycleId
+    ) return;
+    cancelWakeSharingChoice(cycleId, true);
   });
   ipcMain.on("window:restore", (event) => {
     if (!mainSender(event)) return;
@@ -555,6 +858,10 @@ function installIpcHandlers(): void {
   ipcMain.handle("capture:screen-active", async (event, active: unknown) => {
     if (!mainSender(event) || typeof active !== "boolean") throw new Error("invalid IPC request");
     if (!active) {
+      wakeChoiceActivationSuppressionCycleId = undefined;
+      if (wakeChoiceOverlaySelectionCycleId !== undefined) {
+        destroyWakeSharingOverlay(wakeChoiceOverlaySelectionCycleId);
+      }
       sleepRecoveryCycleId += 1;
       if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
       sleepRecoveryTimer = undefined;
@@ -574,6 +881,10 @@ function installIpcHandlers(): void {
     }
     capturePending = false;
     shareActive = true;
+    wakeChoiceActivationSuppressionCycleId = undefined;
+    if (wakeChoiceOverlaySelectionCycleId !== undefined) {
+      destroyWakeSharingOverlay(wakeChoiceOverlaySelectionCycleId);
+    }
     captureDiagnostics.log("screen_capture_activation_confirmed_by_main", {
       attemptId: activeCaptureAttemptId,
       screen: true,
@@ -732,11 +1043,14 @@ async function createMainWindow(): Promise<BrowserWindow> {
   });
   mainWindow = window;
   mainWindowAppEventsReady = false;
+  mainWindowWakeChoiceHandlerReady = false;
   resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
   window.webContents.on("did-start-loading", () => {
     if (mainWindow !== window) return;
     mainWindowAppEventsReady = false;
+    mainWindowWakeChoiceHandlerReady = false;
     resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
+    updateWakeSharingOverlayChoice();
   });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, url) => {
@@ -745,10 +1059,17 @@ async function createMainWindow(): Promise<BrowserWindow> {
   window.webContents.on("render-process-gone", () => {
     if (mainWindow === window) {
       mainWindowAppEventsReady = false;
+      mainWindowWakeChoiceHandlerReady = false;
       resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
+      updateWakeSharingOverlayChoice();
     }
     if (shareActive || capturePending) void stopSharing("renderer-crashed", true);
     else {
+      const cycleId =
+        wakeSharingChoiceDelivery.pendingCycleId ??
+        wakeChoiceCandidateCycleId ??
+        wakeChoiceOverlayCycleId;
+      if (cycleId !== undefined) cancelWakeSharingChoice(cycleId);
       transport?.close();
       transport = undefined;
     }
@@ -766,7 +1087,13 @@ async function createMainWindow(): Promise<BrowserWindow> {
     if (mainWindow !== window) return;
     mainWindow = undefined;
     mainWindowAppEventsReady = false;
+    mainWindowWakeChoiceHandlerReady = false;
     resetWakeSharingChoiceDelivery(wakeSharingChoiceDelivery);
+    const cycleId =
+      wakeSharingChoiceDelivery.pendingCycleId ??
+      wakeChoiceCandidateCycleId ??
+      wakeChoiceOverlayCycleId;
+    if (cycleId !== undefined) cancelWakeSharingChoice(cycleId);
     if (!shareActive && !capturePending) {
       transport?.close();
       transport = undefined;
@@ -788,6 +1115,11 @@ app.on("before-quit", (event) => {
     event.preventDefault();
     void stopSharing("application-shutdown", true);
   } else {
+    const cycleId =
+      wakeSharingChoiceDelivery.pendingCycleId ??
+      wakeChoiceCandidateCycleId ??
+      wakeChoiceOverlayCycleId;
+    if (cycleId !== undefined) cancelWakeSharingChoice(cycleId);
     transport?.close();
     transport = undefined;
   }
@@ -913,6 +1245,10 @@ app.whenReady().then(async () => {
   });
   app.on("activate", () => {
     if (!hasSingleInstanceLock) return;
+    if (wakeChoiceActivationSuppressionCycleId !== undefined) {
+      wakeChoiceActivationSuppressionCycleId = undefined;
+      return;
+    }
     restoreApplicationWindow();
   });
 }).catch((error: unknown) => {

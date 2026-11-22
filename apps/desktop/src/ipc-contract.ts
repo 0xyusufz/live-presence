@@ -291,6 +291,7 @@ export type AppEvent =
   | { type: "suspend"; cycleId: number; sharingActive: boolean }
   | { type: "resume"; cycleId: number }
   | { type: "wake-sharing-choice"; cycleId: number }
+  | { type: "wake-sharing-choice-dismissed"; cycleId: number }
   | { type: "sleep-recovery-timeout"; cycleId: number }
   | { type: "sleep-recovery-attempt-accepted"; cycleId: number; recoveryAttemptId: string }
   | {
@@ -303,7 +304,20 @@ export type AppEvent =
   | { type: "indicator-ready"; ready: boolean }
   | { type: "indicator-state"; screen: boolean; camera: boolean };
 
+export type WakeSharingChoiceOption = "screen" | "screen-camera";
+
+export type WakeSharingOverlayChoice = {
+  cycleId: number;
+  canChoose: boolean;
+};
+
+export type WakeSharingChoiceHandler = (
+  cycleId: number,
+  option: WakeSharingChoiceOption,
+) => boolean;
+
 export type LivePresenceBridge = {
+  platform: NodeJS.Platform;
   hasCredential(): Promise<boolean>;
   indicatorReady(): Promise<boolean>;
   saveCredential(value: string): Promise<void>;
@@ -332,9 +346,25 @@ export type LivePresenceBridge = {
   restoreApplicationWindow(): void;
   registerDisplayedWakeSharingChoice(cycleId: number): void;
   completeWakeSharingChoice(cycleId: number): void;
+  reportWakeSharingChoiceHandlerReady(): void;
   reportAppEventsReady(): void;
   notifySharingResumed(): void;
   reportCaptureDiagnostic(event: CaptureDiagnosticEvent, details?: CaptureDiagnosticDetails): void;
   stopFromIndicator(): void;
   onAppEvent(callback: (event: AppEvent) => void): () => void;
 };
+
+export type WakeSharingOverlayBridge = {
+  reportReady(): void;
+  select(cycleId: number, option: WakeSharingChoiceOption): void;
+  dismiss(cycleId: number): void;
+  onChoice(callback: (choice: WakeSharingOverlayChoice) => void): () => void;
+};
+
+declare global {
+  interface Window {
+    livePresence: LivePresenceBridge;
+    wakeSharingOverlay: WakeSharingOverlayBridge;
+    __livePresenceWakeSharingChoice?: WakeSharingChoiceHandler;
+  }
+}

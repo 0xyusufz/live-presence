@@ -46,6 +46,9 @@ import type {
   CaptureDiagnosticDetails,
   CaptureDiagnosticErrorCode,
   CaptureDiagnosticEvent,
+  WakeSharingChoiceOption,
+  WakeSharingChoiceHandler,
+  WakeSharingOverlayChoice,
 } from "../ipc-contract.js";
 
 type Capture = {
@@ -116,7 +119,65 @@ export function DesktopApp(): JSX.Element {
   const path = new URL(window.location.href).pathname;
   if (path === "/picker") return <SourcePicker />;
   if (path === "/indicator") return <Indicator />;
+  if (path === "/wake-sharing-overlay") return <WakeSharingOverlay />;
   return <ShareWindow />;
+}
+
+function WakeSharingOverlay(): JSX.Element {
+  const [choice, setChoice] = useState<WakeSharingOverlayChoice | undefined>();
+
+  useEffect(() => {
+    const removeChoiceListener = window.wakeSharingOverlay.onChoice(setChoice);
+    window.wakeSharingOverlay.reportReady();
+    return removeChoiceListener;
+  }, []);
+
+  if (!choice) {
+    return (
+      <main className="wake-overlay-page" aria-live="polite">
+        <p>Preparing sharing choices...</p>
+      </main>
+    );
+  }
+
+  return (
+    <main className="wake-overlay-page">
+      <section
+        className="wake-choice wake-choice-window"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="wake-overlay-title"
+        aria-describedby="wake-overlay-description"
+      >
+        <h2 id="wake-overlay-title">What would you like to share?</h2>
+        <p id="wake-overlay-description">
+          Choose what to share again. Nothing starts until you choose.
+        </p>
+        {!choice.canChoose && <p role="status">Preparing the sharing controls...</p>}
+        <div className="wake-choice-actions">
+          <button
+            disabled={!choice.canChoose}
+            onClick={() => window.wakeSharingOverlay.select(choice.cycleId, "screen")}
+          >
+            Screen only
+          </button>
+          <button
+            className="secondary"
+            disabled={!choice.canChoose}
+            onClick={() => window.wakeSharingOverlay.select(choice.cycleId, "screen-camera")}
+          >
+            Screen + camera
+          </button>
+          <button
+            className="stop"
+            onClick={() => window.wakeSharingOverlay.dismiss(choice.cycleId)}
+          >
+            Not now
+          </button>
+        </div>
+      </section>
+    </main>
+  );
 }
 
 function SourcePicker(): JSX.Element {
@@ -174,6 +235,7 @@ function ShareWindow(): JSX.Element {
   const [screenSharing, setScreenSharing] = useState(false);
   const [cameraSharing, setCameraSharing] = useState(false);
   const [indicatorPrepared, setIndicatorPrepared] = useState(false);
+  const indicatorPreparedRef = useRef(false);
   const [message, setMessage] = useState("");
   const [credentialSaved, setCredentialSaved] = useState<boolean | undefined>();
   const [credentialInput, setCredentialInput] = useState("");
@@ -187,6 +249,9 @@ function ShareWindow(): JSX.Element {
   const wakeChoiceObserved = useRef(false);
   const lastWakeChoiceCycle = useRef<number | undefined>(undefined);
   const wakeChoiceSelectionInFlight = useRef(false);
+  const wakeChoiceHandlerRef = useRef<WakeSharingChoiceHandler>(() => false);
+  wakeChoiceHandlerRef.current = (cycleId, option) =>
+    startWakeSharingChoice(cycleId, option, false);
 
   function showWakeSharingChoice(cycleId: number): void {
     const alreadyOffered = !isNewWakeSharingChoiceCycle(cycleId, lastWakeChoiceCycle.current);
@@ -198,8 +263,10 @@ function ShareWindow(): JSX.Element {
     )) return;
     lastWakeChoiceCycle.current = cycleId;
     window.livePresence.registerDisplayedWakeSharingChoice(cycleId);
-    window.livePresence.restoreApplicationWindow();
-    setWakeChoiceOpen(true);
+    if (window.livePresence.platform !== "darwin") {
+      window.livePresence.restoreApplicationWindow();
+      setWakeChoiceOpen(true);
+    }
   }
 
   function cancelWakeSharingChoice(cycleId: number | undefined): boolean {
@@ -430,6 +497,9 @@ function ShareWindow(): JSX.Element {
 
   useEffect(() => {
     let active = true;
+    const wakeChoiceHandler: WakeSharingChoiceHandler = (cycleId, option) =>
+      wakeChoiceHandlerRef.current(cycleId, option);
+    window.__livePresenceWakeSharingChoice = wakeChoiceHandler;
     void Promise.all([
       window.livePresence.hasCredential(),
       window.livePresence.getServerUrl(),
@@ -438,12 +508,17 @@ function ShareWindow(): JSX.Element {
       if (!active) return;
       setCredentialSaved(hasCredential);
       setServerUrl(url);
+      indicatorPreparedRef.current = indicatorAvailable;
       setIndicatorPrepared(indicatorAvailable);
+      window.livePresence.reportWakeSharingChoiceHandlerReady();
       if (hasCredential) {
         ensureOwnerClient();
       }
     }).catch(() => {
-      if (active) setMessage("Desktop setup could not be loaded.");
+      if (active) {
+        setMessage("Desktop setup could not be loaded.");
+        window.livePresence.reportWakeSharingChoiceHandlerReady();
+      }
     });
     const timer = window.setInterval(() => {
       window.livePresence.reportHeartbeat();
@@ -470,7 +545,16 @@ function ShareWindow(): JSX.Element {
           event.wakeChoiceCycleId,
         );
       }
-      if (event.type === "indicator-ready") setIndicatorPrepared(event.ready);
+      if (event.type === "wake-sharing-choice-dismissed" &&
+        wakeChoiceCycle.current === event.cycleId) {
+        wakeChoiceCycle.current = undefined;
+        wakeChoiceObserved.current = false;
+        setWakeChoiceOpen(false);
+      }
+      if (event.type === "indicator-ready") {
+        indicatorPreparedRef.current = event.ready;
+        setIndicatorPrepared(event.ready);
+      }
       if (event.type === "suspend") {
         wakeChoiceCycle.current = event.sharingActive ? event.cycleId : undefined;
         wakeChoiceObserved.current = false;
@@ -668,6 +752,9 @@ function ShareWindow(): JSX.Element {
     });
     return () => {
       active = false;
+      if (window.__livePresenceWakeSharingChoice === wakeChoiceHandler) {
+        delete window.__livePresenceWakeSharingChoice;
+      }
       window.clearInterval(timer);
       removeEvents();
     };
@@ -753,22 +840,34 @@ function ShareWindow(): JSX.Element {
     cancelWakeSharingChoice(wakeChoiceCycle.current);
   }
 
-  async function chooseWakeSharingOption(option: "screen" | "screen-camera"): Promise<void> {
-    if (!canStartWakeSharingChoice(indicatorPrepared, wakeChoiceSelectionInFlight.current)) return;
+  function startWakeSharingChoice(
+    cycleId: number | undefined,
+    option: WakeSharingChoiceOption,
+    requireIndicatorReady = true,
+  ): boolean {
+    if (
+      cycleId === undefined ||
+      !Number.isSafeInteger(cycleId) ||
+      wakeChoiceCycle.current !== cycleId ||
+      (option !== "screen" && option !== "screen-camera") ||
+      !canStartWakeSharingChoice(
+        !requireIndicatorReady || indicatorPreparedRef.current,
+        wakeChoiceSelectionInFlight.current,
+      )
+    ) return false;
     wakeChoiceSelectionInFlight.current = true;
     dismissWakeSharingChoice();
-    try {
-      if (option === "screen") {
-        await startScreenShare();
-      } else {
-        await startCameraAfterScreenActivation(
-          startScreenShare,
-          toggleCamera,
-        );
-      }
-    } finally {
+    const starting = option === "screen"
+      ? startScreenShare()
+      : startCameraAfterScreenActivation(startScreenShare, toggleCamera);
+    void starting.finally(() => {
       wakeChoiceSelectionInFlight.current = false;
-    }
+    });
+    return true;
+  }
+
+  function chooseWakeSharingOption(option: WakeSharingChoiceOption): void {
+    startWakeSharingChoice(wakeChoiceCycle.current, option);
   }
 
   async function saveCredential(): Promise<void> {

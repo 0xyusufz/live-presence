@@ -44,6 +44,11 @@ footer { margin-top: 40px; font-size: 13px; }
 .wake-choice h2 { margin: 0; font-size: 24px; }
 .wake-choice p { color: #62706a; }
 .wake-choice-actions { display: grid; gap: 10px; margin-top: 22px; }
+.wake-overlay-page { display: grid; width: 100vw; height: 100vh; place-items: center; padding: 20px; background: #f3f6f4; }
+.wake-choice-window { width: 100%; padding: 22px; border: 1px solid #dfe7e2; box-shadow: 0 12px 36px #10191424; }
+.wake-choice-window h2 { font-size: 22px; }
+.wake-choice-window p { margin: 10px 0 0; line-height: 1.4; }
+.wake-choice-window .wake-choice-actions { gap: 8px; margin-top: 18px; }
 .indicator { display: flex; height: 100vh; align-items: center; gap: 12px; padding: 14px; background: #17211d; color: white; }
 .indicator strong, .indicator small { display: block; }
 .indicator small { color: #b9c9c0; margin-top: 4px; }

@@ -1,0 +1,10 @@
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  build: {
+    rollupOptions: {
+      external: ["electron"],
+      output: { entryFileNames: "wake-sharing-overlay-preload.js" },
+    },
+  },
+});

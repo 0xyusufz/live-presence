@@ -3,6 +3,7 @@ import type { AppEvent, LivePresenceBridge, SocketEvent } from "./ipc-contract.j
 import type { WebRtcConfiguration } from "../../../shared/src/webrtc.js";
 
 const bridge: LivePresenceBridge = {
+  platform: process.platform,
   hasCredential: () => ipcRenderer.invoke("credential:exists") as Promise<boolean>,
   indicatorReady: () => ipcRenderer.invoke("capture:indicator-ready") as Promise<boolean>,
   saveCredential: (value) => ipcRenderer.invoke("credential:save", value) as Promise<void>,
@@ -38,6 +39,7 @@ const bridge: LivePresenceBridge = {
   registerDisplayedWakeSharingChoice: (cycleId) =>
     ipcRenderer.send("wake-sharing-choice:register", cycleId),
   completeWakeSharingChoice: (cycleId) => ipcRenderer.send("wake-sharing-choice:complete", cycleId),
+  reportWakeSharingChoiceHandlerReady: () => ipcRenderer.send("wake-sharing-choice:handler-ready"),
   reportAppEventsReady: () => ipcRenderer.send("app:events-ready"),
   notifySharingResumed: () => ipcRenderer.send("notification:sharing-resumed"),
   reportCaptureDiagnostic: (event, details = {}) => ipcRenderer.send("capture:diagnostic", event, details),
@@ -51,9 +53,3 @@ const bridge: LivePresenceBridge = {
 };
 
 contextBridge.exposeInMainWorld("livePresence", bridge);
-
-declare global {
-  interface Window {
-    livePresence: LivePresenceBridge;
-  }
-}
