@@ -54,12 +54,36 @@ const EVENTS = new Set<CaptureDiagnosticEvent>([
   "screen_track_unavailable",
   "screen_track_ended",
   "screen_track_became_unavailable",
+  "screen_track_muted",
+  "screen_track_unmuted",
+  "camera_track_ended",
+  "camera_track_muted",
+  "camera_track_unmuted",
   "sharing_state_activation_requested",
   "screen_sharing_activation_failed",
   "screen_capture_activation_confirmed_by_main",
   "sharing_state_update_sent",
   "sharing_state_update_not_sent",
   "sharing_state_update_confirmed",
+  "sleep_marker_prepare_started",
+  "sleep_marker_prepare_acknowledged",
+  "sleep_marker_prepare_failed",
+  "sleep_marker_sent",
+  "sleep_marker_timed_out",
+  "sleep_marker_error_received",
+  "sleep_recovery_started",
+  "sleep_recovery_track_unavailable",
+  "sleep_recovery_result",
+  "sleep_recovery_eligibility",
+  "screen_track_state_before_false_publish",
+  "peer_closed",
+  "capture_cleanup",
+  "system_suspend",
+  "system_resume",
+  "lock_screen",
+  "unlock_screen",
+  "display_removed",
+  "display_metrics_changed",
   "owner_signaling_transport",
 ]);
 
@@ -279,6 +303,53 @@ export class CaptureDiagnostics {
         case "cycleId":
           if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) safe.cycleId = value;
           break;
+        case "timestampWallMs":
+        case "timestampMonotonicMs":
+        case "elapsedSinceSuspendMs":
+          if (typeof value === "number" && Number.isFinite(value) && value >= 0) safe[key] = value;
+          break;
+        case "captureGeneration":
+          if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) safe.captureGeneration = value;
+          break;
+        case "trackId":
+        case "screenTrackId":
+        case "cameraTrackId":
+          if (typeof value === "string" && value.length > 0 && value.length <= 100 &&
+            /^[a-zA-Z0-9._:-]+$/.test(value)) safe[key] = value;
+          break;
+        case "trackKind":
+          if (value === "screen" || value === "camera") safe.trackKind = value;
+          break;
+        case "trackEvent":
+          if (value === "ended" || value === "mute" || value === "unmute") safe.trackEvent = value;
+          break;
+        case "sleepRecoveryState":
+          if (value === "idle" || value === "eligible" || value === "started" ||
+            value === "completed" || value === "failed" || value === "timed_out") {
+            safe.sleepRecoveryState = value;
+          }
+          break;
+        case "cleanupReason":
+          if (value === "explicit_user_stop" || value === "track_ended" || value === "resume_ineligible" ||
+            value === "safety_stop" || value === "terminal_failure" || value === "setup_failure") {
+            safe.cleanupReason = value;
+          }
+          break;
+        case "screenReadyState":
+        case "cameraReadyState":
+          if (typeof value === "string" && READY_STATES.has(value)) {
+            const readyState = value as NonNullable<CaptureDiagnosticDetails["readyState"]>;
+            if (key === "screenReadyState") safe.screenReadyState = readyState;
+            else safe.cameraReadyState = readyState;
+          }
+          break;
+        case "displayId":
+          if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) safe.displayId = value;
+          break;
+        case "screenPermissionStatus":
+          if (value === "not-determined" || value === "granted" || value === "denied" ||
+            value === "restricted" || value === "unknown") safe.screenPermissionStatus = value;
+          break;
         case "recoveryAttemptId":
         case "sessionId":
           if (isCaptureAttemptId(value)) safe[key] = value;
@@ -305,6 +376,10 @@ export class CaptureDiagnostics {
         case "sourceSelected":
         case "enabled":
         case "muted":
+        case "screenEnabled":
+        case "cameraEnabled":
+        case "screenMuted":
+        case "cameraMuted":
         case "screen":
         case "camera":
         case "sent":

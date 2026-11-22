@@ -25,11 +25,16 @@ import {
 import { createSignalingSocket } from "./signaling-socket.js";
 import { sharingStateSendEvent } from "./capture-diagnostic-events.js";
 import {
+  captureCleanupDiagnostic,
+  trackLifecycleDiagnostic,
+} from "./capture-lifecycle-diagnostics.js";
+import {
   displayCaptureFailureCategory,
   displayCaptureFailureMessage,
 } from "../capture-utils.js";
 import type {
   CaptureDiagnosticCategory,
+  CaptureCleanupReason,
   CaptureDiagnosticDetails,
   CaptureDiagnosticErrorCode,
   CaptureDiagnosticEvent,
@@ -59,6 +64,8 @@ function reportCaptureDiagnostic(
   try {
     window.livePresence.reportCaptureDiagnostic(event, {
       ...details,
+      timestampWallMs: Date.now(),
+      timestampMonotonicMs: performance.now(),
       ...(attemptId ? { attemptId } : {}),
     });
   } catch {
@@ -166,6 +173,41 @@ function ShareWindow(): JSX.Element {
   const sleepRecoveryCycle = useRef<number | undefined>(undefined);
   const sleepRecoveryAttemptId = useRef<string | undefined>(undefined);
   const sleepRecoveryState = useRef<"idle" | "eligible" | "started" | "completed" | "failed" | "timed_out">("idle");
+  const suspendStartedAt = useRef<number | undefined>(undefined);
+
+  function reportTrackLifecycle(
+    track: MediaStreamTrack,
+    trackKind: "screen" | "camera",
+    trackEvent: "ended" | "mute" | "unmute",
+    attemptId?: string,
+  ): void {
+    const diagnostic = trackLifecycleDiagnostic(
+      track,
+      trackKind,
+      trackEvent,
+      capture.current.generation,
+      sleepRecoveryCycle.current,
+      sleepRecoveryState.current,
+    );
+    reportCaptureDiagnostic(diagnostic.event, diagnostic.details, attemptId);
+  }
+
+  function captureTrackDiagnosticDetails(): CaptureDiagnosticDetails {
+    const current = capture.current;
+    return {
+      screen: current.screen?.readyState === "live",
+      camera: current.camera?.readyState === "live",
+      screenReadyState: current.screen?.readyState ?? "unavailable",
+      cameraReadyState: current.camera?.readyState ?? "unavailable",
+      screenEnabled: current.screen?.enabled,
+      cameraEnabled: current.camera?.enabled,
+      screenMuted: current.screen?.muted,
+      cameraMuted: current.camera?.muted,
+      captureGeneration: current.generation,
+      cycleId: sleepRecoveryCycle.current,
+      sleepRecoveryState: sleepRecoveryState.current,
+    };
+  }
 
   function requestSleepRecoveryCompletion(recoveryAttemptId?: string): void {
     if (
@@ -218,10 +260,25 @@ function ShareWindow(): JSX.Element {
             void stopCurrent(
               "Viewer authorization was revoked; sharing was stopped.",
               true,
+              "safety_stop",
             );
           }
         },
         onDiagnostic: (diagnostic) => {
+        if (
+          diagnostic.event === "sleep_marker_sent" ||
+          diagnostic.event === "sleep_marker_timed_out" ||
+          diagnostic.event === "sleep_marker_error_received"
+        ) {
+          reportCaptureDiagnostic(diagnostic.event, {
+            cycleId: diagnostic.cycleId ?? sleepRecoveryCycle.current,
+            ...captureTrackDiagnosticDetails(),
+            correlationId: diagnostic.correlationId,
+            elapsedSinceSuspendMs: suspendStartedAt.current === undefined
+              ? undefined
+              : performance.now() - suspendStartedAt.current,
+          }, capture.current.attemptId);
+        }
         if (
           (sleepRecoveryState.current === "eligible" || sleepRecoveryState.current === "started") &&
           diagnostic.event === "recovery" &&
@@ -314,7 +371,7 @@ function ShareWindow(): JSX.Element {
         handleTerminalCaptureFailure(
           capture.current,
           error,
-          (reason) => { void stopCurrent(reason); },
+          (reason) => { void stopCurrent(reason, true, "terminal_failure"); },
           setMessage,
         );
       },
@@ -362,40 +419,67 @@ function ShareWindow(): JSX.Element {
         handleTerminalCaptureFailure(
           current,
           new Error(error?.message ?? "The WebRTC session failed."),
-          (reason) => { void stopCurrent(reason); },
+          (reason) => { void stopCurrent(reason, true, "terminal_failure"); },
           setMessage,
         );
       }
     }, 750);
     const removeEvents = window.livePresence.onAppEvent((event) => {
-      if (event.type === "stop-sharing") void stopCurrent("Sharing stopped for safety.");
+      if (event.type === "stop-sharing") void stopCurrent("Sharing stopped for safety.", true, "safety_stop");
       if (event.type === "indicator-ready") setIndicatorPrepared(event.ready);
       if (event.type === "suspend") {
         sleepRecoveryCycle.current = event.cycleId;
         sleepRecoveryAttemptId.current = undefined;
         sleepRecoveryState.current = "idle";
+        suspendStartedAt.current = performance.now();
         const client = capture.current.client;
+        reportCaptureDiagnostic("sleep_marker_prepare_started", {
+          cycleId: event.cycleId,
+          screen: capture.current.screen?.readyState === "live",
+          camera: capture.current.camera?.readyState === "live",
+          screenReadyState: capture.current.screen?.readyState ?? "unavailable",
+          cameraReadyState: capture.current.camera?.readyState ?? "unavailable",
+          screenEnabled: capture.current.screen?.enabled,
+          cameraEnabled: capture.current.camera?.enabled,
+          screenMuted: capture.current.screen?.muted,
+          cameraMuted: capture.current.camera?.muted,
+          captureGeneration: capture.current.generation,
+          sleepRecoveryState: sleepRecoveryState.current,
+          signalingState: client?.getSignalingState(),
+        }, capture.current.attemptId);
         if (!client) {
+          reportCaptureDiagnostic("sleep_marker_prepare_failed", {
+            ...captureTrackDiagnosticDetails(),
+            cycleId: event.cycleId,
+            signalingState: "not-connected",
+            elapsedSinceSuspendMs: suspendStartedAt.current === undefined
+              ? undefined
+              : performance.now() - suspendStartedAt.current,
+          }, capture.current.attemptId);
           window.livePresence.reportSleepMarker(event.cycleId, false);
           return;
         }
-        reportCaptureDiagnostic("sleep_marker_prepare_started", {
-          screen: capture.current.screen?.readyState === "live",
-          signalingState: client.getSignalingState(),
-        });
-        void client.prepareForSleep().then(
+        void client.prepareForSleep(event.cycleId).then(
           () => {
             reportCaptureDiagnostic("sleep_marker_prepare_acknowledged", {
-              screen: capture.current.screen?.readyState === "live",
+              ...captureTrackDiagnosticDetails(),
+              cycleId: event.cycleId,
               signalingState: client.getSignalingState(),
-            });
+              elapsedSinceSuspendMs: suspendStartedAt.current === undefined
+                ? undefined
+                : performance.now() - suspendStartedAt.current,
+            }, capture.current.attemptId);
             window.livePresence.reportSleepMarker(event.cycleId, true);
           },
           () => {
             reportCaptureDiagnostic("sleep_marker_prepare_failed", {
-              screen: capture.current.screen?.readyState === "live",
+              ...captureTrackDiagnosticDetails(),
+              cycleId: event.cycleId,
               signalingState: client.getSignalingState(),
-            });
+              elapsedSinceSuspendMs: suspendStartedAt.current === undefined
+                ? undefined
+                : performance.now() - suspendStartedAt.current,
+            }, capture.current.attemptId);
           },
         );
       }
@@ -408,11 +492,23 @@ function ShareWindow(): JSX.Element {
         ) return;
         if (event.phase === "failed") {
           sleepRecoveryState.current = "failed";
+          reportCaptureDiagnostic("sleep_recovery_result", {
+            ...captureTrackDiagnosticDetails(),
+            cycleId: event.cycleId,
+            recoveryAttemptId: event.recoveryAttemptId,
+            recoveryPhase: "failed",
+          });
           setMessage("Unable to resume sharing after sleep.");
           return;
         }
         if (event.phase !== "completed") return;
         sleepRecoveryState.current = "completed";
+        reportCaptureDiagnostic("sleep_recovery_result", {
+          ...captureTrackDiagnosticDetails(),
+          cycleId: event.cycleId,
+          recoveryAttemptId: event.recoveryAttemptId,
+          recoveryPhase: "completed",
+        });
         setMessage("Connected / Sharing resumed");
         window.livePresence.notifySharingResumed();
       }
@@ -425,11 +521,18 @@ function ShareWindow(): JSX.Element {
         const client = capture.current.client;
         if (!client || capture.current.screen?.readyState !== "live") {
           sleepRecoveryState.current = "failed";
+          reportCaptureDiagnostic("sleep_recovery_result", {
+            ...captureTrackDiagnosticDetails(),
+            cycleId: event.cycleId,
+            recoveryAttemptId: event.recoveryAttemptId,
+            recoveryPhase: "failed",
+          });
           window.livePresence.reportSleepRecovery(event.cycleId, event.recoveryAttemptId, "failed");
           return;
         }
         sleepRecoveryState.current = "started";
         reportCaptureDiagnostic("sleep_recovery_started", {
+          ...captureTrackDiagnosticDetails(),
           cycleId: event.cycleId,
           recoveryAttemptId: event.recoveryAttemptId,
           recoveryPhase: "started",
@@ -448,6 +551,9 @@ function ShareWindow(): JSX.Element {
           current.screen &&
           current.screen.readyState === "live",
         );
+        const elapsedSinceSuspendMs = suspendStartedAt.current === undefined
+          ? undefined
+          : performance.now() - suspendStartedAt.current;
         if (
           sleepRecoveryCycle.current === event.cycleId &&
           sleepRecoveryState.current !== "idle"
@@ -455,6 +561,21 @@ function ShareWindow(): JSX.Element {
         sleepRecoveryCycle.current = event.cycleId;
         sleepRecoveryAttemptId.current = crypto.randomUUID();
         sleepRecoveryState.current = eligible ? "eligible" : "failed";
+        reportCaptureDiagnostic("sleep_recovery_eligibility", {
+          cycleId: event.cycleId,
+          screen: current.screen?.readyState === "live",
+          camera: current.camera?.readyState === "live",
+          screenReadyState: current.screen?.readyState ?? "unavailable",
+          cameraReadyState: current.camera?.readyState ?? "unavailable",
+          screenEnabled: current.screen?.enabled,
+          cameraEnabled: current.camera?.enabled,
+          screenMuted: current.screen?.muted,
+          cameraMuted: current.camera?.muted,
+          captureGeneration: current.generation,
+          sleepRecoveryState: sleepRecoveryState.current,
+          elapsedSinceSuspendMs,
+          signalingState: client?.getSignalingState(),
+        }, current.attemptId);
         reportCaptureDiagnostic(
           eligible ? "sleep_recovery_started" : "sleep_recovery_track_unavailable",
           {
@@ -470,7 +591,7 @@ function ShareWindow(): JSX.Element {
           "eligible",
         );
         if (!eligible) {
-          void stopCurrent("Screen sharing ended during sleep.");
+          void stopCurrent("Screen sharing ended during sleep.", true, "resume_ineligible");
           return;
         }
       }
@@ -481,6 +602,7 @@ function ShareWindow(): JSX.Element {
         capture.current.client?.abandonSleepRecovery();
         setMessage("Connection interrupted; sharing remains active while reconnection continues.");
         reportCaptureDiagnostic("sleep_recovery_started", {
+          ...captureTrackDiagnosticDetails(),
           cycleId: event.cycleId,
           recoveryPhase: "timed_out",
           screen: capture.current.screen?.readyState === "live",
@@ -495,11 +617,23 @@ function ShareWindow(): JSX.Element {
     };
   }, []);
 
-  async function stopCurrent(reason?: string, stopClient = true): Promise<void> {
+  async function stopCurrent(
+    reason: string | undefined,
+    stopClient: boolean,
+    cleanupReason: CaptureCleanupReason,
+  ): Promise<void> {
+    const current = capture.current;
+    reportCaptureDiagnostic("capture_cleanup", captureCleanupDiagnostic(
+      current.screen,
+      current.camera,
+      current.generation,
+      sleepRecoveryCycle.current,
+      sleepRecoveryState.current,
+      cleanupReason,
+    ), current.attemptId);
     sleepRecoveryState.current = "idle";
     sleepRecoveryCycle.current = undefined;
     sleepRecoveryAttemptId.current = undefined;
-    const current = capture.current;
     if (current.screen) {
       reportCaptureDiagnostic("screen_track_state_before_false_publish", {
         stage: "before_signaling_update",
@@ -522,7 +656,7 @@ function ShareWindow(): JSX.Element {
     current.cameraPending = false;
     current.preparingScreen = false;
     if (stopClient) {
-      detachOwnerClientAfterCaptureStop(current, true);
+      detachOwnerClientAfterCaptureStop(current, true, cleanupReason);
     }
     setScreenSharing(false);
     setCameraSharing(false);
@@ -598,7 +732,7 @@ function ShareWindow(): JSX.Element {
         errorCategory: "display_media_failed",
         errorCode: diagnosticErrorCode(error),
       }, attemptId);
-      void stopCurrent("Screen sharing could not be started.")
+      void stopCurrent("Screen sharing could not be started.", true, "setup_failure")
         .catch(() => setMessage("Screen sharing could not be started; local cleanup was requested."));
       return;
     }
@@ -609,7 +743,7 @@ function ShareWindow(): JSX.Element {
         errorCode: diagnosticErrorCode(error),
       }, attemptId);
       if (capture.current.generation !== generation) return;
-      await stopCurrent("Screen sharing could not be completed.").catch(() => undefined);
+      await stopCurrent("Screen sharing could not be completed.", true, "setup_failure").catch(() => undefined);
       setMessage("Screen sharing could not be completed. Local media cleanup was requested.");
     });
   }
@@ -638,7 +772,7 @@ function ShareWindow(): JSX.Element {
           category,
         }));
         const message = displayCaptureFailureMessage(error);
-        await stopCurrent(message).catch(() => setMessage(message));
+        await stopCurrent(message, true, "setup_failure").catch(() => setMessage(message));
       }
       return;
     }
@@ -675,7 +809,7 @@ function ShareWindow(): JSX.Element {
           category,
         }));
         const message = displayCaptureFailureMessage(error);
-        await stopCurrent(message).catch(() => setMessage(message));
+        await stopCurrent(message, true, "setup_failure").catch(() => setMessage(message));
       }
       return;
     }
@@ -694,16 +828,13 @@ function ShareWindow(): JSX.Element {
     capture.current.preparingScreen = false;
     setScreenSharing(true);
     screen.addEventListener("ended", () => {
-      reportCaptureDiagnostic("screen_track_ended", {
-        stage: "track_lifecycle",
-        readyState: screen.readyState,
-        enabled: screen.enabled,
-        muted: screen.muted,
-        reason: "ended_event",
-      }, attemptId);
-      if (capture.current.screen === screen) void stopCurrent("The screen capture ended.");
+      reportTrackLifecycle(screen, "screen", "ended", attemptId);
+      if (capture.current.screen === screen) {
+        void stopCurrent("The screen capture ended.", true, "track_ended");
+      }
     }, { once: true });
     screen.addEventListener("mute", () => {
+      reportTrackLifecycle(screen, "screen", "mute", attemptId);
       reportCaptureDiagnostic("screen_track_became_unavailable", {
         stage: "track_lifecycle",
         readyState: screen.readyState,
@@ -711,7 +842,10 @@ function ShareWindow(): JSX.Element {
         muted: screen.muted,
         reason: "track_muted",
       }, attemptId);
-    }, { once: true });
+    });
+    screen.addEventListener("unmute", () => {
+      reportTrackLifecycle(screen, "screen", "unmute", attemptId);
+    });
 
     try {
       reportCaptureDiagnostic("sharing_state_activation_requested", {
@@ -736,7 +870,11 @@ function ShareWindow(): JSX.Element {
           enabled: screen.enabled,
           muted: screen.muted,
         }, attemptId);
-        await stopCurrent("The screen capture ended before sharing could start.");
+        await stopCurrent(
+          "The screen capture ended before sharing could start.",
+          true,
+          screen.readyState === "ended" ? "track_ended" : "setup_failure",
+        );
         return;
       }
       const client = ensureOwnerClient();
@@ -769,7 +907,7 @@ function ShareWindow(): JSX.Element {
           errorCategory: "sharing_activation_failed",
           errorCode: diagnosticErrorCode(error),
         }));
-        await stopCurrent("Sharing could not connect.");
+        await stopCurrent("Sharing could not connect.", true, "setup_failure");
       }
     }
   }
@@ -815,8 +953,15 @@ function ShareWindow(): JSX.Element {
       requestedCamera = camera;
       setApprovedCameraTrack(current, camera);
       camera.addEventListener("ended", () => {
+        reportTrackLifecycle(camera, "camera", "ended", current.attemptId);
         if (capture.current.camera === camera) void disableCameraAfterFailure(camera);
       }, { once: true });
+      camera.addEventListener("mute", () => {
+        reportTrackLifecycle(camera, "camera", "mute", current.attemptId);
+      });
+      camera.addEventListener("unmute", () => {
+        reportTrackLifecycle(camera, "camera", "unmute", current.attemptId);
+      });
       await replaceApprovedCameraTrack(
         current,
         generation,
@@ -929,7 +1074,11 @@ function ShareWindow(): JSX.Element {
           <button className="secondary" disabled={!screenSharing} onClick={() => void toggleCamera()}>
             {cameraSharing ? "Turn camera off" : "Share camera"}
           </button>
-          <button className="stop" disabled={!screenSharing} onClick={() => void stopCurrent()}>
+          <button
+            className="stop"
+            disabled={!screenSharing}
+            onClick={() => void stopCurrent(undefined, true, "explicit_user_stop")}
+          >
             Stop sharing
           </button>
         </div>

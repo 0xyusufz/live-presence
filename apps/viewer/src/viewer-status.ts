@@ -4,10 +4,12 @@ export function viewerStatus(
   lifecycle: ClientLifecycleState,
   deviceOnline: boolean,
   screenSharing: boolean,
-): ClientLifecycleState | "Connected" | "Reconnecting" {
-  if (lifecycle === "CONNECTED" || (deviceOnline && !screenSharing && lifecycle === "CLOSED")) {
-    return "Connected";
-  }
+  intentionallyDisconnected = false,
+): ClientLifecycleState | "Connected" | "Not sharing" | "Owner offline" | "Disconnected" | "Reconnecting" {
+  if (intentionallyDisconnected) return "Disconnected";
   if (lifecycle === "RECONNECTING") return "Reconnecting";
+  if (lifecycle === "CONNECTED") return "Connected";
+  if (lifecycle === "CLOSED" && deviceOnline && !screenSharing) return "Not sharing";
+  if (lifecycle === "CLOSED" && !deviceOnline) return "Owner offline";
   return lifecycle;
 }

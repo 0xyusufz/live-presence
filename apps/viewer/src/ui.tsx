@@ -64,6 +64,7 @@ export function ViewerApp(): JSX.Element {
   const [autoConnecting, setAutoConnecting] = useState(false);
   const [deviceOnline, setDeviceOnline] = useState(false);
   const [screenSharing, setScreenSharing] = useState(false);
+  const [intentionallyDisconnected, setIntentionallyDisconnected] = useState(false);
   const [screenStream, setScreenStream] = useState<MediaStream>();
   const [cameraStream, setCameraStream] = useState<MediaStream>();
   const [cameraSharing, setCameraSharing] = useState(false);
@@ -271,6 +272,7 @@ export function ViewerApp(): JSX.Element {
 
   function stop(): void {
     userDisconnectedRef.current = true;
+    setIntentionallyDisconnected(true);
     startupConnectionRef.current.disconnect();
     attemptGenerationRef.current += 1;
     connectionInFlightGenerationRef.current = undefined;
@@ -304,7 +306,12 @@ export function ViewerApp(): JSX.Element {
     setAuthMessage("");
   }
 
-  const visibleStatus = viewerStatus(lifecycle, deviceOnline, screenSharing);
+  const visibleStatus = viewerStatus(
+    lifecycle,
+    deviceOnline,
+    screenSharing,
+    intentionallyDisconnected,
+  );
 
   return (
     <main className="viewer">
@@ -349,10 +356,12 @@ export function ViewerApp(): JSX.Element {
           </label>
           <button onClick={() => {
             userDisconnectedRef.current = false;
+            setIntentionallyDisconnected(false);
             retryAttemptRef.current = 0;
             const generation = ++attemptGenerationRef.current;
             void connect(deviceId, generation);
           }}>Connect</button>
+          {intentionallyDisconnected && <p role="status">{visibleStatus}</p>}
         </section>
       )}
       {(client || autoConnecting) && (

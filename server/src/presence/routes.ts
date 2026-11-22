@@ -213,6 +213,20 @@ export async function registerPresenceRoutes(
   const sessions = new Map<string, Session>();
   const sessionByDevice = new Map<string, string>();
   const shareStates = new Map<string, { screen: boolean; camera: boolean }>();
+  const sharingStateRevisions = new Map<string, number>();
+  const sharingStateRevision = (deviceId: string): number =>
+    sharingStateRevisions.get(deviceId) ?? 0;
+  const deviceSharingStateMessage = (
+    deviceId: string,
+    state: { screen: boolean; camera: boolean },
+    online: boolean,
+  ): ServerMessage => ({
+    type: "device_sharing_state",
+    device_id: deviceId,
+    ...state,
+    online,
+    state_revision: sharingStateRevision(deviceId),
+  });
   const resumeStore = new ResumeSessionStore();
   let serverClosing = false;
 
@@ -279,17 +293,16 @@ export async function registerPresenceRoutes(
     deviceId: string,
     state: { screen: boolean; camera: boolean },
   ): void => {
+    const stateRevision = sharingStateRevision(deviceId) + 1;
+    sharingStateRevisions.set(deviceId, stateRevision);
+    const online = presence.getDevicePresence(deviceId) !== undefined;
     let delivered = 0;
     for (const viewer of connections.values()) {
       if (
         viewer.role === "viewer" &&
         authorization.canAccess(ownerUserId, viewer.userId)
       ) {
-        send(viewer.socket, {
-          type: "device_sharing_state",
-          device_id: deviceId,
-          ...state,
-        });
+        send(viewer.socket, deviceSharingStateMessage(deviceId, state, online));
         delivered += 1;
       }
     }
@@ -711,6 +724,7 @@ export async function registerPresenceRoutes(
           ownerPresence?.userId ??
           currentSession?.ownerUserId ??
           devices.getActiveDeviceOwner(deviceId);
+        const currentSharingState = shareStates.get(deviceId) ?? { screen: false, camera: false };
         if (
           !ownerUserId ||
           (currentSession && ownerPresence && currentSession.ownerUserId !== ownerPresence.userId) ||
@@ -719,12 +733,16 @@ export async function registerPresenceRoutes(
           send(socket, { type: "error", code: "NOT_AUTHORIZED" }); return;
         }
         if (!ownerPresence && !currentSession) {
-          send(socket, { type: "error", code: "DEVICE_OFFLINE" }); return;
+          send(socket, deviceSharingStateMessage(
+            deviceId,
+            { screen: false, camera: false },
+            false,
+          ));
+          return;
         }
         if (message.active_session_id !== undefined && message.active_session_id !== currentSession?.id) {
           send(socket, { type: "error", code: "SESSION_NOT_FOUND" }); return;
         }
-          const currentSharingState = shareStates.get(deviceId) ?? { screen: false, camera: false };
           const ownerRecoveryRemainingMs =
             currentSession &&
             !currentSession.owner &&
@@ -747,11 +765,11 @@ export async function registerPresenceRoutes(
             }));
           }
           if (!currentSharingState.screen) {
-            send(socket, {
-              type: "device_sharing_state",
-              device_id: deviceId,
-              ...currentSharingState,
-            });
+            send(socket, deviceSharingStateMessage(
+              deviceId,
+              currentSharingState,
+              ownerPresence !== undefined,
+            ));
             console.info(JSON.stringify({
               source: "backend",
               event: "create-session-waiting",
@@ -775,11 +793,11 @@ export async function registerPresenceRoutes(
             if (currentSession.viewerGraceTimer) clearTimeout(currentSession.viewerGraceTimer);
             currentSession.viewerGraceTimer = undefined;
             currentSession.viewer = connection;
-            send(socket, {
-              type: "device_sharing_state",
-              device_id: deviceId,
-              ...currentSharingState,
-            });
+            send(socket, deviceSharingStateMessage(
+              deviceId,
+              currentSharingState,
+              ownerPresence !== undefined,
+            ));
             send(socket, {
               type: "session_attached",
               session_id: currentSession.id,
@@ -814,16 +832,19 @@ export async function registerPresenceRoutes(
             owner.deviceId !== deviceId ||
             owner.socket.readyState !== WebSocket.OPEN
           ) {
-            send(socket, { type: "error", code: "DEVICE_OFFLINE" });
+            send(socket, deviceSharingStateMessage(
+              deviceId,
+              { screen: false, camera: false },
+              false,
+            ));
             return;
           }
           if (!ownerSharingStateSockets.has(owner.socket)) {
-            send(socket, {
-              type: "device_sharing_state",
-              device_id: deviceId,
-              screen: false,
-              camera: false,
-            });
+            send(socket, deviceSharingStateMessage(
+              deviceId,
+              { screen: false, camera: false },
+              true,
+            ));
             console.info(JSON.stringify({
               source: "backend",
               event: "create-session-waiting",
@@ -884,11 +905,7 @@ export async function registerPresenceRoutes(
             return;
           }
           sessions.set(sessionId, session); sessionByDevice.set(deviceId, sessionId);
-          send(socket, {
-            type: "device_sharing_state",
-            device_id: deviceId,
-            ...currentSharingState,
-          });
+          send(socket, deviceSharingStateMessage(deviceId, currentSharingState, true));
           send(socket, {
             type: "session_created",
             session_id: sessionId,
@@ -1149,6 +1166,17 @@ export async function registerPresenceRoutes(
         presence.disconnect(connectionId);
       }
       const connection = connections.get(socket);
+      if (serverClosing) {
+        if (
+          connection?.role === "owner" &&
+          connection.deviceId &&
+          latestOwnerSockets.get(connection.deviceId) === socket
+        ) {
+          latestOwnerSockets.delete(connection.deviceId);
+        }
+        connections.delete(socket);
+        return;
+      }
       if (connection) {
         const affectedSessionIds = [...sessions.values()]
           .filter((session) => session.owner?.socket === socket || session.viewer?.socket === socket)
@@ -1250,7 +1278,6 @@ export async function registerPresenceRoutes(
           !replacementOwnerConnected
         ) {
           const inactive = { screen: false, camera: false };
-          const previous = shareStates.get(connection.deviceId);
           setSharingState(
             connection.deviceId,
             inactive,
@@ -1258,9 +1285,7 @@ export async function registerPresenceRoutes(
             socket,
             affectedSessionIds[0],
           );
-          if (previous?.screen || previous?.camera) {
-            notifyAuthorizedViewers(connection.userId, connection.deviceId, inactive);
-          }
+          notifyAuthorizedViewers(connection.userId, connection.deviceId, inactive);
           console.info(JSON.stringify({
             source: "backend",
             event: "owner-disconnected-sharing-cleared",

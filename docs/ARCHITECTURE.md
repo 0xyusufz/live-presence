@@ -424,6 +424,7 @@ One WebSocket, one JSON envelope:
 | `presence` | server→viewer | `{ "device_id": "d1", "state": "online", "screen": false, "camera": false, "active_usage_seconds": 13320 }` |
 | `sharing_state` | device→server | `{ "screen": true, "camera": false }` |
 | `create_session` | viewer→server | `{ "device_id": "d1" }` |
+| `device_sharing_state` | server→authorized viewer | `{ "device_id": "d1", "screen": true, "camera": false, "online": true, "state_revision": 4 }` |
 | `viewer_joined` | server→device | `{ "session_id": "s1", "viewer_user_id": "u2", "viewer_name": "Amit" }` |
 | `viewer_left` | server→device | `{ "session_id": "s1", "viewer_user_id": "u2", "reason": "closed" }` |
 | `offer` / `answer` | relayed opaquely | `{ "session_id": "s1", "sdp": "...", "track_map": [{"mid":"0","kind":"screen"},{"mid":"1","kind":"camera"}] }` |
@@ -433,6 +434,8 @@ One WebSocket, one JSON envelope:
 | `sleep_marked` | server→active owner and viewer | Endpoint-specific one-use capability, epoch and expiry; only a previously active session is eligible |
 | `resume_session` | reconnecting owner or viewer→server | `{ "session_id": "s1", "epoch": 1, "capability": "...", "request_id": "..." }` |
 | `resume_pending` / `session_resumed` | server→reconnecting endpoint(s) | Rotated capability while the other endpoint is absent, then the resumed session epoch |
+
+After viewer authentication or reauthentication, the viewer makes one authorized `create_session` request to discover the device's current state and attach if sharing is active. The server returns a `device_sharing_state` snapshot with `online`, `screen`, `camera`, and the current per-device `state_revision`, including when the authorized owner is offline or online but idle. If the owner is offline or not sharing, the viewer waits without repeated session probes; a later owner state transition is sent to authorized viewers. Availability notifications carry a monotonically increasing per-device `state_revision`; viewers ignore lower revisions so delayed snapshots or notifications cannot overwrite newer availability or retire a newer active session.
 
 `active_usage_seconds` is **omitted entirely** when the device's privacy toggle is OFF (§3). Absent means "not shared", and the viewer UI shows nothing rather than a zero.
 

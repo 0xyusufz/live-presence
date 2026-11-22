@@ -467,6 +467,50 @@ async function createViewer(
   return { cookie, userId: session.json<{ user: { id: string } }>().user.id };
 }
 
+async function createViewerDiscoveryFixture() {
+  const server = await buildApp(":memory:", 3600, "test", undefined, 600, 45);
+  const device = await createDevice(server);
+  const ownerSession = await server.app.inject({
+    method: "GET",
+    url: "/auth/session",
+    headers: { cookie: device.cookie },
+  });
+  const ownerUserId = ownerSession.json<{ user: { id: string } }>().user.id;
+  const authorized = await createViewer(server, `discovery-allowed-${Date.now()}@example.com`);
+  const unauthorized = await createViewer(server, `discovery-denied-${Date.now()}@example.com`);
+  server.authorization.grant(ownerUserId, authorized.userId);
+  await server.app.listen({ host: "127.0.0.1", port: 0 });
+  const address = server.app.server.address();
+  assert.ok(address && typeof address !== "string");
+  const wsUrl = `ws://127.0.0.1:${address.port}/ws`;
+  const sockets: WebSocket[] = [];
+  const openOwner = (): WebSocket => {
+    const socket = new WebSocket(wsUrl, { origin: "http://localhost:5173" });
+    sockets.push(socket);
+    return socket;
+  };
+  const openViewer = (authorizedViewer = true): WebSocket => {
+    const cookie = authorizedViewer ? authorized.cookie : unauthorized.cookie;
+    const socket = new WebSocket(wsUrl, {
+      origin: "http://localhost:5173",
+      headers: { cookie },
+    });
+    sockets.push(socket);
+    return socket;
+  };
+  return {
+    server,
+    device,
+    openOwner,
+    openViewer,
+    async close(): Promise<void> {
+      await Promise.all(sockets.map(terminateSocket));
+      await server.app.close();
+      server.close();
+    },
+  };
+}
+
 test("presence service distinguishes connections and expires at the threshold", () => {
   let now = 1_700_000_000_000;
   const closed: Array<{ connectionId: string; cause: string }> = [];
@@ -742,6 +786,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: false,
       camera: false,
+      online: true,
+      state_revision: 0,
     });
 
     const heartbeatAck = nextMessage(owner);
@@ -761,6 +807,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: true,
       camera: false,
+      online: true,
+      state_revision: 1,
     });
     await assertNoMessage(unauthorized);
     const activePresence = await server.app.inject({
@@ -781,6 +829,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: true,
       camera: false,
+      online: true,
+      state_revision: 1,
     });
     assert.equal(createdSession?.type, "session_created");
     let sessionId = createdSession?.session_id as string;
@@ -801,6 +851,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: true,
       camera: true,
+      online: true,
+      state_revision: 2,
     });
 
     const previousSessionIds = new Set([sessionId]);
@@ -841,6 +893,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
         device_id: device.deviceId,
         screen: true,
         camera: true,
+        online: true,
+        state_revision: 2,
       });
       assert.equal(reconnectedSession?.type, "session_created");
       sessionId = reconnectedSession?.session_id as string;
@@ -868,6 +922,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: true,
       camera: false,
+      online: true,
+      state_revision: 3,
     });
     await assertNoMessage(unauthorized);
 
@@ -887,6 +943,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: false,
       camera: false,
+      online: true,
+      state_revision: 4,
     });
     assert.equal(stoppedSession?.type, "viewer_left");
     const stoppedPresence = await server.app.inject({
@@ -901,6 +959,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: false,
       camera: false,
+      online: true,
+      state_revision: 4,
     });
 
     const restartedOwnerAck = nextMessage(owner);
@@ -917,6 +977,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: true,
       camera: false,
+      online: true,
+      state_revision: 5,
     });
     const ownerClosed = waitForClose(owner);
     const disconnectedViewerNotification = nextMessage(authorized);
@@ -931,6 +993,8 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: false,
       camera: false,
+      online: false,
+      state_revision: 6,
     });
     const disconnectedPresence = await server.app.inject({
       method: "GET",
@@ -944,14 +1008,291 @@ test("sharing activation is acknowledged, authorizes viewers only while active, 
       device_id: device.deviceId,
       screen: false,
       camera: false,
+      online: true,
+      state_revision: 6,
     });
+    const idleOwnerAck = nextMessage(reconnectingOwner);
+    const idleOwnerOnline = nextMessage(authorized);
+    reconnectingOwner.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }));
+    assert.deepEqual(await idleOwnerAck, {
+      type: "sharing_state_updated",
+      device_id: device.deviceId,
+      screen: false,
+      camera: false,
+    });
+    assert.deepEqual(await idleOwnerOnline, {
+      type: "device_sharing_state",
+      device_id: device.deviceId,
+      screen: false,
+      camera: false,
+      online: true,
+      state_revision: 7,
+    });
+    const idleOwnerClosed = waitForClose(reconnectingOwner);
+    const idleOwnerOffline = nextMessage(authorized);
     reconnectingOwner.close();
+    await idleOwnerClosed;
+    assert.deepEqual(await idleOwnerOffline, {
+      type: "device_sharing_state",
+      device_id: device.deviceId,
+      screen: false,
+      camera: false,
+      online: false,
+      state_revision: 8,
+    });
   } finally {
     owner.close();
     authorized.close();
     unauthorized.close();
     await server.app.close();
     server.close();
+  }
+});
+
+test("viewer discovery reports an already-online idle owner without a later owner update", async () => {
+  const fixture = await createViewerDiscoveryFixture();
+  const owner = fixture.openOwner();
+  try {
+    const ownerAuth = nextMessage(owner);
+    await waitForOpen(owner);
+    owner.send(JSON.stringify({ type: "auth", token: fixture.device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+
+    const viewer = fixture.openViewer();
+    const viewerAuth = nextMessage(viewer);
+    await waitForOpen(viewer);
+    assert.equal((await viewerAuth).role, "viewer");
+    const discovery = nextMessage(viewer);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: fixture.device.deviceId }));
+    assert.deepEqual(await discovery, {
+      type: "device_sharing_state",
+      device_id: fixture.device.deviceId,
+      screen: false,
+      camera: false,
+      online: true,
+      state_revision: 0,
+    });
+    await assertNoMessage(viewer);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("viewer discovery reports an authorized offline owner explicitly", async () => {
+  const fixture = await createViewerDiscoveryFixture();
+  const viewer = fixture.openViewer();
+  try {
+    const viewerAuth = nextMessage(viewer);
+    await waitForOpen(viewer);
+    assert.equal((await viewerAuth).role, "viewer");
+    const discovery = nextMessage(viewer);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: fixture.device.deviceId }));
+    assert.deepEqual(await discovery, {
+      type: "device_sharing_state",
+      device_id: fixture.device.deviceId,
+      screen: false,
+      camera: false,
+      online: false,
+      state_revision: 0,
+    });
+    await assertNoMessage(viewer);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("viewer discovery attaches to an owner already sharing", async () => {
+  const fixture = await createViewerDiscoveryFixture();
+  const owner = fixture.openOwner();
+  try {
+    const ownerAuth = nextMessage(owner);
+    await waitForOpen(owner);
+    owner.send(JSON.stringify({ type: "auth", token: fixture.device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+    const ownerState = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: false }));
+    assert.equal((await ownerState).type, "sharing_state_updated");
+
+    const viewer = fixture.openViewer();
+    const viewerAuth = nextMessage(viewer);
+    await waitForOpen(viewer);
+    assert.equal((await viewerAuth).role, "viewer");
+    const ownerJoined = nextMessage(owner);
+    const discovery = nextMessages(viewer, 2);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: fixture.device.deviceId }));
+    const [state, session] = await discovery;
+    assert.deepEqual(state, {
+      type: "device_sharing_state",
+      device_id: fixture.device.deviceId,
+      screen: true,
+      camera: false,
+      online: true,
+      state_revision: 1,
+    });
+    assert.equal(session?.type, "session_created");
+    assert.equal((await ownerJoined).type, "viewer_joined");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("owner starting after online-idle discovery notifies the viewer and permits attachment", async () => {
+  const fixture = await createViewerDiscoveryFixture();
+  const owner = fixture.openOwner();
+  try {
+    const ownerAuth = nextMessage(owner);
+    await waitForOpen(owner);
+    owner.send(JSON.stringify({ type: "auth", token: fixture.device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+    const idleAck = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }));
+    assert.equal((await idleAck).type, "sharing_state_updated");
+
+    const viewer = fixture.openViewer();
+    const viewerAuth = nextMessage(viewer);
+    await waitForOpen(viewer);
+    assert.equal((await viewerAuth).role, "viewer");
+    const discovery = nextMessage(viewer);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: fixture.device.deviceId }));
+    assert.deepEqual(await discovery, {
+      type: "device_sharing_state",
+      device_id: fixture.device.deviceId,
+      screen: false,
+      camera: false,
+      online: true,
+      state_revision: 1,
+    });
+    await assertNoMessage(viewer);
+
+    const activeAck = nextMessage(owner);
+    const activeNotification = nextMessage(viewer);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: false }));
+    assert.equal((await activeAck).type, "sharing_state_updated");
+    assert.deepEqual(await activeNotification, {
+      type: "device_sharing_state",
+      device_id: fixture.device.deviceId,
+      screen: true,
+      camera: false,
+      online: true,
+      state_revision: 2,
+    });
+    const ownerJoined = nextMessage(owner);
+    const attachment = nextMessages(viewer, 2);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: fixture.device.deviceId }));
+    assert.equal((await attachment)[1]?.type, "session_created");
+    assert.equal((await ownerJoined).type, "viewer_joined");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("owner disconnect after online-idle discovery sends a newer offline state", async () => {
+  const fixture = await createViewerDiscoveryFixture();
+  const owner = fixture.openOwner();
+  try {
+    const ownerAuth = nextMessage(owner);
+    await waitForOpen(owner);
+    owner.send(JSON.stringify({ type: "auth", token: fixture.device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+    const idleAck = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }));
+    assert.equal((await idleAck).type, "sharing_state_updated");
+
+    const viewer = fixture.openViewer();
+    const viewerAuth = nextMessage(viewer);
+    await waitForOpen(viewer);
+    assert.equal((await viewerAuth).role, "viewer");
+    const discovery = nextMessage(viewer);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: fixture.device.deviceId }));
+    assert.deepEqual(await discovery, {
+      type: "device_sharing_state",
+      device_id: fixture.device.deviceId,
+      screen: false,
+      camera: false,
+      online: true,
+      state_revision: 1,
+    });
+
+    const offline = nextMessage(viewer);
+    const ownerClosed = waitForClose(owner);
+    owner.close();
+    await ownerClosed;
+    assert.deepEqual(await offline, {
+      type: "device_sharing_state",
+      device_id: fixture.device.deviceId,
+      screen: false,
+      camera: false,
+      online: false,
+      state_revision: 2,
+    });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("unauthorized viewer discovery does not reveal owner availability", async () => {
+  const fixture = await createViewerDiscoveryFixture();
+  const owner = fixture.openOwner();
+  try {
+    const ownerAuth = nextMessage(owner);
+    await waitForOpen(owner);
+    owner.send(JSON.stringify({ type: "auth", token: fixture.device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+    const ownerState = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }));
+    assert.equal((await ownerState).type, "sharing_state_updated");
+
+    const viewer = fixture.openViewer(false);
+    const viewerAuth = nextMessage(viewer);
+    await waitForOpen(viewer);
+    assert.equal((await viewerAuth).role, "viewer");
+    const result = nextMessage(viewer);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: fixture.device.deviceId }));
+    assert.deepEqual(await result, { type: "error", code: "NOT_AUTHORIZED" });
+    await assertNoMessage(viewer);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("initial discovery snapshot and later owner notification have increasing revisions", async () => {
+  const fixture = await createViewerDiscoveryFixture();
+  const owner = fixture.openOwner();
+  try {
+    const ownerAuth = nextMessage(owner);
+    await waitForOpen(owner);
+    owner.send(JSON.stringify({ type: "auth", token: fixture.device.refreshToken }));
+    assert.equal((await ownerAuth).role, "owner");
+    const idleAck = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: false, camera: false }));
+    assert.equal((await idleAck).type, "sharing_state_updated");
+
+    const viewer = fixture.openViewer();
+    const viewerAuth = nextMessage(viewer);
+    await waitForOpen(viewer);
+    assert.equal((await viewerAuth).role, "viewer");
+    const snapshotPromise = nextMessage(viewer);
+    viewer.send(JSON.stringify({ type: "create_session", device_id: fixture.device.deviceId }));
+    const snapshot = await snapshotPromise;
+    const notificationPromise = nextMessage(viewer);
+    const activeAck = nextMessage(owner);
+    owner.send(JSON.stringify({ type: "sharing_state", screen: true, camera: false }));
+    assert.equal((await activeAck).type, "sharing_state_updated");
+    const notification = await notificationPromise;
+
+    assert.equal(snapshot.type, "device_sharing_state");
+    assert.equal(snapshot.online, true);
+    assert.equal(snapshot.screen, false);
+    assert.equal(snapshot.state_revision, 1);
+    assert.equal(notification.type, "device_sharing_state");
+    assert.equal(notification.online, true);
+    assert.equal(notification.screen, true);
+    assert.equal(notification.state_revision, 2);
+    assert.ok(
+      (notification.state_revision as number) > (snapshot.state_revision as number),
+    );
+  } finally {
+    await fixture.close();
   }
 });
 
@@ -1299,6 +1640,8 @@ test("signaling enforces offer/answer direction and routes valid messages", asyn
       device_id: device.deviceId,
       screen: true,
       camera: false,
+      online: true,
+      state_revision: 1,
     });
     const activeSessionMessages = nextMessages(viewer, 2);
     viewer.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
@@ -1308,6 +1651,8 @@ test("signaling enforces offer/answer direction and routes valid messages", asyn
       device_id: device.deviceId,
       screen: true,
       camera: false,
+      online: true,
+      state_revision: 1,
     });
     const sessionId = createdSession?.session_id as string;
     assert.equal((await nextMessage(owner)).type, "viewer_joined");
@@ -1698,6 +2043,8 @@ test("fresh authorized viewer replacement attaches to the existing session witho
       device_id: device.deviceId,
       screen: true,
       camera: true,
+      online: true,
+      state_revision: 1,
     });
     assert.deepEqual(attached[1], {
       type: "session_attached",
@@ -1844,6 +2191,8 @@ test("owner retirement preserves sharing availability and allows a fresh authori
       device_id: device.deviceId,
       screen: true,
       camera: true,
+      online: true,
+      state_revision: 3,
     });
 
     const freshMessages = nextMessages(viewer, 2);
@@ -1857,14 +2206,23 @@ test("owner retirement preserves sharing availability and allows a fresh authori
       (await freshJoined as { session_id: string }).session_id,
       freshSession?.session_id,
     );
+    const finalOwnerLeft = nextMessage(returningOwner);
+    const finalViewerLeft = nextMessage(viewer);
+    viewer.send(JSON.stringify({
+      type: "leave_session",
+      session_id: freshSession!.session_id as string,
+    }));
+    assert.equal((await finalOwnerLeft).type, "viewer_left");
+    assert.equal((await finalViewerLeft).type, "viewer_left");
   } finally {
     await Promise.all(sockets.map(terminateSocket));
+    await new Promise<void>((resolve) => setImmediate(resolve));
     await server.app.close();
     server.close();
   }
 });
 
-test("authorized viewers receive DEVICE_OFFLINE without revealing offline device ownership", async () => {
+test("authorized viewers receive offline availability without revealing it to unauthorized viewers", async () => {
   const server = await buildApp(":memory:", 3600, "test", undefined, 600, 45);
   const device = await createDevice(server);
   const ownerSession = await server.app.inject({
@@ -1923,7 +2281,14 @@ test("authorized viewers receive DEVICE_OFFLINE without revealing offline device
     const deniedResult = nextMessage(denied);
     allowed.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
     denied.send(JSON.stringify({ type: "create_session", device_id: device.deviceId }));
-    assert.deepEqual(await offlineResult, { type: "error", code: "DEVICE_OFFLINE" });
+    assert.deepEqual(await offlineResult, {
+      type: "device_sharing_state",
+      device_id: device.deviceId,
+      screen: false,
+      camera: false,
+      online: false,
+      state_revision: 0,
+    });
     assert.deepEqual(await deniedResult, { type: "error", code: "NOT_AUTHORIZED" });
   } finally {
     await terminateSocket(allowed);

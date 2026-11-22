@@ -32,6 +32,11 @@ export type CaptureDiagnosticEvent =
   | "screen_track_unavailable"
   | "screen_track_ended"
   | "screen_track_became_unavailable"
+  | "screen_track_muted"
+  | "screen_track_unmuted"
+  | "camera_track_ended"
+  | "camera_track_muted"
+  | "camera_track_unmuted"
   | "sharing_state_activation_requested"
   | "screen_sharing_activation_failed"
   | "screen_capture_activation_confirmed_by_main"
@@ -41,7 +46,17 @@ export type CaptureDiagnosticEvent =
   | "sleep_marker_prepare_started"
   | "sleep_marker_prepare_acknowledged"
   | "sleep_marker_prepare_failed"
+  | "sleep_marker_sent"
+  | "sleep_marker_timed_out"
   | "sleep_marker_error_received"
+  | "sleep_recovery_eligibility"
+  | "capture_cleanup"
+  | "system_suspend"
+  | "system_resume"
+  | "lock_screen"
+  | "unlock_screen"
+  | "display_removed"
+  | "display_metrics_changed"
   | "screen_track_state_before_false_publish"
   | "peer_closed"
   | "sleep_recovery_started"
@@ -126,6 +141,14 @@ export type CaptureDiagnosticErrorCode =
   | "DOMException"
   | "unknown";
 
+export type CaptureCleanupReason =
+  | "explicit_user_stop"
+  | "track_ended"
+  | "resume_ineligible"
+  | "safety_stop"
+  | "terminal_failure"
+  | "setup_failure";
+
 export type CaptureDiagnosticStage =
   | "local_user_action"
   | "display_media_request"
@@ -173,6 +196,25 @@ export type CaptureDiagnosticReason =
 
 export type CaptureDiagnosticDetails = {
   cycleId?: number;
+  timestampWallMs?: number;
+  timestampMonotonicMs?: number;
+  elapsedSinceSuspendMs?: number;
+  captureGeneration?: number;
+  trackId?: string;
+  trackKind?: "screen" | "camera";
+  trackEvent?: "ended" | "mute" | "unmute";
+  sleepRecoveryState?: "idle" | "eligible" | "started" | "completed" | "failed" | "timed_out";
+  cleanupReason?: CaptureCleanupReason;
+  screenTrackId?: string;
+  cameraTrackId?: string;
+  screenReadyState?: "live" | "ended" | "unavailable";
+  cameraReadyState?: "live" | "ended" | "unavailable";
+  screenEnabled?: boolean;
+  cameraEnabled?: boolean;
+  screenMuted?: boolean;
+  cameraMuted?: boolean;
+  displayId?: number;
+  screenPermissionStatus?: "not-determined" | "granted" | "denied" | "restricted" | "unknown";
   recoveryAttemptId?: string;
   sessionId?: string;
   recoveryPhase?: string;

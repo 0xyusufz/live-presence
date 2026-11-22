@@ -1338,19 +1338,25 @@ test("viewer does not re-session after an explicit leave", async () => {
 test("viewer treats sharing_stopped as an expected end and keeps authenticated presence open", async () => {
   const scheduler = new ManualScheduler();
   const sockets: MockSocket[] = [];
-  const connection = new MockConnection();
+  const connections: MockConnection[] = [];
   const endedReasons: string[] = [];
+  const availability: boolean[] = [];
   const viewer = new ViewerWebRtcClient({
     socketFactory: () => {
       const socket = new MockSocket();
       sockets.push(socket);
       return socket;
     },
-    peerFactory: () => connection,
+    peerFactory: () => {
+      const connection = new MockConnection();
+      connections.push(connection);
+      return connection;
+    },
     browserSessionToken: "browser-session-token",
     deviceId: "00000000-0000-0000-0000-000000000001",
     reconnect: { scheduler },
     onSessionEnded: (reason) => endedReasons.push(reason),
+    onDeviceAvailability: (online) => availability.push(online),
   });
 
   viewer.start();
@@ -1367,7 +1373,7 @@ test("viewer treats sharing_stopped as an expected end and keeps authenticated p
     }),
   });
   assert.equal(viewer.lifecycle, "NEGOTIATING");
-  assert.equal(connection.closed, false);
+  assert.equal(connections[0]?.closed, false);
   const createSessionCount = socket.sent.filter((data) => JSON.parse(data).type === "create_session").length;
 
   socket.onmessage?.({
@@ -1380,21 +1386,48 @@ test("viewer treats sharing_stopped as an expected end and keeps authenticated p
   });
 
   assert.equal(viewer.lifecycle, "CLOSED");
-  assert.equal(connection.closed, true);
+  assert.equal(connections[0]?.closed, true);
   assert.equal(socket.readyState, 1);
   assert.deepEqual(endedReasons, ["sharing_stopped"]);
-  assert.equal(scheduler.timers.size, 1);
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
   assert.equal(
     socket.sent.filter((data) => JSON.parse(data).type === "create_session").length,
     createSessionCount,
   );
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "device_sharing_state",
+      device_id: "00000000-0000-0000-0000-000000000001",
+      screen: false,
+      camera: false,
+    }),
+  });
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
+  assert.deepEqual(endedReasons, ["sharing_stopped"]);
+  assert.deepEqual(availability, [true]);
+
   socket.disconnect();
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.deepEqual(availability, [true]);
   assert.equal(scheduler.runNext(), 1_500);
   await new Promise((resolve) => setImmediate(resolve));
   const replacementSocket = sockets[1]!;
   replacementSocket.open();
   replacementSocket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    replacementSocket.sent.filter((data) => JSON.parse(data).type === "create_session").length,
+    1,
+  );
+  replacementSocket.onmessage?.({
+    data: JSON.stringify({ type: "error", code: "DEVICE_OFFLINE" }),
+  });
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
+  assert.equal(
+    replacementSocket.sent.filter((data) => JSON.parse(data).type === "create_session").length,
+    1,
+  );
   replacementSocket.onmessage?.({
     data: JSON.stringify({
       type: "device_sharing_state",
@@ -1404,15 +1437,48 @@ test("viewer treats sharing_stopped as an expected end and keeps authenticated p
     }),
   });
   assert.equal(viewer.lifecycle, "CLOSED");
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
+  replacementSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "device_sharing_state",
+      device_id: "00000000-0000-0000-0000-000000000001",
+      screen: true,
+      camera: false,
+    }),
+  });
   assert.equal(
-    replacementSocket.sent.some((data) => JSON.parse(data).type === "create_session"),
-    true,
+    replacementSocket.sent.filter((data) => JSON.parse(data).type === "create_session").length,
+    2,
   );
+  replacementSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(replacementSocket),
+    }),
+  });
+  replacementSocket.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      negotiation_id: "new-session-negotiation",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 2);
+  assert.equal(connections[1]?.answerCalls, 1);
+  connections[1]!.connectionState = "connected";
+  connections[1]!.onconnectionstatechange?.();
+  assert.equal(viewer.lifecycle, "CONNECTED");
   viewer.close();
   assert.equal(replacementSocket.readyState, 3);
 });
 
 test("viewer waits while sharing is inactive and creates one fresh session on each activation", async () => {
+  const scheduler = new ManualScheduler();
   const socket = new MockSocket();
   const connections: MockConnection[] = [];
   const endedReasons: string[] = [];
@@ -1426,6 +1492,7 @@ test("viewer waits while sharing is inactive and creates one fresh session on ea
     },
     browserSessionToken: "browser-session-token",
     deviceId,
+    reconnect: { scheduler },
     onSessionEnded: (reason) => endedReasons.push(reason),
   });
 
@@ -1448,6 +1515,7 @@ test("viewer waits while sharing is inactive and creates one fresh session on ea
   notifySharing(false);
   assert.equal(viewer.lifecycle, "CLOSED");
   assert.equal(createSessionCount(), 1);
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
 
   notifySharing(true);
   notifySharing(true);
@@ -1464,10 +1532,19 @@ test("viewer waits while sharing is inactive and creates one fresh session on ea
   assert.equal(connections.length, 1);
 
   notifySharing(false);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+      reason: "sharing_stopped",
+    }),
+  });
   notifySharing(false);
   assert.equal(viewer.lifecycle, "CLOSED");
   assert.equal(connections[0]?.closed, true);
   assert.deepEqual(endedReasons, ["sharing_stopped"]);
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
 
   notifySharing(true);
   notifySharing(true);
@@ -1482,10 +1559,31 @@ test("viewer waits while sharing is inactive and creates one fresh session on ea
   });
   assert.equal(viewer.lifecycle, "NEGOTIATING");
   assert.equal(connections.length, 2);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      negotiation_id: "new-session-negotiation",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections[1]?.answerCalls, 1);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "viewer_left",
+      session_id: "00000000-0000-0000-0000-000000000002",
+      viewer_user_id: "viewer",
+      reason: "sharing_stopped",
+    }),
+  });
+  assert.equal(viewer.lifecycle, "NEGOTIATING");
+  assert.equal(connections[1]?.closed, false);
   assert.equal(socket.readyState, 1);
 });
 
-test("inactive-sharing polls preserve the authenticated online viewer lifecycle", async () => {
+test("inactive-sharing notifications keep the authenticated viewer idle without session probes", async () => {
   const socket = new MockSocket();
   const scheduler = new ManualScheduler();
   const connections: MockConnection[] = [];
@@ -1518,25 +1616,163 @@ test("inactive-sharing polls preserve the authenticated online viewer lifecycle"
       }),
     });
     assert.equal(viewer.lifecycle, "CLOSED");
-    if (cycle < 2) {
-      scheduler.runNext();
-      assert.equal(viewer.lifecycle, "CLOSED");
-    }
+    assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
   }
 
-  assert.deepEqual(availability, [true, true, true]);
-  assert.equal(socket.sent.filter((data) => JSON.parse(data).type === "create_session").length, 3);
+  socket.onmessage?.({
+    data: JSON.stringify({
+      type: "device_sharing_state",
+      device_id: deviceId,
+      screen: false,
+      camera: false,
+      online: false,
+      state_revision: 4,
+    }),
+  });
+  assert.deepEqual(availability, [true, true, true, false]);
+  assert.equal(socket.sent.filter((data) => JSON.parse(data).type === "create_session").length, 1);
   assert.equal(connections.length, 0);
   viewer.close();
   viewer.close();
 });
 
-test("viewer retries an authorized offline device and reports online-but-not-sharing", async () => {
+test("viewer reconnects after an offline owner returns and discovers active sharing", async () => {
   const scheduler = new ManualScheduler();
-  const socket = new MockSocket();
+  const sockets: MockSocket[] = [];
+  const connections: MockConnection[] = [];
   const availability: boolean[] = [];
   const viewer = new ViewerWebRtcClient({
-    socketFactory: () => socket,
+    socketFactory: () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    peerFactory: () => {
+      const connection = new MockConnection();
+      connections.push(connection);
+      return connection;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId: "00000000-0000-0000-0000-000000000001",
+    reconnect: { scheduler },
+    onDeviceAvailability: (online) => availability.push(online),
+  });
+
+  viewer.start();
+  sockets[0]!.open();
+  sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "error", code: "DEVICE_OFFLINE" }) });
+
+  assert.deepEqual(availability, [false]);
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
+  assert.equal(sockets[0]!.sent.filter((data) => JSON.parse(data).type === "create_session").length, 1);
+
+  sockets[0]!.disconnect();
+  assert.equal(scheduler.runNext(), 1_500);
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sockets[1]!.sent.filter((data) => JSON.parse(data).type === "create_session").length, 1);
+
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "device_sharing_state",
+      device_id: "00000000-0000-0000-0000-000000000001",
+      screen: true,
+      camera: false,
+      state_revision: 1,
+    }),
+  });
+  assert.deepEqual(availability, [false, true]);
+  assert.equal(viewer.lifecycle, "CONNECTING");
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(sockets[1]!),
+    }),
+  });
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: "00000000-0000-0000-0000-000000000003",
+      negotiation_id: "owner-started-sharing",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections[0]?.answerCalls, 1);
+  connections[0]!.connectionState = "connected";
+  connections[0]!.onconnectionstatechange?.();
+  assert.equal(viewer.lifecycle, "CONNECTED");
+  viewer.close();
+});
+
+test("viewer reconnects while the owner is online but not sharing without probing repeatedly", async () => {
+  const scheduler = new ManualScheduler();
+  const sockets: MockSocket[] = [];
+  const availability: boolean[] = [];
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    peerFactory: () => new MockConnection(),
+    browserSessionToken: "browser-session-token",
+    deviceId: "00000000-0000-0000-0000-000000000001",
+    reconnect: { scheduler },
+    onDeviceAvailability: (online) => availability.push(online),
+  });
+  const inactiveState = (socket: MockSocket, revision: number) => socket.onmessage?.({
+    data: JSON.stringify({
+      type: "device_sharing_state",
+      device_id: "00000000-0000-0000-0000-000000000001",
+      screen: false,
+      camera: false,
+      online: true,
+      state_revision: revision,
+    }),
+  });
+
+  viewer.start();
+  sockets[0]!.open();
+  sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  inactiveState(sockets[0]!, 1);
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.deepEqual(availability, [true]);
+  assert.equal(sockets[0]!.sent.filter((data) => JSON.parse(data).type === "create_session").length, 1);
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
+
+  sockets[0]!.disconnect();
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.equal(scheduler.runNext(), 1_500);
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  inactiveState(sockets[1]!, 2);
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.deepEqual(availability, [true, true]);
+  assert.equal(sockets[1]!.sent.filter((data) => JSON.parse(data).type === "create_session").length, 1);
+  assert.ok(![...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
+  viewer.close();
+});
+
+test("viewer ignores a superseded socket-close callback after reauthentication", async () => {
+  const scheduler = new ManualScheduler();
+  const sockets: MockSocket[] = [];
+  const availability: boolean[] = [];
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      return socket;
+    },
     peerFactory: () => new MockConnection(),
     browserSessionToken: "browser-session-token",
     deviceId: "00000000-0000-0000-0000-000000000001",
@@ -1545,35 +1781,256 @@ test("viewer retries an authorized offline device and reports online-but-not-sha
   });
 
   viewer.start();
-  socket.open();
-  socket.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  sockets[0]!.open();
+  sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
   await new Promise((resolve) => setImmediate(resolve));
-  socket.onmessage?.({ data: JSON.stringify({ type: "error", code: "DEVICE_OFFLINE" }) });
-
-  assert.deepEqual(availability, [false]);
+  const staleClose = sockets[0]!.onclose!;
+  sockets[0]!.disconnect();
   assert.equal(viewer.lifecycle, "RECONNECTING");
-  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === 1_500));
+  assert.deepEqual(availability, []);
   assert.equal(scheduler.runNext(), 1_500);
-  assert.equal(
-    socket.sent.filter((data) => JSON.parse(data).type === "create_session").length,
-    2,
-  );
 
-  socket.onmessage?.({
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.onmessage?.({
     data: JSON.stringify({
       type: "device_sharing_state",
       device_id: "00000000-0000-0000-0000-000000000001",
       screen: false,
       camera: false,
+      state_revision: 0,
     }),
   });
-  assert.deepEqual(availability, [false, true]);
   assert.equal(viewer.lifecycle, "CLOSED");
-  assert.ok([...scheduler.timers.values()].some((timer) => timer.delay === 3_000));
-  assert.equal(scheduler.runNext(), 3_000);
-  socket.onmessage?.({ data: JSON.stringify({ type: "error", code: "DEVICE_OFFLINE" }) });
-  assert.deepEqual(availability, [false, true, false]);
+  assert.deepEqual(availability, [true]);
+
+  staleClose({ code: 1006 });
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.deepEqual(availability, [true]);
+  assert.equal(sockets[1]!.readyState, 1);
+  viewer.close();
+});
+
+test("viewer ignores a delayed old-socket close after the replacement session connects", async () => {
+  const scheduler = new ManualScheduler();
+  const sockets: MockSocket[] = [];
+  const connections: MockConnection[] = [];
+  const availability: boolean[] = [];
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    peerFactory: () => {
+      const connection = new MockConnection();
+      connections.push(connection);
+      return connection;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId: "00000000-0000-0000-0000-000000000001",
+    reconnect: { scheduler },
+    onDeviceAvailability: (online) => availability.push(online),
+  });
+
+  viewer.start();
+  sockets[0]!.open();
+  sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  const staleClose = sockets[0]!.onclose!;
+  sockets[0]!.disconnect();
   assert.equal(viewer.lifecycle, "RECONNECTING");
+  assert.equal(scheduler.runNext(), 1_500);
+
+  sockets[1]!.open();
+  sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "device_sharing_state",
+      device_id: "00000000-0000-0000-0000-000000000001",
+      screen: true,
+      camera: false,
+      online: true,
+      state_revision: 1,
+    }),
+  });
+  const sessionId = "00000000-0000-0000-0000-000000000002";
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "session_created",
+      session_id: sessionId,
+      device_id: "00000000-0000-0000-0000-000000000001",
+      request_id: createSessionRequestId(sockets[1]!),
+    }),
+  });
+  sockets[1]!.onmessage?.({
+    data: JSON.stringify({
+      type: "offer",
+      session_id: sessionId,
+      negotiation_id: "replacement-session-negotiation",
+      sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+      track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(connections.length, 1);
+  connections[0]!.connectionState = "connected";
+  connections[0]!.onconnectionstatechange?.();
+  assert.equal(viewer.lifecycle, "CONNECTED");
+  assert.deepEqual(availability, [true]);
+
+  const activePeer = connections[0]!;
+  const timersBeforeStaleClose = [...scheduler.timers.entries()];
+  staleClose({ code: 1006 });
+
+  assert.equal(viewer.lifecycle, "CONNECTED");
+  assert.deepEqual(availability, [true]);
+  assert.equal(connections.length, 1);
+  assert.equal(connections[0], activePeer);
+  assert.equal(activePeer.closed, false);
+  assert.deepEqual([...scheduler.timers.entries()], timersBeforeStaleClose);
+  assert.equal(sockets[1]!.readyState, 1);
+  assert.equal(
+    sockets[1]!.sent.filter((data) => JSON.parse(data).type === "create_session").length,
+    1,
+  );
+  viewer.close();
+});
+
+test("viewer ignores stale inactive state and duplicate ends after a replacement session starts", async () => {
+  const socket = new MockSocket();
+  const connections: MockConnection[] = [];
+  const sharingStates: Array<{ screen: boolean; camera: boolean }> = [];
+  const endedReasons: string[] = [];
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const oldSessionId = "00000000-0000-0000-0000-000000000002";
+  const newSessionId = "00000000-0000-0000-0000-000000000003";
+  const viewer = new ViewerWebRtcClient({
+    socketFactory: () => socket,
+    peerFactory: () => {
+      const connection = new MockConnection();
+      connections.push(connection);
+      return connection;
+    },
+    browserSessionToken: "browser-session-token",
+    deviceId,
+    onSharingState: (state) => sharingStates.push(state),
+    onSessionEnded: (reason) => endedReasons.push(reason),
+  });
+  const sendMessage = (message: Record<string, unknown>) =>
+    socket.onmessage?.({ data: JSON.stringify(message) });
+
+  viewer.start();
+  socket.open();
+  sendMessage({ type: "authenticated", role: "viewer" });
+  await new Promise((resolve) => setImmediate(resolve));
+  sendMessage({
+    type: "device_sharing_state",
+    device_id: deviceId,
+    screen: true,
+    camera: false,
+    state_revision: 1,
+  });
+  sendMessage({
+    type: "session_created",
+    session_id: oldSessionId,
+    device_id: deviceId,
+    request_id: createSessionRequestId(socket),
+  });
+  sendMessage({
+    type: "offer",
+    session_id: oldSessionId,
+    negotiation_id: "old-session-negotiation",
+    sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+    track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  connections[0]!.connectionState = "connected";
+  connections[0]!.onconnectionstatechange?.();
+
+  sendMessage({
+    type: "device_sharing_state",
+    device_id: deviceId,
+    screen: false,
+    camera: false,
+    state_revision: 2,
+  });
+  assert.equal(connections[0]?.closed, true);
+  assert.equal(viewer.lifecycle, "CLOSED");
+  sendMessage({
+    type: "viewer_left",
+    session_id: oldSessionId,
+    viewer_user_id: "viewer",
+    reason: "sharing_stopped",
+  });
+  sendMessage({
+    type: "viewer_left",
+    session_id: oldSessionId,
+    viewer_user_id: "viewer",
+    reason: "sharing_stopped",
+  });
+  assert.deepEqual(endedReasons, ["sharing_stopped"]);
+
+  sendMessage({
+    type: "device_sharing_state",
+    device_id: deviceId,
+    screen: true,
+    camera: false,
+    state_revision: 3,
+  });
+  sendMessage({
+    type: "session_created",
+    session_id: newSessionId,
+    device_id: deviceId,
+    request_id: createSessionRequestId(socket),
+  });
+  sendMessage({
+    type: "offer",
+    session_id: newSessionId,
+    negotiation_id: "new-session-negotiation",
+    sdp: "v=0\r\na=mid:0\r\na=mid:1\r\n",
+    track_map: [{ mid: "0", kind: "screen" }, { mid: "1", kind: "camera" }],
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  connections[1]!.connectionState = "connected";
+  connections[1]!.onconnectionstatechange?.();
+  assert.equal(viewer.lifecycle, "CONNECTED");
+
+  sendMessage({
+    type: "device_sharing_state",
+    device_id: deviceId,
+    screen: false,
+    camera: false,
+    state_revision: 2,
+  });
+  sendMessage({
+    type: "viewer_left",
+    session_id: oldSessionId,
+    viewer_user_id: "viewer",
+    reason: "sharing_stopped",
+  });
+  assert.equal(connections[1]?.closed, false);
+  assert.equal(viewer.lifecycle, "CONNECTED");
+  assert.deepEqual(sharingStates.at(-1), { screen: true, camera: false });
+  assert.deepEqual(endedReasons, ["sharing_stopped"]);
+
+  sendMessage({
+    type: "viewer_left",
+    session_id: newSessionId,
+    viewer_user_id: "viewer",
+    reason: "sharing_stopped",
+  });
+  sendMessage({
+    type: "viewer_left",
+    session_id: newSessionId,
+    viewer_user_id: "viewer",
+    reason: "sharing_stopped",
+  });
+  assert.equal(connections[1]?.closed, true);
+  assert.equal(viewer.lifecycle, "CLOSED");
+  assert.deepEqual(endedReasons, ["sharing_stopped", "sharing_stopped"]);
   viewer.close();
 });
 
@@ -2050,19 +2507,25 @@ test("abandonSleepRecovery preserves an open signaling socket and recreates peer
 test("desktop wake recovers the approved session after sleep marking times out", async () => {
   const scheduler = new ManualScheduler();
   const connection = new MockConnection();
+  const diagnostics: DesktopDiagnostic[] = [];
   const { client, socket, sockets, connection: peerConnection } = await connectedDesktop(
     scheduler,
     connection,
     undefined,
     {
     isSharingActive: () => true,
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
     },
   );
 
   await client.setSharingState(true, false);
-  const marker = client.prepareForSleep();
+  const marker = client.prepareForSleep(17);
+  assert.equal(diagnostics.some((diagnostic) =>
+    diagnostic.event === "sleep_marker_sent" && diagnostic.cycleId === 17), true);
   scheduler.runDelay(2_000);
   await assert.rejects(marker, /not acknowledged/);
+  assert.equal(diagnostics.some((diagnostic) =>
+    diagnostic.event === "sleep_marker_timed_out" && diagnostic.cycleId === 17), true);
   client.resumeAfterWake();
 
   assert.equal(socket.readyState, 3);
@@ -5425,7 +5888,7 @@ test("owner replaces the peer with the existing screen and camera tracks after r
   client.close();
 });
 
-test("viewer reconnect reattaches to the existing session without creating another peer", async () => {
+test("viewer reconnect discovers the active session without a new sharing-state broadcast", async () => {
   const scheduler = new ManualScheduler();
   const sockets: MockSocket[] = [];
   const connections: MockConnection[] = [];
@@ -5479,13 +5942,17 @@ test("viewer reconnect reattaches to the existing session without creating anoth
   sockets[1]!.open();
   sockets[1]!.onmessage?.({ data: JSON.stringify({ type: "authenticated", role: "viewer" }) });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(JSON.parse(sockets[1]!.sent.at(-1)!).type, "create_session");
+  const reconnectRequest = JSON.parse(sockets[1]!.sent.at(-1)!) as Record<string, unknown>;
+  assert.equal(reconnectRequest.type, "create_session");
+  assert.equal(reconnectRequest.active_session_id, "00000000-0000-0000-0000-000000000002");
   sockets[1]!.onmessage?.({
     data: JSON.stringify({
-      type: "device_sharing_state",
+      type: "session_attached",
+      session_id: "00000000-0000-0000-0000-000000000002",
       device_id: "00000000-0000-0000-0000-000000000001",
       screen: true,
       camera: false,
+      request_id: createSessionRequestId(sockets[1]!),
     }),
   });
   sockets[1]!.onmessage?.({

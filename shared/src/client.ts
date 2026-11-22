@@ -67,6 +67,8 @@ export type ClientSignalingDiagnostic = {
     | "sleep_marker_prepare_started"
     | "sleep_marker_prepare_acknowledged"
     | "sleep_marker_prepare_failed"
+    | "sleep_marker_sent"
+    | "sleep_marker_timed_out"
     | "sleep_marker_error_received"
     | "peer_closed"
     | "sleep_recovery_started"
@@ -80,6 +82,7 @@ export type ClientSignalingDiagnostic = {
   peerGeneration?: number;
   negotiationId?: string;
   correlationId?: string;
+  cycleId?: number;
   socketConnectionGeneration?: number;
   reason?: string;
   peerState?: PeerState;
@@ -123,6 +126,7 @@ export type DesktopDiagnostic = {
   sessionId?: string;
   recoveryAttemptId?: string;
   recoveryPhase?: string;
+  cycleId?: number;
   peerGeneration?: number;
   negotiationId?: string;
   correlationId?: string;
@@ -1165,7 +1169,12 @@ export class DesktopWebRtcClient extends WebRtcClient {
   private resumeRequestId: string | undefined;
   private resumeRequestPending = false;
   private sleepRecoveryAttemptId: string | undefined;
-  private sleepMarkerRequest: { requestId: string; resolve: () => void; reject: (error: Error) => void } | undefined;
+  private sleepMarkerRequest: {
+    requestId: string;
+    cycleId?: number;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  } | undefined;
   private restartResponseTimer: ReturnType<typeof setTimeout> | undefined;
   private startInFlight: Promise<void> | undefined;
   private awaitingControlPlaneRecovery = false;
@@ -1823,6 +1832,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
         this.onDiagnostic?.({
           event: "sleep_marker_error_received",
           lifecycle: this.lifecycle,
+          ...(pending.cycleId !== undefined ? { cycleId: pending.cycleId } : {}),
           ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
           sessionId: sessionId ?? this.sessionId,
           correlationId: requestId,
@@ -2784,7 +2794,9 @@ export class DesktopWebRtcClient extends WebRtcClient {
     return this.publishSharingState();
   }
 
-  stopSharingSession(): Promise<void> {
+  stopSharingSession(
+    reason: "explicit_user_stop" | "track_ended" | "resume_ineligible" | "safety_stop" | "terminal_failure" | "setup_failure" = "explicit_user_stop",
+  ): Promise<void> {
     let update = Promise.resolve();
     try {
       update = this.setSharingState(false, false);
@@ -2792,7 +2804,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
       this.pendingSharingResumed = false;
       this.approvedCaptureSessionId = undefined;
       this.clearPendingRetirements();
-      this.closePeer(false, "stopSharingSession", "explicit_stop");
+      this.closePeer(false, "stopSharingSession", reason);
       if (!this.terminal && !this.closing) {
         this.setLifecycle(this.socket?.readyState === 1 ? "IDLE" : "CLOSED");
       }
@@ -2809,7 +2821,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
     if (this.peer !== peer || this.peerGeneration !== generation || this.terminal || this.closing) return;
   }
 
-  prepareForSleep(): Promise<void> {
+  prepareForSleep(cycleId?: number): Promise<void> {
     if (!this.sessionId || !this.sharingState.screen || this.socket?.readyState !== 1) {
       return Promise.reject(new Error("no active sharing session to preserve"));
     }
@@ -2817,6 +2829,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
     const requestId = crypto.randomUUID();
     this.onDiagnostic?.({
       event: "sleep_marker_prepare_started",
+      ...(cycleId !== undefined ? { cycleId } : {}),
       lifecycle: this.lifecycle,
       ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
       ...(this.sessionId ? { sessionId: this.sessionId } : {}),
@@ -2826,20 +2839,30 @@ export class DesktopWebRtcClient extends WebRtcClient {
       message: `sleep marker request ${requestId} started`,
     });
     return new Promise<void>((resolve, reject) => {
-      this.sleepMarkerRequest = { requestId, resolve, reject };
+      this.sleepMarkerRequest = { requestId, cycleId, resolve, reject };
       this.send({ type: "prepare_sleep", session_id: this.sessionId!, request_id: requestId });
+      this.onDiagnostic?.({
+        event: "sleep_marker_sent",
+        lifecycle: this.lifecycle,
+        ...(cycleId !== undefined ? { cycleId } : {}),
+        ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
+        ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+        correlationId: requestId,
+        signalingState: this.getSignalingState(),
+        sharingState: { ...this.sharingState },
+      });
       this.clientScheduler.setTimeout(() => {
         if (this.sleepMarkerRequest?.requestId !== requestId) return;
         this.sleepMarkerRequest = undefined;
         this.onDiagnostic?.({
-          event: "sleep_marker_prepare_failed",
+          event: "sleep_marker_timed_out",
           lifecycle: this.lifecycle,
+          ...(cycleId !== undefined ? { cycleId } : {}),
           ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
           ...(this.sessionId ? { sessionId: this.sessionId } : {}),
           correlationId: requestId,
           signalingState: this.getSignalingState(),
           sharingState: { ...this.sharingState },
-          message: `sleep marker request ${requestId} was not acknowledged`,
         });
         reject(new Error("sleep continuity marker was not acknowledged"));
       }, 2_000);
@@ -2858,6 +2881,7 @@ export class DesktopWebRtcClient extends WebRtcClient {
     this.resumeRequestPending = false;
     this.onDiagnostic?.({
       event: "sleep_marker_prepare_acknowledged",
+      ...(this.sleepMarkerRequest.cycleId !== undefined ? { cycleId: this.sleepMarkerRequest.cycleId } : {}),
       lifecycle: this.lifecycle,
       ...(this.ownerDeviceId ? { deviceId: this.ownerDeviceId } : {}),
       sessionId: message.session_id,
@@ -3032,6 +3056,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
   private readonly onDeviceAvailability?: (online: boolean) => void;
   private iceConfiguration: WebRtcConfiguration | undefined;
   private reconnecting = false;
+  private sharingStateRevision: number | undefined;
   private hasEstablishedSession = false;
   private authorizationRetryCount = 0;
   private readonly retiredSessionIds = new Set<string>();
@@ -3099,6 +3124,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
   start(reconnecting = false): void {
     if (!reconnecting) this.closing = false;
     if (this.socket) return;
+    this.sharingStateRevision = undefined;
     this.reconnecting = reconnecting;
     this.sessionRequestPending = false;
     this.sessionRequestId = undefined;
@@ -3222,6 +3248,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
       }
       return this.handleMessage(message, socket);
     });
+    if (this.sharingActive === false) this.setLifecycle("CLOSED");
   }
 
   protected override async onAuthenticated(sourceSocket?: SignalingSocket): Promise<void> {
@@ -3446,10 +3473,21 @@ export class ViewerWebRtcClient extends WebRtcClient {
     }
     if (message.type !== "device_sharing_state") return false;
     if (message.device_id !== this.deviceId) return true;
-    this.onDeviceAvailability?.(true);
+    if (
+      message.state_revision !== undefined &&
+      this.sharingStateRevision !== undefined &&
+      message.state_revision < this.sharingStateRevision
+    ) {
+      return true;
+    }
+    if (message.state_revision !== undefined) {
+      this.sharingStateRevision = message.state_revision;
+    }
+    this.onDeviceAvailability?.(message.online ?? true);
     this.sharingActive = message.screen;
     this.onSharingState?.({ screen: message.screen, camera: message.camera });
     if (!message.screen) {
+      this.cancelReconnect();
       this.sessionRequestPending = false;
       this.sessionRequestId = undefined;
       this.peerEverConnected = false;
@@ -3461,7 +3499,6 @@ export class ViewerWebRtcClient extends WebRtcClient {
       } else if (!this.terminal && !this.closing) {
         this.setLifecycle("CLOSED");
       }
-      this.scheduleReconnect(() => this.requestSession());
       return true;
     }
     this.cancelReconnect();
@@ -3585,7 +3622,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
 
   protected override onControlPlaneClosed(): void {
     this.reconnecting = true;
-    this.setLifecycle("RECONNECTING");
+    if (this.sharingActive !== false) this.setLifecycle("RECONNECTING");
     this.scheduleReconnect(() => this.start(true));
   }
 
@@ -3672,9 +3709,9 @@ export class ViewerWebRtcClient extends WebRtcClient {
       return true;
     }
     if (code === "DEVICE_OFFLINE") {
+      this.cancelReconnect();
       this.onDeviceAvailability?.(false);
-      this.setLifecycle("RECONNECTING");
-      this.scheduleReconnect(() => this.requestSession());
+      this.setLifecycle("CLOSED");
       return true;
     }
     if (code === "RESUME_INVALID") {
@@ -3718,6 +3755,7 @@ export class ViewerWebRtcClient extends WebRtcClient {
     if (reason === "sharing_stopped") {
       this.sharingActive = false;
       this.peerEverConnected = false;
+      this.onSharingState?.({ screen: false, camera: false });
       this.cancelReconnect();
       return;
     }
@@ -3732,8 +3770,9 @@ export class ViewerWebRtcClient extends WebRtcClient {
 
   protected override onSocketClosed(code?: number): void {
     super.onSocketClosed(code);
-    this.onDeviceAvailability?.(false);
-    if (!this.terminal && !this.closing) this.setLifecycle("RECONNECTING");
+    if (!this.terminal && !this.closing && this.sharingActive !== false) {
+      this.setLifecycle("RECONNECTING");
+    }
     this.onRecoveryDiagnostic("signaling_disconnected");
     this.sessionRequestPending = false;
     this.resumeRequestPending = false;

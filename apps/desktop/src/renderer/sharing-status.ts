@@ -1,5 +1,6 @@
 import type { ClientLifecycleState } from "../../../../shared/src/client.js";
 import type { WebRtcPeer, WebRtcTrack } from "../../../../shared/src/webrtc.js";
+import type { CaptureCleanupReason } from "../ipc-contract.js";
 
 type CaptureTrackState<T extends WebRtcTrack = WebRtcTrack> = {
   generation: number;
@@ -41,15 +42,19 @@ export function invalidateCapture<T extends WebRtcTrack>(
 
 export function detachOwnerClientAfterCaptureStop<
   TClient extends {
-    stopSharingSession(): Promise<void>;
+    stopSharingSession(reason?: CaptureCleanupReason): Promise<void>;
     close(): void;
   },
->(current: { client?: TClient }, stopClient = true): void {
+>(
+  current: { client?: TClient },
+  stopClient: boolean,
+  reason: CaptureCleanupReason,
+): void {
   const client = current.client;
   if (!stopClient || !client) return;
   current.client = undefined;
   try {
-    void client.stopSharingSession().catch(() => undefined);
+    void client.stopSharingSession(reason).catch(() => undefined);
   } catch {
     // A stale transport may already be closed.
   }

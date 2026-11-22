@@ -7,6 +7,8 @@ import {
   protocol,
   session,
   powerMonitor,
+  screen,
+  systemPreferences,
 } from "electron";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join } from "node:path";
@@ -55,6 +57,7 @@ let quittingAfterCleanup = false;
 let sleepMarkerAcknowledged = false;
 let systemSuspended = false;
 let sleepRecoveryCycleId = 0;
+let suspendedAtMs: number | undefined;
 let sleepRecoveryTimer: NodeJS.Timeout | undefined;
 let sleepRecoveryState: "idle" | "started" | "completed" | "failed" | "timed_out" = "idle";
 let sleepRecoveryAttemptId: string | undefined;
@@ -722,9 +725,17 @@ app.whenReady().then(async () => {
 
   powerMonitor.on("suspend", () => {
     systemSuspended = true;
+    sleepRecoveryCycleId += 1;
+    suspendedAtMs = Date.now();
+    captureDiagnostics.log("system_suspend", {
+      cycleId: sleepRecoveryCycleId,
+      timestampWallMs: suspendedAtMs,
+      screen: shareActive,
+      camera: cameraIntent,
+      sleepRecoveryState,
+    });
     if (!shareActive && !capturePending) return;
     sleepMarkerAcknowledged = false;
-    sleepRecoveryCycleId += 1;
     if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
     sleepRecoveryTimer = undefined;
     sleepRecoveryState = "idle";
@@ -734,6 +745,26 @@ app.whenReady().then(async () => {
   powerMonitor.on("resume", () => {
     lastHeartbeat = Date.now();
     systemSuspended = false;
+    let screenPermissionStatus: "not-determined" | "granted" | "denied" | "restricted" | "unknown" = "unknown";
+    try {
+      const permissionStatus = systemPreferences.getMediaAccessStatus("screen");
+      if (permissionStatus === "not-determined" || permissionStatus === "granted" ||
+        permissionStatus === "denied" || permissionStatus === "restricted") {
+        screenPermissionStatus = permissionStatus;
+      }
+    } catch {
+      screenPermissionStatus = "unknown";
+    }
+    captureDiagnostics.log("system_resume", {
+      cycleId: sleepRecoveryCycleId,
+      timestampWallMs: Date.now(),
+      ...(suspendedAtMs === undefined ? {} : { elapsedSinceSuspendMs: Date.now() - suspendedAtMs }),
+      screen: shareActive,
+      camera: cameraIntent,
+      sleepRecoveryState,
+      screenPermissionStatus,
+    });
+    suspendedAtMs = undefined;
     if (capturePending && !shareActive) {
       void stopSharing("capture-interrupted-by-sleep");
       return;
@@ -741,6 +772,12 @@ app.whenReady().then(async () => {
     if (shareActive) {
       if (sleepRecoveryState !== "idle") return;
       sleepRecoveryState = "started";
+      captureDiagnostics.log("sleep_recovery_started", {
+        cycleId: sleepRecoveryCycleId,
+        sleepRecoveryState,
+        screen: shareActive,
+        camera: cameraIntent,
+      });
       if (sleepRecoveryTimer) clearTimeout(sleepRecoveryTimer);
       sleepRecoveryTimer = setTimeout(() => {
         sleepRecoveryTimer = undefined;
@@ -752,6 +789,18 @@ app.whenReady().then(async () => {
     }
     if (shareActive) emitAppEvent({ type: "resume", cycleId: sleepRecoveryCycleId });
     sleepMarkerAcknowledged = false;
+  });
+  powerMonitor.on("lock-screen", () => {
+    captureDiagnostics.log("lock_screen", { cycleId: sleepRecoveryCycleId, screen: shareActive, camera: cameraIntent });
+  });
+  powerMonitor.on("unlock-screen", () => {
+    captureDiagnostics.log("unlock_screen", { cycleId: sleepRecoveryCycleId, screen: shareActive, camera: cameraIntent });
+  });
+  screen.on("display-removed", (_event, display) => {
+    captureDiagnostics.log("display_removed", { cycleId: sleepRecoveryCycleId, displayId: display.id });
+  });
+  screen.on("display-metrics-changed", (_event, display) => {
+    captureDiagnostics.log("display_metrics_changed", { cycleId: sleepRecoveryCycleId, displayId: display.id });
   });
   app.on("activate", () => {
     if (!hasSingleInstanceLock) return;

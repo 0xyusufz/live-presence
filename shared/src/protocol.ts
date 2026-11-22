@@ -26,7 +26,14 @@ export type ServerMessage =
   | { type: "heartbeat_ack" }
   | { type: "session_retired"; session_id: string; outcome: "retired" | "not_found" | "authorization_revoked" }
   | { type: "sharing_state_updated"; device_id: string; screen: boolean; camera: boolean; session_id?: string }
-  | { type: "device_sharing_state"; device_id: string; screen: boolean; camera: boolean }
+  | {
+    type: "device_sharing_state";
+    device_id: string;
+    screen: boolean;
+    camera: boolean;
+    online?: boolean;
+    state_revision?: number;
+  }
   | { type: "sleep_marked"; session_id: string; epoch: number; capability: string; expires_at: number; request_id: string }
   | { type: "resume_pending"; session_id: string; epoch: number; capability: string; expires_at: number; request_id: string }
   | {
@@ -215,7 +222,6 @@ export function parseServerMessage(value: unknown): ServerMessage | null {
           ? { type: "authenticated", role: item.role, ...(item.device_id === undefined ? {} : { device_id: item.device_id }) }
           : null;
       case "sharing_state_updated":
-      case "device_sharing_state":
         return exactKeys(
           item,
           item.session_id === undefined
@@ -227,11 +233,45 @@ export function parseServerMessage(value: unknown): ServerMessage | null {
           (item.session_id === undefined || validSession(item.session_id)) &&
           (!item.camera || item.screen)
           ? {
-            type: item.type,
+            type: "sharing_state_updated",
             device_id: item.device_id,
             screen: item.screen,
             camera: item.camera,
             ...(item.session_id === undefined ? {} : { session_id: item.session_id }),
+          }
+          : null;
+      case "device_sharing_state":
+        return exactKeys(
+          item,
+          [
+            "type",
+            "device_id",
+            "screen",
+            "camera",
+            ...(item.online === undefined ? [] : ["online"]),
+            ...(item.session_id === undefined ? [] : ["session_id"]),
+            ...(item.state_revision === undefined ? [] : ["state_revision"]),
+          ],
+        ) &&
+          string(item.device_id, 128) && DEVICE_ID.test(item.device_id) &&
+          typeof item.screen === "boolean" && typeof item.camera === "boolean" &&
+          (item.online === undefined || typeof item.online === "boolean") &&
+          (item.session_id === undefined || validSession(item.session_id)) &&
+          (item.state_revision === undefined ||
+            (typeof item.state_revision === "number" &&
+              Number.isSafeInteger(item.state_revision) &&
+              item.state_revision >= 0)) &&
+          (!item.camera || item.screen)
+          ? {
+            type: "device_sharing_state",
+            device_id: item.device_id,
+            screen: item.screen,
+            camera: item.camera,
+            ...(item.online === undefined ? {} : { online: item.online }),
+            ...(item.session_id === undefined ? {} : { session_id: item.session_id }),
+            ...(item.state_revision === undefined || typeof item.state_revision !== "number"
+              ? {}
+              : { state_revision: item.state_revision }),
           }
           : null;
       case "sleep_marked":

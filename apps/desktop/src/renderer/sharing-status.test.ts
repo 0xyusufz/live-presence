@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { CaptureCleanupReason } from "../ipc-contract.js";
 import {
   attachApprovedTracks,
   acquireLiveScreenTrack,
@@ -44,7 +45,7 @@ test("capture stop detaches the owner client and an explicit share creates a fre
   };
   const current: { client?: typeof staleClient } = { client: staleClient };
 
-  detachOwnerClientAfterCaptureStop(current, true);
+  detachOwnerClientAfterCaptureStop(current, true, "explicit_user_stop");
   assert.equal(current.client, undefined);
   assert.equal(stopCalls, 1);
   assert.equal(closeCalls, 1);
@@ -68,6 +69,30 @@ test("capture stop detaches the owner client and an explicit share creates a fre
     throw new Error("must not create a duplicate client");
   }, () => { throw new Error("must not start an existing client"); });
   assert.equal(reusedAgain, freshClient);
+});
+
+test("capture cleanup forwards each explicit typed reason to the owner client", () => {
+  const reasons: CaptureCleanupReason[] = [
+    "explicit_user_stop",
+    "track_ended",
+    "resume_ineligible",
+    "safety_stop",
+    "terminal_failure",
+    "setup_failure",
+  ];
+
+  for (const reason of reasons) {
+    let receivedReason: CaptureCleanupReason | undefined;
+    const current = {
+      client: {
+        async stopSharingSession(stopReason?: CaptureCleanupReason) { receivedReason = stopReason; },
+        close() {},
+      },
+    };
+
+    detachOwnerClientAfterCaptureStop(current, true, reason);
+    assert.equal(receivedReason, reason);
+  }
 });
 
 test("terminal owner clients are closed and never reused", () => {

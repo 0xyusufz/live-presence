@@ -57,6 +57,54 @@ test("capture diagnostics append curated events to the configured path", async (
   }
 });
 
+test("sleep, track, and cleanup lifecycle metadata is persisted through the allow-list", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "live-presence-capture-"));
+  const path = join(directory, "screen-capture.log");
+  try {
+    const diagnostics = new CaptureDiagnostics(() => path);
+    diagnostics.log("screen_track_ended", {
+      timestampWallMs: 1_700_000_000_000,
+      timestampMonotonicMs: 42.5,
+      trackId: "screen-track-1",
+      trackKind: "screen",
+      trackEvent: "ended",
+      readyState: "ended",
+      enabled: true,
+      muted: false,
+      captureGeneration: 3,
+      cycleId: 2,
+      sleepRecoveryState: "started",
+    });
+    diagnostics.log("capture_cleanup", {
+      cleanupReason: "track_ended",
+      captureGeneration: 4,
+      screenTrackId: "screen-track-1",
+      screenReadyState: "ended",
+      screenEnabled: true,
+      screenMuted: false,
+    });
+    diagnostics.log("system_resume", {
+      cycleId: 2,
+      elapsedSinceSuspendMs: 30_000,
+      screenPermissionStatus: "granted",
+    });
+    await diagnostics.flush();
+
+    const records = (await readFile(path, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(records[0]?.trackId, "screen-track-1");
+    assert.equal(records[0]?.trackEvent, "ended");
+    assert.equal(records[0]?.timestampMonotonicMs, 42.5);
+    assert.equal(records[0]?.cycleId, 2);
+    assert.equal(records[1]?.cleanupReason, "track_ended");
+    assert.equal(records[1]?.screenReadyState, "ended");
+    assert.equal(records[2]?.elapsedSinceSuspendMs, 30_000);
+    assert.equal(records[2]?.screenPermissionStatus, "granted");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("unknown fields and malicious auth, SDP, ICE, URL, and path input are discarded", async () => {
   const directory = await mkdtemp(join(tmpdir(), "live-presence-capture-"));
   const path = join(directory, "screen-capture.log");
