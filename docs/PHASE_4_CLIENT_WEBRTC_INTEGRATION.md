@@ -127,6 +127,9 @@ tombstone and cleanup outbox operation, scoped to owner account, device,
 viewer, and session. The server retries unprocessed operations at startup and
 every second; records have no time expiry and remain until cleanup is complete
 and the matching authenticated owner device acknowledges the tombstone. The
+PostgreSQL migration preserves this behavior with Neon tombstone/outbox tables
+and startup reconciliation.
+
 10,000-record combined binding/tombstone limit rejects new grants or sessions
 instead of evicting unresolved revocations. This preserves revocation across
 CLI operation, owner disconnection, and server restart without turning
@@ -157,4 +160,7 @@ two-peer browser/Electron integration with `iceTransportPolicy: "relay"` and
 the authenticated `/webrtc/ice-servers` response, then verify a gathered
 `relay` candidate and a selected relay candidate pair. No reachable coturn
 endpoint and deployment secret are available in this repository test
-environment, so live relay connectivity remains a release blocker.
+environment. Live Cloudflare Realtime TURN validation remains pending.
+
+Optional coturn validation is separate and is not a release blocker for the
+active Cloudflare TURN provider.

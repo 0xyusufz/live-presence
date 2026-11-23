@@ -74,8 +74,13 @@ React. The pinned toolchain is Electron 45.2.3, Electron Forge 8.0.1, Vite
 8.3.7, React 19.3.1, and TypeScript 7.0.2. Forge's Node requirement sets the
 repository minimum to Node `>=22.13.0`. Viewer development binds
 `localhost:5173` and proxies existing auth, presence, ICE, and WebSocket paths
-to the local Fastify service; the production viewer is expected to share its
-origin with the service behind the existing reverse proxy.
+to the local Fastify service.
+
+The agreed target deployment hosts the viewer on Vercel at
+`app.yourdomain.com`. Production REST and WSS endpoints use
+`api.yourdomain.com` through Cloudflare Tunnel. This deployment target does not
+change local capture ownership, source selection, consent, IPC, the indicator,
+screen/camera tracks, or viewer playback.
 
 Useful checks:
 

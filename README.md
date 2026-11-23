@@ -6,9 +6,9 @@ Live Presence is a privacy-first, consent-based application for sharing live scr
 
 - `apps/desktop/` — Electron, TypeScript, and React desktop application for macOS and Windows.
 - `apps/viewer/` — browser-based viewer application.
-- `server/` — Node.js/Fastify signaling backend with SQLite/Drizzle persistence.
+- `server/` — Node.js/Fastify signaling backend.
 - `shared/` — shared protocol types and validation.
-- `infra/` — Docker Compose, Caddy, and coturn deployment configuration.
+- `infra/` — Docker, Cloudflare Tunnel, and deployment documentation.
 - `docs/` — architecture and project documentation.
 - `.github/` — repository automation and Copilot guidance.
 
@@ -25,5 +25,29 @@ restart, and each record remains until its owning desktop device acknowledges
 it. Unresolved records are never expired or evicted; when the documented
 capacity is reached, new grants and session creation are rejected until
 acknowledgments free capacity.
+
+## Initial deployment target
+
+The agreed deployment target is:
+
+- the owner's Mac hosts the Electron desktop app and Docker/Fastify backend;
+- Cloudflare Tunnel exposes the Fastify API and WebSocket signaling at
+  `api.yourdomain.com`;
+- Vercel hosts the browser viewer at `app.yourdomain.com`;
+- Cloudflare manages DNS;
+- Neon PostgreSQL is the persistent database target;
+- Cloudflare Realtime TURN is the active WebRTC relay fallback;
+- no public VPS, Caddy, router port forwarding, or public home IP exposure;
+- database backups are deferred.
+
+This describes the target deployment, not implemented or verified infrastructure.
+The checked-out implementation currently uses SQLite. Neon migration does not
+import existing SQLite records: users sign in afresh, devices re-enroll, and
+permissions are provisioned afresh.
+
+Live Mac/Docker/Tunnel startup and reconnect behavior remains to be implemented
+and manually validated. Backend restart does not prove active WebRTC media or
+capture recovery. Phase 6 requests, Phase 7 chat, and Phase 8 usage/notice
+remain future work.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the agreed boundaries and privacy invariants.

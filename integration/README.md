@@ -91,6 +91,11 @@ discarding the in-memory signaling session, then verifies fresh socket
 authentication and a new authorized session. It does not resume synthetic
 media tracks after restart.
 
+After PostgreSQL migration, the restart test must use a real PostgreSQL test
+database and verify persistent identities/authorization while discarding
+in-memory presence, active sessions, pending requests, and chat state.
+It must not claim automatic media-track or capture recovery.
+
 The failure scenario still fetches ICE configuration through the authenticated
 endpoint, then replaces only the browser harness's ICE server list with an
 unreachable relay endpoint. Both peers remain relay-only, so direct fallback

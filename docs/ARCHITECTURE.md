@@ -1,6 +1,6 @@
 # Presence & Screen Sharing — MVP Architecture
 
-Open-source, self-hostable, consent-based live presence/screen-sharing. Windows + macOS desktop sender, browser viewer. One VPS. No mobile.
+Open-source, self-hostable, consent-based live presence/screen-sharing. Windows + macOS desktop sender, browser viewer. Initial backend host: the owner's Mac with Docker and Cloudflare Tunnel. Persistent database target: Neon PostgreSQL. No mobile.
 
 ---
 
@@ -8,26 +8,31 @@ Open-source, self-hostable, consent-based live presence/screen-sharing. Windows 
 
 ```mermaid
 graph LR
-    D["Desktop app<br/>Electron<br/>Win / macOS"] -.->|"WSS: auth, presence,<br/>signaling, requests, chat"| S
-    V["Browser viewer"] -.->|"HTTPS + WSS"| S
-    S["Node + Fastify<br/>one process<br/>REST + WS + SQLite"]
+    D["Desktop app<br/>Electron<br/>Win / macOS"] -.->|"WSS: auth, presence,<br/>signaling"| CT["Cloudflare Tunnel"]
+    V["Browser viewer<br/>Vercel"] -.->|"HTTPS + WSS"| CT
+    CT --> S["Node + Fastify<br/>Docker on Mac<br/>REST + WS"]
+    S --> DB["Neon PostgreSQL<br/>persistent state"]
     S -->|"fetch temporary ICE servers"| CF["Cloudflare Realtime API"]
     D ==>|"WebRTC media,<br/>P2P, encrypted"| V
     D -.->|"relay if selected"| T["Cloudflare TURN relay"]
     T -.-> V
     style D fill:#2d5016,color:#fff
     style S fill:#1a3a5c,color:#fff
+    style DB fill:#345a77,color:#fff
     style CF fill:#5c1a1a,color:#fff
 ```
 
 Two planes, kept separate on purpose:
 
-- **Control plane** (dotted): auth, presence, signaling, viewer screen/camera **requests**, and **text chat** — a few KB/min, all through one server.
+- **Control plane** (dotted): auth, presence, signaling, and future Phase 6 viewer screen/camera **requests** — a few KB/min, all through one server.
 - **Media plane** (solid): pixels — peer-to-peer whenever possible, DTLS-SRTP encrypted end to end. The application server (`S`) never terminates or stores this media. When TURN (`T`) is needed as a fallback, it relays the encrypted stream between the two endpoints without the keys to decrypt it — see §11 for exactly what that does and doesn't expose.
 
 **Why this shape:** the server's only job is introducing two peers, relaying small consent/chat messages between them, and getting out of the way. Everything else (recording, history, multi-viewer) is explicitly out of scope, so there's nothing else for the server to do.
 
-Chat and viewer requests ride the **control plane, not WebRTC**. They're a few hundred bytes each, and both must work whether or not a media session exists — that's the whole point of a screen request, and it's equally true of chat: an authorized viewer can message the sender with screen and camera both off. Putting them on the existing authenticated WebSocket avoids inventing a data-channel lifecycle that would have to be negotiated before it could be used, and it keeps their lifetime tied to the control relationship rather than to any particular share session.
+Future Phase 6 viewer requests ride the **control plane, not WebRTC**.
+Future Phase 7 chat is not implemented in the current repository. Its protocol
+and buffer design remain roadmap documentation, not evidence of existing
+implementation.
 
 **The single most important property of this system is §5's consent invariant:** a viewer can *ask*, and only the sender can *arm capture*. Read that section before changing anything in the control plane.
 
@@ -38,13 +43,15 @@ Chat and viewer requests ride the **control plane, not WebRTC**. They're a few h
 | Layer | Choice | WHY | TRADE-OFF |
 |---|---|---|---|
 | Desktop | **Electron** | Chosen for lower implementation risk on this MVP. Chromium ships `desktopCapturer`/`setDisplayMediaRequestHandler` (screen) and `getUserMedia` (camera/mic) plus a complete, production-grade WebRTC stack — all as documented JS APIs, on both OSes, with no platform-specific capture code to write. Tauri is a credible alternative in principle, but its macOS webview (WKWebView) has historically needed more platform-specific work to reach equivalent screen-capture/WebRTC functionality, which is more implementation risk than this MVP needs — verify current WKWebView support if you revisit this later. | ~150MB install, ~150–250MB RAM. Irrelevant for a two-person desktop tool. |
-| Backend | **Node + Fastify, one process** | REST + WebSocket + SQLite in one deployable unit. Shared TypeScript types between server and Electron app. | Not horizontally scalable — fine, you don't need it to be. |
+| Backend | **Node + Fastify, one process** | REST + WebSocket in one Docker deployable unit. Shared TypeScript types between server and Electron app. | Not horizontally scalable — fine, you don't need it to be. |
 | Signaling | **`ws` library**, hand-rolled routing | ~150 lines. Socket.IO's rooms/reconnection abstractions fight an explicit presence state machine more than they help. | You write reconnect logic yourself — but you need custom reconnect logic anyway (see §10). |
-| DB | **SQLite** (better-sqlite3 + Drizzle) | Zero ops, file-based, trivial to back up (`cp`). At this scale, faster than networked Postgres. | Couples you to a persistent disk — fine on one VPS. |
+| DB current implementation | **SQLite** (better-sqlite3 + Drizzle) | Existing implementation, schema, and tests. | SQLite couples persistent state to a local file. |
+| DB deployment target | **Neon PostgreSQL** | Managed PostgreSQL for persistent authentication, authorization, device, and revocation state. | Requires migration, connection, role, TLS, startup, and concurrency validation. |
 | Media | **WebRTC, P2P, 1 viewer** | Zero media cost when direct; lowest latency. | 2+ viewers needs an SFU — **NOT NEEDED FOR MVP**. |
 | TURN | **Cloudflare Realtime temporary ICE servers** for the active MVP; self-hosted coturn remains an optional deployment path | No permanent TURN credentials reach clients; direct ICE avoids relay bandwidth when possible. | Cloudflare is an external provider; live self-hosted coturn validation remains a deployment task. |
-| Reverse proxy | **Caddy** | Automatic HTTPS via Let's Encrypt, one-file config. | None worth mentioning. |
-| Deployment | **One VPS + Docker Compose** | Everything in one place, backs up as one thing, migrates as one thing. | No redundancy — acceptable for two users. |
+| Public ingress | **Cloudflare Tunnel** | Public HTTPS/WSS control-plane ingress without router forwarding or public home IP exposure. | Availability depends on the Mac, Docker, internet, and tunnel. |
+| Viewer hosting | **Vercel** | The browser viewer remains independently hosted. | Backend-dependent features require the Mac/backend to be available. |
+| Deployment | **Mac Docker + Cloudflare Tunnel + Vercel** | No VPS rental for the initial deployment. | The Mac is the backend availability boundary. |
 
 **NOT NEEDED FOR MVP:** Redis, message queues, Kubernetes, microservices, SFU, multi-region, event sourcing, RBAC, analytics.
 
@@ -130,14 +137,14 @@ Four small surfaces, all in the desktop app:
 
    When the viewer disconnects, the watcher line becomes `Amit stopped watching` and then clears; the sharing state itself is unaffected (§10 grace period).
 
-2. **Request prompt** — raised on an incoming viewer request:
+2. **Future Phase 6 request prompt** — raised on an incoming viewer request:
 
    ```
    Amit wants to view your screen.
    [ Allow ]   [ Deny ]
    ```
 
-3. **Chat notification + side panel** — an OS notification on an incoming message; clicking it opens the panel docked beside the app window:
+3. **Future Phase 7 chat notification + side panel** — an OS notification on an incoming message; clicking it opens the panel docked beside the app window:
 
    ```
    +----------------------------------+------------------+
@@ -151,7 +158,7 @@ Four small surfaces, all in the desktop app:
    +----------------------------------+------------------+
    ```
 
-4. **60-minute awareness notice** — fires once per continuous sharing session (§9). It is a notification, not a prompt: there is no button on it, and nothing stops.
+4. **Future Phase 8 60-minute awareness notice** — fires once per continuous sharing session (§9). It is a notification, not a prompt: there is no button on it, and nothing stops.
 
 ### Daily active usage tracker
 
@@ -185,12 +192,12 @@ When a tick observes a different local date than the stored one, the counter res
 
 ## 4. Backend Architecture
 
-One Fastify process. Presence, active sessions, pending requests and chat buffers live **in memory**. Identity data and the narrowly scoped authorization-revocation recovery records touch SQLite.
+One Fastify process. Presence, active sessions, and Phase 6 pending requests live **in memory**. Identity data and authorization-revocation recovery records use SQLite in the current implementation and Neon PostgreSQL after migration.
 
 ```mermaid
 graph LR
     subgraph P["Single process"]
-      R["REST routes"] --> DBX[("SQLite")]
+      R["REST routes"] --> DBX[("SQLite now /<br/>Neon PostgreSQL target")]
       WSH["WS handler"] --> PR["Presence map<br/>(memory)"]
       WSH --> SR["Session map<br/>(memory)"]
       WSH --> RQ["Pending requests<br/>+ deny cooldowns<br/>(memory)"]
@@ -199,12 +206,12 @@ graph LR
     end
 ```
 
-| In memory (gone on restart — by design) | In SQLite |
+| In memory (gone on restart — by design) | Persistent database |
 |---|---|
 | Which devices are connected | users, devices, credentials, sessions (login), viewer_permissions |
 | Active share sessions, who is currently watching | `devices.last_seen_at` (one overwritten column) |
-| Pending screen/camera requests + per-kind deny cooldowns | — |
-| Transient chat buffer per active relationship (independent of media state — see §9) | — |
+| Future Phase 6 pending screen/camera requests + per-kind deny cooldowns | — |
+| Future Phase 7 transient chat buffer | — |
 | Last reported `active_usage_seconds` per device | — |
 | — | `presence_authorization_bindings` records the latest session for an owner-device/viewer authorization while approved sharing may continue |
 | — | `presence_revocation_tombstones` durably records authorization revocation until the matching authenticated owner device acknowledges it |
@@ -334,7 +341,7 @@ must be checked through WebRTC statistics.
 ```
 Internet
   │
-  ├─ 443/tcp (HTTPS+WSS) ──> Caddy ──> Fastify
+  ├─ 443/tcp (HTTPS+WSS) ──> Cloudflare Tunnel ──> Fastify
   ├─ HTTPS API request ──> Fastify ──> Cloudflare Realtime TURN
   │                         (temporary ICE-server credentials)
   ├─ WebRTC direct path ──> peer-to-peer media
@@ -343,7 +350,7 @@ Internet
 Optional self-hosted coturn deployment uses its own public TURN/TLS and relay ports.
 ```
 
-**Do not put coturn behind Caddy.** TURN needs raw UDP relay across a configured port range and its own TLS on 5349 for `turns:`; an HTTP reverse proxy adds nothing and actively can't forward that traffic correctly. Give coturn its own public ports.
+**Do not put optional coturn behind an HTTP reverse proxy.** TURN needs raw UDP relay across a configured port range and its own TLS on 5349 for `turns:`. HTTP reverse proxies cannot forward that traffic correctly. Coturn would need its own public ports and is outside the initial Cloudflare Tunnel deployment.
 
 **Minimum correct configuration:**
 
@@ -361,7 +368,7 @@ user-quota=... total-quota=... max-bps=...
 no-multicast-peers
 ```
 
-`external-ip` is the field that quietly breaks everything when wrong behind cloud NAT: candidates are advertised with an unreachable address and connections fail only for the users who actually need the relay. Keep the relay range open in the firewall and matched between `turnserver.conf` and the VPS security group.
+`external-ip` is the field that quietly breaks everything when wrong behind cloud NAT: candidates are advertised with an unreachable address and connections fail only for the users who actually need the relay. For an optional coturn deployment, keep the relay range open in the firewall and matched between `turnserver.conf` and the host network/security configuration.
 
 **Credentials — do this correctly, it's the one place a misconfiguration costs money:** never static creds. The optional self-hosted coturn deployment uses `use-auth-secret` mode:
 
@@ -387,8 +394,8 @@ provider-side credential, quota, and bandwidth controls apply to this path;
 the application does not expose a permanent provider secret or apply coturn
 quotas to Cloudflare.
 
-Self-hosted coturn remains an optional, separate deployment path in the
-documented one-VPS Docker Compose architecture. It expects temporary HMAC
+Self-hosted coturn remains an optional, separate deployment path outside the
+initial Mac/Docker + Cloudflare Tunnel architecture. It expects temporary HMAC
 credentials derived from `TURN_SHARED_SECRET` and scoped by `TURN_REALM`; the
 current application does not issue them. `user-quota`, `total-quota`,
 `max-bps`, `no-multicast-peers`, and the bounded relay port range are applied
@@ -396,10 +403,11 @@ by the Compose service. These coturn-specific quotas and controls do not apply
 to the active Cloudflare provider. The current automated relay evidence is for
 Cloudflare; the normal automated path uses
 `iceTransportPolicy: "all"` and verifies the selected candidate pair, while a
-forced-relay test uses `iceTransportPolicy: "relay"`. Live self-hosted coturn
-connectivity and its deployment acceptance criteria remain outstanding.
+forced-relay test uses `iceTransportPolicy: "relay"`. Live self-hosted coturn connectivity and its deployment acceptance criteria
+remain optional future validation and are not required for the initial
+Cloudflare TURN path.
 
-**Forced-relay test is mandatory, not optional.** Run the full flow with `iceTransportPolicy: "relay"` on both ends (§15, item 8) during Phase 4. It's the only way to find out your TURN config is wrong before a user on a hostile network does.
+**Cloudflare forced-relay validation is required, but live validation remains pending.** Run the full flow with `iceTransportPolicy: "relay"` on both ends (§15, item 8) during Phase 4. It is the way to verify Cloudflare TURN credentials, relay candidates, DTLS, and media delivery before a user on a restrictive network does.
 
 Cloudflare Realtime is the current application provider, not an SFU. The
 optional coturn deployment remains available for self-hosting and its live
@@ -474,29 +482,173 @@ After viewer authentication or reauthentication, the viewer makes one authorized
 
 ## 8. Database Schema
 
-Six tables. **What's excluded matters more than what's included.**
+The checked-out implementation uses SQLite/better-sqlite3/Drizzle and creates
+nine persistent tables. The Neon PostgreSQL migration creates the exact same
+logical schema.
 
 ```sql
-users (id, email, created_at)
+CREATE TABLE users (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX users_email_idx ON users(email);
 
-auth_tokens (id, user_id, token_hash, expires_at, consumed_at)
-  -- magic-link style login tokens; SHA-256 hashed, single-use, 15 min TTL
+CREATE TABLE auth_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  token_hash TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  consumed_at BIGINT
+);
+CREATE INDEX auth_tokens_token_hash_idx ON auth_tokens(token_hash);
 
-sessions (id, user_id, token_hash, expires_at, revoked_at, created_at)
-  -- LOGIN sessions only: the server-side record behind the browser's opaque
-  -- session cookie (§9). Enables instant revocation.
-  -- This is authentication state. It is NOT share-session history and must
-  -- never be extended into one.
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  token_hash TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  revoked_at BIGINT,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX sessions_token_hash_idx ON sessions(token_hash);
 
-devices (id, user_id, name, platform, revoked_at, last_seen_at)
-  -- last_seen_at is ONE overwritten column, not a log
+CREATE TABLE devices (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  name TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  revoked_at BIGINT,
+  last_seen_at BIGINT
+);
 
-device_credentials (id, device_id, refresh_token_hash, family_id, revoked_at)
-  -- rotation + reuse-detection lineage
+CREATE TABLE device_credentials (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  refresh_token_hash TEXT NOT NULL,
+  family_id TEXT NOT NULL,
+  revoked_at BIGINT
+);
+CREATE INDEX device_credentials_refresh_token_hash_idx
+ON device_credentials(refresh_token_hash);
+CREATE INDEX device_credentials_family_idx
+ON device_credentials(family_id);
 
-viewer_permissions (id, owner_user_id, viewer_user_id, revoked_at)
-  -- who may watch whom; either side can revoke
-  -- AUTHORIZATION ONLY — not consent to capture. See §9.
+CREATE TABLE viewer_permissions (
+  id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL REFERENCES users(id),
+  viewer_user_id TEXT NOT NULL REFERENCES users(id),
+  revoked_at BIGINT
+);
+CREATE INDEX viewer_permissions_owner_viewer_idx
+ON viewer_permissions(owner_user_id, viewer_user_id);
+CREATE INDEX viewer_permissions_viewer_owner_idx
+ON viewer_permissions(viewer_user_id, owner_user_id);
+CREATE UNIQUE INDEX viewer_permissions_active_unique_idx
+ON viewer_permissions(owner_user_id, viewer_user_id)
+WHERE revoked_at IS NULL;
+
+CREATE TABLE presence_authorization_bindings (
+  owner_user_id TEXT NOT NULL REFERENCES users(id),
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  viewer_user_id TEXT NOT NULL REFERENCES users(id),
+  session_id TEXT NOT NULL
+);
+CREATE UNIQUE INDEX presence_authorization_bindings_owner_device_viewer_idx
+ON presence_authorization_bindings(owner_user_id, device_id, viewer_user_id);
+CREATE INDEX presence_authorization_bindings_session_idx
+ON presence_authorization_bindings(session_id);
+
+CREATE TABLE presence_revocation_tombstones (
+  session_id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL REFERENCES users(id),
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  viewer_user_id TEXT NOT NULL REFERENCES users(id),
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX presence_revocation_tombstones_owner_device_idx
+ON presence_revocation_tombstones(owner_user_id, device_id);
+
+CREATE TABLE presence_revocation_outbox (
+  session_id TEXT PRIMARY KEY
+    REFERENCES presence_revocation_tombstones(session_id)
+    ON DELETE CASCADE,
+  owner_user_id TEXT NOT NULL REFERENCES users(id),
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  viewer_user_id TEXT NOT NULL REFERENCES users(id),
+  created_at BIGINT NOT NULL,
+  processed_at BIGINT
+);
+CREATE INDEX presence_revocation_outbox_pending_idx
+ON presence_revocation_outbox(processed_at);
+```
+
+The SQLite implementation uses `INTEGER` epoch-millisecond values.
+PostgreSQL uses `BIGINT`. node-postgres returns BIGINT values as strings;
+the application parser must validate the complete numeric string and return
+only JavaScript safe integers.
+
+The exact invariant is:
+
+```text
+presence_authorization_bindings + presence_revocation_tombstones <= 10000
+```
+
+`viewer_permissions` is not counted.
+
+Every capacity-changing transaction uses `READ COMMITTED` and the shared
+advisory lock `pg_advisory_xact_lock(726149, 10000)` before counting or
+mutating. Permission inserts/re-grants check the combined count but do not
+consume it. Binding insertions consume the remaining count. Revocation replaces
+a binding with a tombstone and remains successful at 10,000. Outbox processing
+changes only `processed_at` and does not change capacity.
+
+The PostgreSQL function and three existing trigger conditions are:
+
+```sql
+CREATE OR REPLACE FUNCTION live_presence_capacity_gate()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  current_count bigint;
+BEGIN
+  PERFORM pg_advisory_xact_lock(726149, 10000);
+
+  SELECT
+    (SELECT COUNT(*) FROM presence_authorization_bindings)
+    + (SELECT COUNT(*) FROM presence_revocation_tombstones)
+  INTO current_count;
+
+  IF current_count >= 10000 THEN
+    RAISE EXCEPTION
+      USING ERRCODE = 'P0001',
+            MESSAGE = 'PRESENCE_REVOCATION_CAPACITY_EXHAUSTED';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER presence_authorization_bindings_capacity
+BEFORE INSERT ON presence_authorization_bindings
+FOR EACH ROW
+EXECUTE FUNCTION live_presence_capacity_gate();
+
+CREATE TRIGGER viewer_permissions_capacity_insert
+BEFORE INSERT ON viewer_permissions
+FOR EACH ROW
+WHEN (NEW.revoked_at IS NULL)
+EXECUTE FUNCTION live_presence_capacity_gate();
+
+CREATE TRIGGER viewer_permissions_capacity_regrant
+BEFORE UPDATE OF revoked_at ON viewer_permissions
+FOR EACH ROW
+WHEN (
+  OLD.revoked_at IS NOT NULL
+  AND NEW.revoked_at IS NULL
+)
+EXECUTE FUNCTION live_presence_capacity_gate();
 ```
 
 **ACTIVE RUNTIME STATE (memory, not DB):** presence, active share sessions, who is currently watching, pending requests and deny cooldowns, chat buffers, last reported daily usage value.
@@ -618,11 +770,13 @@ The two tracks are independent, so four states exist and the viewer's UI follows
 | Screen OFF + Camera ON | live camera, `[ Request Screen ]` |
 | Screen ON + Camera ON | both live, no request buttons |
 
-Chat is available in all four rows, including Screen OFF + Camera OFF — an authorized viewer can message the sender and send requests before any media has ever been shared this visit.
+**Future Phase 7 chat:** chat is not implemented in the current repository.
+The following table and chat sections describe the retained Phase 7 roadmap
+design. They must not be treated as existing Phase 0–5 behavior.
 
 Approving a request while a session is already live adds the track via the reserved transceiver (§5) — no renegotiation, no new session, no second indicator.
 
-### Chat buffer lifetime
+### Future Phase 7 chat buffer lifetime
 
 Chat lifetime is tied to the **authorized owner↔viewer control relationship** — the viewer is connected and `viewer_permissions` is live — **not** to whether screen or camera sharing is currently active. Chat is transient by construction:
 
@@ -631,7 +785,7 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 - **Survives a brief viewer reconnect** within the existing grace period, so a refresh doesn't wipe the conversation mid-sentence.
 - **Cleared** only when the control relationship itself ends: the viewer disconnects permanently (past the grace period with no reconnect), `viewer_permissions` is revoked, or the owner disconnects for good. **Stopping screen or camera sharing does not clear or disable chat** — that's a media-plane event, and the chat buffer doesn't listen for it.
 - **Cleared on server restart** — no persistence, no recovery.
-- **Never written to SQLite.** There is no chat table (§8) and adding one is not a small change; it's a change in what this product is.
+- **Never written to the persistent database.** There is no chat table (§8) and adding one is not a small change; it's a change in what this product is.
 
 ---
 
@@ -710,26 +864,40 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 
 ## 12. Deployment
 
-One VPS, Docker Compose:
+The initial deployment target is:
 
-```yaml
-services:
-  caddy:   # :443, auto Let's Encrypt, routes /api,/ws -> app; serves static viewer page
-  app:     # Fastify: REST + WS + SQLite volume
-  coturn:  # optional: 3478/udp+tcp, 5349/tls, relay UDP range — not behind caddy
-```
+- Fastify in Docker on the owner's Mac.
+- Cloudflare Tunnel exposing `api.yourdomain.com`.
+- Vercel hosting the viewer at `app.yourdomain.com`.
+- Cloudflare DNS managing both hostnames.
+- Neon PostgreSQL as the persistent database target.
+- Cloudflare Realtime TURN as the active external relay fallback.
 
-- **Domain:** buy one small/cheap domain from day one — needed for TURN's `realm`, cookie stability, and email deliverability (magic-link sending domain verification).
-- **HTTPS/WSS:** Caddy handles TLS automatically; the browser viewer requires a secure context for `getUserMedia`/media APIs and blocks mixed `ws://` from an `https://` page outright.
-- **Firewall:** open 443/tcp (Caddy). Open 3478/udp + 3478/tcp, 5349/tcp, and coturn's configured relay UDP range (§6) only when the optional self-hosted coturn service is deployed; set `external-ip` correctly if the VPS is behind cloud NAT.
-- **Secrets:** `.env`, never committed — Cloudflare provider credentials for the active application, or the optional coturn shared secret, plus SMTP creds and the cookie signing key.
-- **Backup:** nightly `sqlite3 .backup`, gzip, push somewhere off-box (even scp to another machine). The DB is a few hundred KB.
-- **Logs:** `journalctl`/Docker logs, 7-day retention, allowlist fields only (§11).
-- **Health:** `GET /healthz` → `{status:"ok", version}`.
+The Cloudflare Tunnel carries API and WebSocket control-plane traffic only.
+It does not carry or terminate screen/camera media.
 
-**Recommended host:** a low-cost VPS with persistent, attachable storage for SQLite and backups, a stable address for the application domain, and predictable bandwidth/egress pricing.
+No VPS, Caddy, router port forwarding, public home IP, or required
+self-hosted coturn is part of the initial deployment. Optional coturn remains
+outside the active MVP provider path.
 
-Cloudflare Realtime TURN is external to the VPS. If you choose to deploy optional self-hosted coturn, the VPS must additionally support a stable public IP, raw UDP, and the configured relay port range. Set coturn's `external-ip` correctly when the VPS is behind cloud NAT.
+Database credentials are separated:
+
+- `NEON_MIGRATION_DATABASE_URL`: direct/migration connection with DDL privileges.
+- `NEON_RUNTIME_DATABASE_URL`: pooled runtime connection with DML-only privileges.
+- Access CLI: normal runtime role, never migration credentials or DDL privileges.
+
+Migration credentials must not be available to Fastify, Vercel, Electron, the
+viewer, or the access CLI.
+
+Migrations run before Fastify startup. Missing migrations or schema verification
+failure must prevent the runtime from listening. Database backup implementation
+is deferred.
+
+Laptop sleep/shutdown makes public backend features unavailable. Vercel may
+remain loadable, but authentication, presence, signaling, and TURN credentials
+require the Mac/backend to be available. Docker startup, tunnel recovery,
+Fastify startup, and client reconnect behavior require implementation and manual
+validation.
 
 ---
 
@@ -755,13 +923,11 @@ Cloudflare Realtime TURN is external to the VPS. If you choose to deploy optiona
   /protocol          # message/type definitions, shared by server + desktop + viewer
 /infra
   docker-compose.yml
-  Caddyfile
-  docker-compose.yml   # optional coturn service configuration
 /docs
   ARCHITECTURE.md    # this document
 ```
 
-TypeScript everywhere except `/infra` config files. `/shared/protocol` is imported by server, desktop and viewer, so a protocol change that breaks one side fails typecheck immediately — cheap safety now that the protocol carries requests and chat as well as signaling.
+TypeScript everywhere except `/infra` config files. `/shared/protocol` is imported by server, desktop and viewer, so a protocol change that breaks one side fails typecheck immediately — cheap safety now that the protocol carries existing signaling and future request/chat definitions.
 
 ---
 
@@ -769,15 +935,15 @@ TypeScript everywhere except `/infra` config files. `/shared/protocol` is import
 
 | Phase | Goal | Done when |
 |---|---|---|
-| **0** | Repo, domain, VPS, Docker Compose skeleton, `/healthz` | CI green, health endpoint live over HTTPS |
-| **1** | Magic-link auth, `sessions` table | Log in from a real email; revoking a session logs the browser out immediately |
-| **2** | Device enrollment, refresh rotation, Electron security baseline (§3) | Desktop app enrolls, survives restart, dies on revoke |
-| **3** | Presence over WS | Closing the app shows Offline in the viewer within seconds |
-| **4** | Signaling + TURN + reconnection | Two peers connect directly **and** relay-only (force with `iceTransportPolicy:"relay"`); survive a server restart; live optional coturn deployment validation remains outstanding |
-| **5** | Desktop capture + viewer UI, two reserved transceivers | Windows→browser and macOS→browser, screen+camera, working Stop, unmissable indicator |
-| **6** | Consent layer: viewer requests, Allow/Deny, partial states, watching indicator | A denied request starts nothing; an allowed camera request adds a track to a live screen session with no renegotiation |
-| **7** | Two-way chat + sender notification/side panel | **MVP.** Messages both ways, notification opens the panel, nothing persists |
-| **8** | Daily usage tracker + privacy toggle + 60-min awareness notice | Toggle OFF removes the field entirely; notice fires once and sharing continues |
+| **0** | Repo, domain/DNS, Mac Docker, Cloudflare Tunnel, Vercel, Neon foundation, migration foundation, `/healthz` | CI green; migration applied; health live through public API |
+| **1** | Existing magic-link auth and login sessions on PostgreSQL | Real login and PostgreSQL session revocation pass |
+| **2** | Existing device enrollment, refresh rotation, and revocation on PostgreSQL | Re-enrollment, reuse, and device revocation pass |
+| **3** | Existing presence, authorization, revocation, capacity, reconciliation, and outbox behavior on PostgreSQL | Real PostgreSQL tests pass |
+| **4** | Existing signaling, TURN and reconnection | Direct and forced relay behavior remains validated; live Cloudflare TURN validation is pending |
+| **5** | Existing desktop capture and viewer UI, two reserved transceivers | Windows/macOS capture, Stop, and indicator behavior remains validated |
+| **6** | Future consent layer: viewer requests, Allow/Deny, partial states, watching indicator | Future implementation; a denied request starts no capture |
+| **7** | Future two-way chat + sender notification/side panel | Future implementation; messages remain transient |
+| **8** | Future daily usage tracker + privacy toggle + 60-min awareness notice | Future implementation; Toggle OFF removes the field entirely |
 | **9** | Reliability hardening | Every scenario in §10 tested manually |
 | **10** | Packaging | Installable `.exe`/`.dmg` on clean machines |
 
@@ -810,23 +976,23 @@ rotation, and resumption of the same approved session without creating a new
 viewer session.
 
 **Implemented but not fully integration-tested:** a live post-connection
-direct-to-relay network failover using Chromium's real network interfaces; the
-self-hosted coturn configuration and relay path on the documented VPS
-deployment; Electron desktop integration; and cross-platform Windows/macOS
+direct-to-relay network failover using Chromium's real network interfaces;
+live Cloudflare Realtime TURN relay validation; Electron desktop integration;
+and cross-platform Windows/macOS
 runtime behavior. The automated browser harness uses synthetic canvas tracks
 and does not exercise
 screen or camera capture.
 
-**Manual or production validation still pending:** live self-hosted coturn
-relay validation with the Docker Compose deployment; real Windows and macOS
-desktop/browser runs; sleep/wake resume behavior and its
+**Manual or production validation still pending:** live Cloudflare Realtime TURN
+relay validation; optional self-hosted coturn validation remains separate;
+real Windows and macOS desktop/browser runs; sleep/wake resume behavior and its
 `Connected / Sharing resumed` notification; crash/relaunch reset; and the
 capture/consent flows in later phases.
 
 Phase 4 is therefore **not marked complete against the original acceptance
 criterion yet**: direct and forced-relay behavior, reconnection, and server
 restart are verified with Chromium and the current temporary TURN provider,
-but the original coturn deployment acceptance still requires live validation.
+but live Cloudflare Realtime TURN and target-platform validation remain pending.
 
 ---
 
@@ -848,21 +1014,21 @@ but the original coturn deployment acceptance still requires live validation.
 5. Viewer closes tab mid-session
 6. Sender network drop + reconnect
 7. Wi-Fi → mobile hotspot mid-share
-8. Forced TURN relay path (`iceTransportPolicy:"relay"`) using the deployed self-hosted coturn service
+8. Future live Cloudflare Realtime TURN forced-relay path (`iceTransportPolicy:"relay"`); live TURN validation remains pending
 9. macOS: deny screen permission, then grant it after relaunch
 10. Screen-capture source window closed mid-share
-11. **Sharing passes 60 minutes:** notice appears exactly once, sharing keeps running, no renewal prompt, no stop. Leave it running well past 60 minutes to confirm nothing expires
+11. **Future Phase 8 — sharing passes 60 minutes:** notice appears exactly once, sharing keeps running, no renewal prompt, no stop. Leave it running well past 60 minutes to confirm nothing expires
 12. Viewer briefly disconnects (refresh/network blip) and reconnects within the grace period — capture should not stop, chat buffer should survive
 13. **Sleep/wake:** share, close the lid, wait, reopen — sharing is temporarily interrupted, then the desktop reconnects and automatically resumes the already-approved sharing session without a button click or fresh consent; show `Connected / Sharing resumed` and no choice popup when recovery succeeds. If the previous capture/session ended, show the Screen only / Screen + camera / Not now choice surface (global desktop overlay on macOS, in-app popup elsewhere); verify dismissal starts no capture and either share choice requires a local action through the existing capture owner. A new viewer request is not auto-approved. Separately verify that a crash or relaunch returns to IDLE without a popup and requires a fresh explicit local action.
-14. **Request denied:** viewer requests screen, sender clicks Deny — no capture starts, viewer sees the denial, button disabled for 30s
-15. **Request spam:** viewer clicks Request repeatedly while one is pending — sender is prompted once only
-16. **Partial states:** screen already live, viewer requests camera, sender allows — camera appears without interrupting the screen stream
-17. **Request while sender is away:** request expires on its own and the prompt disappears
-18. **Chat both directions,** including the sender-side notification opening the side panel; restart the server and confirm the buffer is gone
-19. **Chat with no sharing active:** viewer connects with screen and camera both off, exchanges messages with the sender, then sends a screen request — all of it works with nothing shared yet
-20. **Chat survives Stop:** start a chat conversation, share the screen, then click Stop — confirm the chat buffer and on-screen history are untouched and the conversation continues normally
-21. **Usage toggle:** ON shows today's figure in the viewer; OFF removes it entirely (not zero, absent)
-22. **Usage rollover:** figure resets across local midnight and doesn't accumulate a second day's row anywhere
+14. **Future Phase 6 — request denied:** viewer requests screen, sender clicks Deny — no capture starts, viewer sees the denial, button disabled for 30s
+15. **Future Phase 6 — request spam:** viewer clicks Request repeatedly while one is pending — sender is prompted once only
+16. **Future Phase 6 — partial states:** screen already live, viewer requests camera, sender allows — camera appears without interrupting the screen stream
+17. **Future Phase 6 — request while sender is away:** request expires on its own and the prompt disappears
+18. **Future Phase 7 — chat both directions:** including sender-side notification and side panel
+19. **Future Phase 7 — chat with no sharing active:** exchange chat and then send a future Phase 6 request
+20. **Future Phase 7 — chat survives Stop:** confirm the chat buffer remains transient and Stop does not persist history
+21. **Future Phase 8 — usage toggle:** ON shows today's figure in the viewer; OFF removes it entirely (not zero, absent)
+22. **Future Phase 8 — usage rollover:** figure resets across local midnight and doesn't accumulate a second day's row anywhere
 
 No automated Windows/macOS UI testing infrastructure for MVP — not worth building for a solo dev; the manual matrix above catches what matters.
 
@@ -872,17 +1038,19 @@ No automated Windows/macOS UI testing infrastructure for MVP — not worth build
 
 - **Desktop:** Electron + TypeScript + React
 - **Backend:** Node.js + Fastify, one process (REST + WS)
-- **DB:** SQLite (better-sqlite3 + Drizzle), eight tables
+- **DB current implementation:** SQLite (better-sqlite3 + Drizzle)
+- **DB deployment target:** Neon PostgreSQL
 - **Media:** WebRTC, P2P, 1 viewer, 2 reserved transceivers (screen + camera)
-- **Control plane:** WebSocket — presence, signaling, viewer requests, transient chat
-- **TURN:** Cloudflare Realtime temporary ICE servers for the active application; optional self-hosted coturn deployment remains documented
-- **Proxy/TLS:** Caddy
-- **Deploy:** Docker Compose on one VPS
+- **Control plane:** WebSocket — presence, signaling, future Phase 6 viewer requests
+- **TURN:** Cloudflare Realtime temporary ICE servers for the active application; live relay validation remains pending. Optional self-hosted coturn remains separate.
+- **Public control plane:** Cloudflare Tunnel
+- **Viewer deployment:** Vercel
+- **Deploy:** Mac Docker + Cloudflare Tunnel + Neon + Vercel
 - **Auth:** magic-link (users) + enrollment code & rotating refresh tokens (devices)
 
 ## MVP SCOPE
 
-Windows + macOS desktop sender · browser viewer (any modern browser) · sign in · online/offline presence · today's aggregate active-usage figure with an owner privacy toggle · start/stop screen+camera sharing as independent tracks · **sharing runs indefinitely until the sender stops it**, with a one-time 60-minute awareness notice · sleep/wake temporarily interrupts sharing and automatically resumes only the already-approved active sharing session with `Connected / Sharing resumed`; if the old capture/session ended, a local Screen only / Screen + camera / Not now choice is shown (global desktop overlay on macOS, in-app popup elsewhere), while crash/relaunch returns to IDLE without a popup and requires a fresh explicit action · pre-authorized viewer access via `viewer_permissions` (revocable by either side) · viewer screen/camera **requests** with explicit sender Allow/Deny · viewer-watching indicator on the sender · two-way transient text chat available whenever an authorized viewer is connected, regardless of whether screen/camera sharing is active · short viewer-disconnect grace period · unmissable sharing indicator · application self-hosted on one VPS, with Cloudflare Realtime as the active external TURN provider and optional self-hosted coturn.
+Windows + macOS desktop sender · browser viewer (any modern browser) · sign in · online/offline presence · start/stop screen+camera sharing as independent tracks · **sharing runs indefinitely until the sender stops it** · sleep/wake behavior according to existing implementation and pending live validation · pre-authorized viewer access via `viewer_permissions` · short viewer-disconnect grace period · unmissable sharing indicator · Mac Docker backend with Cloudflare Tunnel, Vercel viewer, Neon PostgreSQL target, and Cloudflare Realtime TURN fallback · future Phase 6 viewer requests/Allow-Deny · future Phase 7 transient chat · future Phase 8 usage toggle and 60-minute notice · optional coturn remains separate.
 
 ## NOT IN MVP
 
@@ -905,6 +1073,8 @@ See §14 — Phases 0 through 7 get you a working MVP, Phase 8 completes the fea
 7. **Leaked TURN credential → bandwidth bill** — the active Cloudflare path depends on provider-side credential and bandwidth controls; the optional coturn path is additionally mitigated by its shared-secret protection, bounded TTLs chosen by its credential issuer, and Compose quotas (§6).
 8. **In-memory presence/session/request/chat state means every deploy drops everyone** — acceptable, but only if reconnect logic (§10) is built in Phase 4 and clients reset request UI on reconnect rather than showing stale pending state.
 9. **Indefinite sessions put more weight on the indicator and resume boundary.** With no expiry, the indicator window, the explicit approval boundary for new viewer requests, and the distinction between automatic sleep/wake resume for an already-approved active session versus the IDLE reset after crash/relaunch are the whole safety net. A bug that lets the indicator hide while capture runs, or that lets wake resume a new request without approval, is now a serious defect, not a cosmetic one — which is exactly why its lifetime is bound to the capture handles (§3).
-10. **Hosting-platform mismatch** — if you ever move off the recommended VPS, verify the new host actually supports raw UDP + a static IP for coturn and has predictable egress pricing (§12); many PaaS platforms don't meet all four, and terms/allocations vary by provider and change over time.
+10. **Mac/Tunnel/Neon availability** — the initial deployment depends on the
+Mac, Docker, internet, Cloudflare Tunnel, and Neon. Vercel keeps the viewer
+available, but it cannot replace backend authentication or signaling.
 11. **Windows DRM/UAC capture gaps** — not fixable, just needs to be documented so it's not mistaken for a bug.
 12. **Durable revocation backlog and storage pressure** — an unreachable owner device can leave an unacknowledged revocation tombstone pending indefinitely. The 10,000-record cap deliberately rejects new grants and sessions rather than discarding unresolved revocations; monitor capacity errors and restore the affected device's connectivity to allow authenticated acknowledgment. A credential-revoked device cannot acknowledge, so its retained record may permanently consume capacity; this implementation intentionally has no unsafe automatic or manual purge path.

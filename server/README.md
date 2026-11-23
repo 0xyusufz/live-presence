@@ -2,11 +2,12 @@
 
 ## Manage viewer authorization
 
-Run these commands from the repository root. They use the server's normal
-configuration, including `DATABASE_PATH` from `../.env` when present; otherwise
-the default is `./data/live-presence.db`. Relative database paths are resolved
-from the `server/` workspace directory by both the backend and these commands,
-regardless of the caller's working directory.
+Run these commands from the repository root.
+
+The current implementation uses `DATABASE_PATH` and SQLite. Relative database
+paths are resolved from the `server/` workspace directory. The PostgreSQL
+migration uses `NEON_RUNTIME_DATABASE_URL` and
+`NEON_MIGRATION_DATABASE_URL` instead.
 
 Grant an existing viewer access to an existing owner:
 

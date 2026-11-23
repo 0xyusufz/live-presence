@@ -1,26 +1,63 @@
 # Infrastructure
 
-The active application TURN provider is Cloudflare Realtime TURN. Fastify
-remains the authenticated signaling and ICE-server proxy, and Caddy must
-terminate HTTPS/WSS separately. The coturn Compose service is optional and
-separate from the currently active Cloudflare-backed application
-configuration; running coturn does not change the provider used by Fastify.
+The initial deployment target is:
 
-Set `TURN_REALM`, `TURN_SHARED_SECRET`, and `TURN_EXTERNAL_IP` in an ignored
-`.env` file before running the optional coturn service. Compose passes these values directly to coturn;
-there is no checked-in coturn config containing unresolved secret placeholders:
+- Fastify in Docker on the owner's Mac.
+- Cloudflare Tunnel for `api.yourdomain.com`.
+- Vercel for `app.yourdomain.com`.
+- Cloudflare DNS for both hostnames.
+- Neon PostgreSQL as persistent application storage.
+- Cloudflare Realtime TURN as the active relay fallback.
 
-```sh
-docker compose --env-file .env -f infra/docker-compose.yml config
-docker compose --env-file .env -f infra/docker-compose.yml up -d coturn
+The Cloudflare Tunnel carries API and WebSocket control-plane traffic only.
+It does not carry or terminate screen/camera media.
+
+No public VPS, Caddy, router port forwarding, public home IP, or coturn service
+is required for the initial deployment. Coturn remains optional and separate.
+
+## Database credentials
+
+Use separate credentials:
+
+- `NEON_RUNTIME_DATABASE_URL` — pooled Neon runtime connection for Fastify.
+- `NEON_MIGRATION_DATABASE_URL` — direct/migration-compatible Neon connection for migrations.
+
+Docker secrets/environment injection must expose:
+
+- migration credentials only to the migration job;
+- runtime credentials only to the Fastify container;
+- no migration credentials to the runtime container or access CLI.
+
+The access CLI uses the runtime role and the minimum grant/revoke privileges.
+It must not receive migration credentials or DDL privileges.
+
+## Migration execution
+
+Migrations run before Fastify startup. Startup verifies migration status and
+required schema objects. It must fail instead of silently creating or changing
+the production schema.
+
+The migration creates no backup implementation. Backups remain deferred.
+
+## Tunnel routing
+
+The proposed route is:
+
+```text
+api.yourdomain.com -> http://backend:3000
 ```
 
-Open UDP/TCP 3478, TCP 5349, and UDP relay ports 49160-49200 in the VPS
-firewall only when the optional coturn service is deployed. The current
-Fastify application does not generate coturn HMAC credentials or route its
-active Cloudflare ICE-server requests through coturn. Never expose the shared
-secret to either client.
+The backend listener should remain private inside Docker. Docker startup,
+Tunnel startup, Mac sleep/wake, and client reconnect behavior require
+implementation and manual validation.
 
-Reserved for the single-VPS Docker Compose deployment using Caddy and the
-optional coturn service. Production deployment configuration is intentionally
-not part of the initial foundation.
+## Verification status
+
+These deployment components are proposed, not verified by the current
+repository:
+
+- Docker Desktop/Tunnel startup after Mac login or sleep/wake;
+- public health and WebSocket routing;
+- Neon runtime/migration connectivity;
+- backend restart and viewer reconnection;
+- active media recovery after laptop/backend interruption.

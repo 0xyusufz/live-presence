@@ -17,11 +17,22 @@ bounded completed-session stale-message history. Pending IDs are retried every
 five seconds through one timer and are never evicted; the queue is capped at
 64. At capacity, the desktop refuses a new viewer session and requests server
 retirement instead of losing an unresolved entry. The server stores
-authorization revocations in a durable SQLite outbox and a device-scoped
-tombstone. It retries pending cleanup after restart and retains the tombstone
-until the correct authenticated owner device acknowledges it. Combined
+authorization revocations in a durable database outbox and a device-scoped
+tombstone. The current SQLite implementation persists both structures. The
+planned Neon PostgreSQL migration preserves the same semantics. It retries
+pending cleanup after restart and retains the tombstone until the correct
+authenticated owner device acknowledges it. Combined
 bindings and unacknowledged tombstones are capped at 10,000; reaching the cap
 rejects new grants/session bindings and does not discard pending revocations.
+
+The PostgreSQL migration must preserve the exact invariant
+`presence_authorization_bindings + presence_revocation_tombstones <= 10000`.
+`viewer_permissions` is not counted. Permission inserts and re-grants check
+the combined count, permission-only grants may succeed at 9,999, and those
+operations reject at 10,000. A binding admission at 9,999 may consume the final
+slot. Revocation replaces a binding with a tombstone and therefore remains
+successful at 10,000. Outbox processing changes only `processed_at` and does
+not change capacity.
 
 ## ICE and TURN strategy
 
