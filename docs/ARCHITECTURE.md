@@ -1084,9 +1084,10 @@ but live Cloudflare Realtime TURN and target-platform validation remain pending.
 - Unit: presence state machine as a pure function; token rotation/reuse-detection.
 - Future Phase 6 tests: request state machine as a pure function (pending/cooldown/TTL transitions).
 - Future Phase 8 tests: usage-counter tick logic including local-midnight rollover.
-- Backend integration: full flow against an in-memory SQLite — enroll device → grant `viewer_permissions` → request → allow → share → session — including negative cases (unauthorized viewer, revoked device, second concurrent viewer, request while one is pending, request during cooldown, oversize/over-rate chat)
-- WebRTC (Playwright, two headless Chromium contexts with fake media devices): connection succeeds, `getStats()` shows frames decoding, and **enabling the camera mid-session does not trigger renegotiation**
-- The 60-minute notice, driven by `SHARE_NOTICE_MS` set to a few seconds in test builds
+- Current backend integration coverage: authentication, device authorization, presence, signaling, and revocation paths that exist in the repository.
+- Future Phase 6/7 backend integration tests: complete request → Allow/Deny → share flow; pending-request and cooldown cases; chat size/rate-limit cases.
+- WebRTC (Playwright, two headless Chromium contexts with fake media devices): connection succeeds, `getStats()` shows frames decoding, and **enabling the camera mid-session does not trigger renegotiation**.
+- Future Phase 8 test: the 60-minute awareness notice, driven by `SHARE_NOTICE_MS` set to a few seconds in test builds.
 
 **Manual matrix — run before every release:**
 
