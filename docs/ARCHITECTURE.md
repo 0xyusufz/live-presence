@@ -883,12 +883,12 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 | Sender clicks Stop | Capture tracks stop, the server invalidates any resume capability, and the session returns to IDLE. No viewer request can restart capture |
 | macOS permission lost | Detect via track/error signals, black-frame check as fallback (§5) → stop, clear recovery message. Chat is unaffected |
 | App crash | Capture dies with the process. **On relaunch: always IDLE, never auto-resume sharing** — a fresh click is required |
-| Viewer closes tab / temporary disconnect | Server sees WS close → approved capture tracks remain live; the viewer grace period tolerates refresh or a brief drop and preserves session/chat continuity. Expiry retires the viewer session but does not stop still-live desktop capture. A fresh authorized viewer can attach later, while a server restart or revocation still ends stale recovery safely. |
-| Sender closes app | Graceful stop sent before quit where possible; otherwise timeout-based. This ends the control relationship, so the chat buffer clears with it |
-| Server restart | Everyone reconnects (backoff). Pending requests, cooldowns and chat buffers are gone — clients reset request UI to NONE rather than showing stale pending state. Unacknowledged authorization-revocation tombstones and their cleanup outbox operations remain in SQLite; pending operations retry and tombstones are delivered only to their owning device |
+| Viewer closes tab / temporary disconnect | Current behavior: the server sees WS close, retains approved capture during the viewer grace period, and retires the viewer session after expiry without stopping still-live desktop capture. A fresh authorized viewer can attach later, while a server restart or revocation still ends stale recovery safely. Future Phase 7 chat continuity across a brief reconnect is not implemented. |
+| Sender closes app | Graceful stop sent before quit where possible; otherwise timeout-based. This ends the control relationship. A transient chat buffer that clears with it is Future Phase 7 behavior and is not implemented today. |
+| Server restart | Everyone reconnects (backoff). Current session-scoped request-ID tracking is lost with the in-memory sessions. Future Phase 6 pending/cooldown state and Future Phase 7 chat buffers, if implemented in memory, will also be lost; clients must not retain stale prompts. Unacknowledged authorization-revocation tombstones and their cleanup outbox operations remain in SQLite; pending operations retry and tombstones are delivered only to their owning device |
 | Sender offline when a request arrives (Future Phase 6) | Planned behavior: request is rejected immediately with `share_request_state: CANCELLED`; nothing queues for later delivery |
 | Request left undecided (Future Phase 6) | Planned behavior: EXPIRES after ~2 min; the prompt closes itself on the sender side so old prompts don't pile up |
-| Usage tracker: clock change / DST / timezone move | Counter keys off local date; a date change resets to zero. A clock jump backwards at worst mis-attributes a few ticks — acceptable for an aggregate figure |
+| Usage tracker: clock change / DST / timezone move (Future Phase 8) | Planned counter keys off local date; a date change resets to zero. A clock jump backwards at worst mis-attributes a few ticks — acceptable for an aggregate figure |
 
 ---
 
@@ -898,8 +898,8 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 |---|---|
 | Screen/camera content | **The application server never terminates or stores it.** Peer-to-peer whenever possible; when TURN is required, Cloudflare TURN or optional coturn relays encrypted DTLS-SRTP media without decrypting it. The selected TURN operator can observe endpoint/network metadata (IP addresses, timing, and traffic volume) but does not possess the keys needed to decrypt screen/camera content |
 | Who watched whom, when | **No** — this table doesn't exist (§8); the currently-watching state is memory-only and vanishes when the viewer leaves |
-| Chat messages | Relayed and briefly buffered in memory; **never persisted** (§9) |
-| Screen/camera requests | Pending state in memory only; no record that a request was ever made, allowed or denied |
+| Chat messages | Future Phase 7 — not implemented. The planned design is transient and never persisted (§9). |
+| Screen/camera requests | Current implementation: request IDs are tracked within active in-memory sessions for relay/duplicate detection; no durable request history is stored. The complete pending/Allow-Deny workflow is Future Phase 6. |
 | Daily active usage | Future Phase 8 only; no usage value is currently measured, sent, or stored |
 | Presence | Current state only, in memory; DB has one overwritten `last_seen_at` |
 | Logs | Connection lifecycle, WS auth failures (by code, not content), WebRTC state transitions, app version/platform. **Never:** frame data, chat text, SDP at info level (it contains IPs), a session-history timeline |
