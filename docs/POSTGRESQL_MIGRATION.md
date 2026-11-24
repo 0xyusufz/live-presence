@@ -146,23 +146,40 @@ EXECUTE FUNCTION live_presence_capacity_gate();
 
 No binding update trigger is introduced.
 
-## P0001 application error mapping
+## Capacity error mapping
 
-The trigger raises SQLSTATE P0001 with message
-`PRESENCE_REVOCATION_CAPACITY_EXHAUSTED`.
-
-The application maps that database signal to the existing
-`AuthorizationError` message:
+**Current SQLite behavior:** the capacity triggers abort with the message
+`PRESENCE_REVOCATION_CAPACITY_EXHAUSTED`. This is a database-trigger sentinel,
+not an application error code. `ViewerAuthorizationService.grant()` detects
+the sentinel by message and throws `AuthorizationError` with this
+human-readable message:
 
 ```text
 Presence revocation capacity is full; acknowledge pending revocations or reduce active authorized relationships before granting access
 ```
 
-This is the existing application-level behavior used to represent capacity
-failure. It is not a new API error code or protocol response.
+The access CLI prints
+`Live Presence access command failed: <message>` and exits unsuccessfully.
+The WebSocket session-binding path does not convert the raw capacity sentinel:
+`AuthorizationError` maps to `NOT_AUTHORIZED`, the raw capacity sentinel
+maps to the existing `PRESENCE_CAPACITY_EXHAUSTED` protocol code, and
+unexpected errors map to `SERVER_ERROR`. `AuthorizationError` has no
+dedicated code property. Do not treat
+`PRESENCE_REVOCATION_CAPACITY_EXHAUSTED` as an application or protocol code.
 
-Non-capacity PostgreSQL errors propagate and are not converted into success or
-capacity failures.
+**PostgreSQL target:** the trigger raises SQLSTATE `P0001` with the same
+sentinel message. Because the pinned Drizzle node-postgres adapter wraps driver
+errors in `DrizzleQueryError` with the original driver error on `.cause`,
+capacity detection must inspect the cause chain and match both SQLSTATE
+`P0001` and the sentinel message. Verify this behavior against the pinned
+Drizzle version during implementation.
+
+Preserve the existing distinct behavior: permission grant/re-grant converts
+the capacity exception to the same human-readable `AuthorizationError`;
+session binding preserves the capacity signal so the WebSocket handler emits
+`PRESENCE_CAPACITY_EXHAUSTED`; the CLI prints the authorization message and
+exits unsuccessfully; and non-capacity database errors propagate to the
+existing unexpected-error handling. Do not introduce a new API error code.
 
 ## Revocation
 
@@ -193,8 +210,50 @@ revoked. It:
 8. preserves existing `processed_at`;
 9. commits atomically.
 
+These PostgreSQL operations are intentionally stricter than the current
+SQLite implementation, which uses `INSERT OR IGNORE` /
+`onConflictDoNothing()` and does not verify affected-row counts. Each binding
+deletion must affect exactly one row. Existing tombstone and outbox records
+must be read back and compared; `ON CONFLICT DO NOTHING` must not conceal an
+identity or timestamp mismatch. Any unexpected row count, mismatch, or
+mutation failure rolls back the complete transaction.
+
 Identity or timestamp mismatch fails reconciliation and rolls back.
 Repeated reconciliation is idempotent.
+
+The outbox worker retries every second in batches of at most 100, ordered by
+oldest `created_at` and then `session_id`. It marks an operation processed
+after cleanup. Tombstones remain until the matching authenticated owner
+device acknowledges them.
+
+## Device refresh-token concurrency
+
+A PostgreSQL refresh runs in one `READ COMMITTED` transaction:
+
+1. Lock the matching credential and device rows using
+   `SELECT ... FOR UPDATE`.
+2. Conditionally revoke the current credential with
+   `UPDATE ... WHERE id = $1 AND revoked_at IS NULL RETURNING id` and require
+   exactly one returned row.
+3. Insert the replacement credential in the same token family.
+4. Update the device's `last_seen_at`.
+5. Commit before returning the replacement token.
+
+If the presented credential is already retired, or the conditional revoke
+does not return exactly one row, revoke the entire token family in a
+transaction and commit that revocation before returning the authentication
+failure. A failed family-revocation transaction must propagate; it must not be
+swallowed, and no external callback may run before commit.
+
+This preserves the existing reuse-detection behavior: a replacement token
+already returned by the winning concurrent request may become invalid
+immediately if a concurrent reuse request subsequently revokes the whole
+family. This is intentional security behavior. Database failures propagate.
+
+Required concurrency tests must prove that concurrent refreshes of one
+credential produce at most one replacement, the losing/reuse request revokes
+the family, the winner's replacement is then rejected, and a failed family
+revocation propagates.
 
 ## PostgreSQL migration startup
 
