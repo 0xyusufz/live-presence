@@ -27,12 +27,16 @@ Two planes, kept separate on purpose:
 - **Control plane** (dotted): auth, presence, signaling, and future Phase 6 viewer screen/camera **requests** — a few KB/min, all through one server.
 - **Media plane** (solid): pixels — peer-to-peer whenever possible, DTLS-SRTP encrypted end to end. The application server (`S`) never terminates or stores this media. When TURN (`T`) is needed as a fallback, it relays the encrypted stream between the two endpoints without the keys to decrypt it — see §11 for exactly what that does and doesn't expose.
 
-**Why this shape:** the server's only job is introducing two peers, relaying small consent/chat messages between them, and getting out of the way. Everything else (recording, history, multi-viewer) is explicitly out of scope, so there's nothing else for the server to do.
+**Why this shape:** the server introduces authorized peers and relays
+signaling. The current repository also has a wire-level `share_request`
+message relay, but it does not yet provide the complete Phase 6 consent
+workflow or desktop request UI. Phase 7 chat is not implemented; its protocol
+and buffer design remain future roadmap documentation.
 
-Future Phase 6 viewer requests ride the **control plane, not WebRTC**.
-Future Phase 7 chat is not implemented in the current repository. Its protocol
-and buffer design remain roadmap documentation, not evidence of existing
-implementation.
+The current wire-level viewer-request relay uses the **control plane, not
+WebRTC**. The complete Phase 6 request, prompt, Allow/Deny, and policy flow
+remains future work. Phase 7 chat also belongs on the control plane when
+implemented.
 
 **The single most important property of this system is §5's consent invariant:** a viewer can *ask*, and only the sender can *arm capture*. Read that section before changing anything in the control plane.
 
@@ -126,16 +130,21 @@ new BrowserWindow({
 
 Four small surfaces, all in the desktop app:
 
-1. **Indicator window** — always-on-top, frameless, lifetime bound to the capture handles (§11). Shows what is live and who is watching:
+1. **Indicator window** — always-on-top, frameless, lifetime bound to the
+   capture handles (§11). The current implementation shows the live sharing
+   state and Stop control. Human-readable viewer identity and the watcher line
+   below are future Phase 6 behavior; the current `viewer_joined` /
+   `viewer_left` messages carry a user ID, not a display name.
 
    ```
    🔴 Sharing Active
-   👁 Amit is watching
+   Future Phase 6: 👁 Amit is watching
    Screen: ON   Camera: OFF
    [ Stop Sharing ]
    ```
 
-   When the viewer disconnects, the watcher line becomes `Amit stopped watching` and then clears; the sharing state itself is unaffected (§10 grace period).
+   When the viewer disconnects, approved capture remains active; the future
+   watcher line clears after the viewer session is retired (§10 grace period).
 
 2. **Future Phase 6 request prompt** — raised on an incoming viewer request:
 
@@ -160,9 +169,15 @@ Four small surfaces, all in the desktop app:
 
 4. **Future Phase 8 60-minute awareness notice** — fires once per continuous sharing session (§9). It is a notification, not a prompt: there is no button on it, and nothing stops.
 
-### Daily active usage tracker
+### Daily active usage tracker (Future Phase 8 — not implemented)
 
-A small main-process module that answers exactly one question: roughly how many minutes has this computer been actively used **today**, in the device's local timezone.
+No usage-tracking module, idle polling, local daily counter, privacy toggle, or
+`active_usage_seconds` field exists in the current repository. The following
+describes the agreed Future Phase 8 design, not current behavior.
+
+A small main-process module would answer exactly one question: roughly how many
+minutes has this computer been actively used **today**, in the device's local
+timezone.
 
 ```
 Rahul
@@ -192,7 +207,12 @@ When a tick observes a different local date than the stored one, the counter res
 
 ## 4. Backend Architecture
 
-One Fastify process. Presence, active sessions, and Phase 6 pending requests live **in memory**. Identity data and authorization-revocation recovery records use SQLite in the current implementation and Neon PostgreSQL after migration.
+One Fastify process. Presence and active sessions live **in memory**.
+The current request relay tracks request IDs per active session; full Phase 6
+pending-request policy and cooldown state are future work. Phase 7 chat buffers
+and Phase 8 usage values are also future work. Identity data and
+authorization-revocation recovery records use SQLite in the current
+implementation and Neon PostgreSQL after migration.
 
 ```mermaid
 graph LR
@@ -200,8 +220,8 @@ graph LR
       R["REST routes"] --> DBX[("SQLite now /<br/>Neon PostgreSQL target")]
       WSH["WS handler"] --> PR["Presence map<br/>(memory)"]
       WSH --> SR["Session map<br/>(memory)"]
-      WSH --> RQ["Pending requests<br/>+ deny cooldowns<br/>(memory)"]
-      WSH --> CB["Chat buffers<br/>(memory, transient)"]
+      WSH --> RQ["Current request-ID relay tracking<br/>Future Phase 6 pending/cooldowns"]
+      WSH --> CB["Future Phase 7 chat buffers<br/>(transient, memory)"]
       R --> TC["TURN credential provider<br/>temporary ICE servers"]
     end
 ```
@@ -210,9 +230,9 @@ graph LR
 |---|---|
 | Which devices are connected | users, devices, credentials, sessions (login), viewer_permissions |
 | Active share sessions, who is currently watching | `devices.last_seen_at` (one overwritten column) |
-| Future Phase 6 pending screen/camera requests + per-kind deny cooldowns | — |
-| Future Phase 7 transient chat buffer | — |
-| Last reported `active_usage_seconds` per device | — |
+| Current per-session request-ID relay tracking; full pending/cooldown policy is Future Phase 6 | — |
+| Future Phase 7 transient chat buffer (not implemented) | — |
+| Future Phase 8 `active_usage_seconds` value (not implemented) | — |
 | — | `presence_authorization_bindings` records the latest session for an owner-device/viewer authorization while approved sharing may continue |
 | — | `presence_revocation_tombstones` durably records authorization revocation until the matching authenticated owner device acknowledges it |
 | — | `presence_revocation_outbox` records pending server-side session cleanup for each tombstone; it is deleted with the acknowledged tombstone |
@@ -224,7 +244,12 @@ The server processes pending outbox operations at startup, after an in-process r
 
 The fixed SQLite presence-revocation capacity is 10,000 combined authorization bindings and unacknowledged tombstones; each outbox operation corresponds to one tombstone and does not add a separate capacity slot. At capacity, new viewer grants and session bindings are rejected with an explicit capacity error. Existing unresolved records are never expired, evicted, or overwritten to make room; operators should restore device connectivity so its owner can acknowledge revocations, or reduce active authorized relationships. A device whose credentials were separately revoked cannot authenticate an acknowledgment, so its tombstone deliberately remains indefinitely and consumes capacity; no automatic purge is provided. Thus a sustained backlog fails closed for new presence sessions rather than losing mandatory revocation state.
 
-A restart drops everyone; clients reconnect with backoff (§10). This isn't a shortcut around building reconnect logic — it's the reason to build it early, since it now runs on every deploy. A restart also clears pending requests, cooldowns and the chat buffer, which is the correct behavior: a stale consent prompt should never survive a deploy.
+A restart drops everyone; clients reconnect with backoff (§10). This isn't a
+shortcut around building reconnect logic — it's the reason to build it early,
+since it now runs on every deploy. A restart clears current session-scoped
+request-ID tracking. Future Phase 6 pending/cooldown state and Phase 7 chat
+buffers, if implemented in memory as designed, will also be cleared; a stale
+consent prompt must never survive a deploy.
 
 ---
 
@@ -270,7 +295,7 @@ sequenceDiagram
     D->>S: sharing_state {screen:true, camera:false}
     V->>S: create_session {device_id}
     S->>S: check auth + viewer authorization + active screen + 1-viewer cap
-    S->>D: viewer_joined {viewer_name}
+    S->>D: viewer_joined {viewer_user_id}
     D->>D: attach current screen/camera tracks before offer
     D->>D: new RTCPeerConnection, 2 sendonly transceivers
     D->>S: offer {sdp}
@@ -429,11 +454,11 @@ One WebSocket, one JSON envelope:
 |---|---|---|
 | `auth` | desktop client→server, **must be first frame** | `{ "token": "..." }` |
 | Browser session cookie | viewer→server during WebSocket upgrade | Existing HttpOnly `live_presence_session`; server authenticates it as a viewer without exposing it to JavaScript |
-| `presence` | server→viewer | `{ "device_id": "d1", "state": "online", "screen": false, "camera": false, "active_usage_seconds": 13320 }` |
+| `presence` | server→viewer | `{ "device_id": "d1", "state": "online", "screen": false, "camera": false }` |
 | `sharing_state` | device→server | `{ "screen": true, "camera": false }` |
 | `create_session` | viewer→server | `{ "device_id": "d1" }` |
 | `device_sharing_state` | server→authorized viewer | `{ "device_id": "d1", "screen": true, "camera": false, "online": true, "state_revision": 4 }` |
-| `viewer_joined` | server→device | `{ "session_id": "s1", "viewer_user_id": "u2", "viewer_name": "Amit" }` |
+| `viewer_joined` | server→device | `{ "session_id": "s1", "viewer_user_id": "u2" }` |
 | `viewer_left` | server→device | `{ "session_id": "s1", "viewer_user_id": "u2", "reason": "closed" }` |
 | `offer` / `answer` | relayed opaquely | `{ "session_id": "s1", "sdp": "...", "track_map": [{"mid":"0","kind":"screen"},{"mid":"1","kind":"camera"}] }` |
 | `ice_candidate` | relayed opaquely, both ways | `{ "session_id": "s1", "candidate": {...} }` |
@@ -443,13 +468,33 @@ One WebSocket, one JSON envelope:
 | `resume_session` | reconnecting owner or viewer→server | `{ "session_id": "s1", "epoch": 1, "capability": "...", "request_id": "..." }` |
 | `resume_pending` / `session_resumed` | server→reconnecting endpoint(s) | Rotated capability while the other endpoint is absent, then the resumed session epoch |
 
-After viewer authentication or reauthentication, the viewer makes one authorized `create_session` request to discover the device's current state and attach if sharing is active. The server returns a `device_sharing_state` snapshot with `online`, `screen`, `camera`, and the current per-device `state_revision`, including when the authorized owner is offline or online but idle. If the owner is offline or not sharing, the viewer waits without repeated session probes; a later owner state transition is sent to authorized viewers. Availability notifications carry a monotonically increasing per-device `state_revision`; viewers ignore lower revisions so delayed snapshots or notifications cannot overwrite newer availability or retire a newer active session.
+After viewer authentication or reauthentication, the viewer makes one authorized
+`create_session` request to discover the device's current state and attach if
+sharing is active. The server returns a `device_sharing_state` snapshot with
+`online`, `screen`, `camera`, and the current per-device `state_revision`,
+including when the authorized owner is offline or online but idle. If the
+owner is offline or not sharing, the viewer waits without repeated session
+probes; a later owner state transition is sent to authorized viewers.
+Availability notifications carry a monotonically increasing per-device
+`state_revision`; viewers ignore lower revisions so delayed snapshots or
+notifications cannot overwrite newer availability or retire a newer active
+session.
 
-`active_usage_seconds` is **omitted entirely** when the device's privacy toggle is OFF (§3). Absent means "not shared", and the viewer UI shows nothing rather than a zero.
+The current `presence` message does not contain `active_usage_seconds`.
+That field and its device-local privacy toggle are Future Phase 8 work and are
+not implemented.
 
-`viewer_joined` / `viewer_left` carry the viewer's display name so the sender's indicator can show *who* is watching (`👁 Amit is watching`). This is live state only; nothing about it is written down (§8).
+Current `viewer_joined` / `viewer_left` messages carry the viewer's user ID,
+not a display name. Human-readable watcher identity in the sender's indicator
+is a Future Phase 6 addition; it is not current protocol behavior.
 
-### Viewer requests
+### Viewer requests (wire-level relay exists; full workflow is Future Phase 6)
+
+The current source relays `share_request`, cancellation, decision, and state
+messages and tracks request IDs within an active session; duplicate request
+IDs are rejected. It does not implement a desktop request prompt, one-pending-
+per-kind enforcement, deny cooldowns, request TTL, or human-readable
+`viewer_name`. Those are Future Phase 6 requirements, not current behavior.
 
 | Type | Direction | Payload (example) |
 |---|---|---|
@@ -458,11 +503,19 @@ After viewer authentication or reauthentication, the viewer makes one authorized
 | `share_request_decision` | device→server | `{ "request_id": "rq_1", "decision": "allow" }` |
 | `share_request_state` | server→viewer | `{ "request_id": "rq_1", "kind": "screen", "state": "DENIED", "cooldown_until": 1758200000 }` |
 
-`kind` is `"screen"` or `"camera"`. The server enforces one pending request per `(viewer, device, kind)` and the 30s post-deny cooldown before relaying anything (§9); a request that violates either is answered with `share_request_state` rather than forwarded, so the sender is never prompted twice for the same thing.
+`kind` is `"screen"` or `"camera"`. The current server relays these wire-level
+messages and rejects a duplicate request ID within the active session. The
+one-pending-per-kind rule, 30-second post-deny cooldown, request TTL, and
+corresponding viewer UI described in §9 are future Phase 6 behavior.
 
-**`share_request` arriving at the device renders a prompt and nothing else.** The Phase 5 desktop does not expose this request UI or connect it to capture. See §5.
+The current Phase 5 desktop has no viewer-request prompt and does not connect
+a relayed request to capture. Even after Phase 6 is implemented,
+`share_request` must remain prompt-only: it cannot start capture.
 
-### Chat
+### Chat (Future Phase 7 — not implemented)
+
+No `chat_message` protocol implementation, chat UI, or chat buffer exists in
+the current repository. The following is the agreed Future Phase 7 design.
 
 | Type | Direction | Payload (example) |
 |---|---|---|
@@ -651,11 +704,17 @@ WHEN (
 EXECUTE FUNCTION live_presence_capacity_gate();
 ```
 
-**ACTIVE RUNTIME STATE (memory, not DB):** presence, active share sessions, who is currently watching, pending requests and deny cooldowns, chat buffers, last reported daily usage value.
+**ACTIVE RUNTIME STATE (memory, not DB):** presence and active share
+sessions. The current request relay tracks request IDs per active session.
+Full Phase 6 pending-request/cooldown state, Phase 7 chat buffers, and Phase 8
+daily usage values are future work and are not currently stored.
 
-**PERSISTENT STATE (DB):** identity, credentials, login sessions, who's allowed to view whom, one `last_seen_at` timestamp.
+**PERSISTENT STATE (DB):** identity, credentials, login sessions, who's
+allowed to view whom, one `last_seen_at` timestamp.
 
-**DEVICE-LOCAL STATE (neither server memory nor server DB):** today's `{ local_date, active_seconds }` counter and the usage-sharing toggle (§3).
+**DEVICE-LOCAL STATE (neither server memory nor server DB):** the Future
+Phase 8 `{ local_date, active_seconds }` counter and usage-sharing toggle;
+neither exists in the current implementation (§3).
 
 **Explicitly NOT stored, anywhere:**
 
@@ -677,7 +736,11 @@ Each of the four excluded tables is individually tempting and individually reaso
 
 **Devices:** one-time enrollment code (generated in the browser while logged in, entered in the desktop app) → device row + refresh token, stored in the OS keychain (`safeStorage` on Electron), never a plain file. Refresh tokens **rotate on every use**; if a *retired* token is ever presented again, revoke the whole token family — that's the signal of theft or a race, and it bounds a stolen credential to one detectable use.
 
-**Viewer authorization:** for MVP, viewers are **pre-authorized directly in `viewer_permissions`** — there's no real-time pairing-code workflow for *becoming* an authorized viewer. In practice: the owner (or a simple admin/CLI action, since there's no self-service multi-tenant signup in scope) inserts a `viewer_permissions` row linking a `viewer_user_id` to an `owner_user_id`. The viewer signs in normally via magic link, and once that row exists they can see that owner's presence, chat, and *ask* to view screen or camera; either side can revoke it at any time. A self-service pairing flow for adding new authorized viewers is a reasonable post-MVP addition if the user base grows beyond people the owner already knows.
+**Viewer authorization:** for MVP, viewers are **pre-authorized directly in `viewer_permissions`** — there's no real-time pairing-code workflow for *becoming* an authorized viewer. In practice: the owner (or a simple admin/CLI action, since there's no self-service multi-tenant signup in scope) inserts a `viewer_permissions` row linking a `viewer_user_id` to an `owner_user_id`. The viewer signs in normally via magic link. Once that row exists, the viewer
+can see the owner's presence. The current server also has a wire-level
+share-request relay, but the desktop has no request prompt or complete
+Allow/Deny workflow; that is Future Phase 6. Chat is Future Phase 7 and is not
+implemented. Either side can revoke the authorization at any time. A self-service pairing flow for adding new authorized viewers is a reasonable post-MVP addition if the user base grows beyond people the owner already knows.
 
 ### AUTHORIZATION vs CONSENT
 
@@ -686,27 +749,29 @@ These are two different things and the document uses two different words for the
 | | **Authorization** | **Consent** |
 |---|---|---|
 | Stored as | `viewer_permissions` row (SQLite) | Nothing — a click, in the moment |
-| Means | "This person is allowed to see my presence and to ask me for screen/camera" | "Yes, right now, start capturing" |
-| Granted by | Owner, ahead of time | Owner, per request, live |
-| Lifetime | Until revoked | The duration of that sharing session |
+| Means | "This person is allowed to see my presence and send a screen/camera request through the current wire-level relay" | "Yes, right now, start capturing" |
+| Granted by | Owner, ahead of time | Owner's local Share Screen action and explicit source selection today; per-request Allow/Deny is Future Phase 6 |
+| Lifetime | Until revoked | The duration of the locally initiated sharing session |
 | Grants capture? | **No. Never.** | Yes — and only this |
 
-An authorized viewer with a valid permission row who asks for the screen while the owner is at lunch gets exactly one thing: a pending request that times out. `viewer_permissions` is a doorbell list, not a key.
+An authorized viewer may send a wire-level request message today, but the
+current desktop does not show a request prompt or implement the pending/expiry
+workflow. The complete request flow is Future Phase 6. `viewer_permissions`
+is a doorbell list, not a key.
 
 ### Share state machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
-    IDLE --> STARTING: user clicks Start / user clicks Allow
+    IDLE --> STARTING: sender locally clicks Share Screen
     STARTING --> SHARING: capture + PC established
     STARTING --> IDLE: permission denied / capture failed
-    SHARING --> SHARING: 60-min awareness notice (once) — sharing continues
+    SHARING --> SHARING: Future Phase 8 60-min awareness notice (once)
     SHARING --> SHARING: track added/removed (replaceTrack, no renegotiation)
     SHARING --> STOPPING: user clicks Stop
     SHARING --> STOPPING: network failure (ICE failed, no recovery)
     SHARING --> STOPPING: capture ended by OS/device (all tracks gone)
-    SHARING --> IDLE: viewer disconnected, grace period elapsed with no reconnect
     STOPPING --> IDLE
     IDLE --> [*]: app crash — sharing returns to IDLE; never auto-resume on relaunch
     SHARING --> IDLE: sleep — sharing temporarily interrupted
@@ -720,9 +785,13 @@ stateDiagram-v2
 2. capture technically ends (source window closed, camera unplugged, OS permission lost, and no track remains);
 3. the app closes or crashes;
 4. an unrecoverable network failure terminates it (§10);
-5. the viewer disconnects and doesn't return within the grace period.
+A viewer disconnect by itself does not end approved capture. When the viewer
+grace period expires, the viewer session is retired while the still-live
+desktop capture continues until one of the events above.
 
-**The 60-minute threshold is awareness only.** When a continuous sharing session reaches 60 minutes, the desktop app fires **one** notification:
+**Future Phase 8 — 60-minute awareness notice (not implemented):** when a
+continuous sharing session reaches 60 minutes, the desktop app is planned to
+fire **one** notification:
 
 > "Screen sharing has been active for 60 minutes. Sharing is still active."
 
@@ -734,9 +803,13 @@ It has no buttons, it doesn't stop anything, and it doesn't repeat — no hourly
 
 **Session ID guessing:** WebRTC `session_id`s are high-entropy (≥128-bit random), which on its own makes them impractical to guess — independent of the authorization check that's still required on every signaling message regardless.
 
-### Request state machine
+### Request state machine (Future Phase 6 design)
 
-One instance per `(viewer, device, kind)`, kind being `screen` or `camera`. Entirely in server memory.
+The current server only relays request messages and tracks request IDs per
+active session. It does not implement this pending/cooldown/TTL state machine.
+The following is the Future Phase 6 design: one instance per
+`(viewer, device, kind)`, kind being `screen` or `camera`, held in server
+memory.
 
 ```mermaid
 stateDiagram-v2
@@ -759,9 +832,12 @@ stateDiagram-v2
 
 APPROVED is a transient state, not a standing grant: it means "the sender clicked Allow and capture is being started for this session." It is consumed immediately and does not survive the session, so a later request goes through the full flow again.
 
-### Partial screen/camera states
+### Partial screen/camera states (request UI is Future Phase 6)
 
-The two tracks are independent, so four states exist and the viewer's UI follows them from `presence` / `sharing_started` / `sharing_updated`:
+The two tracks are independent in the current Phase 5 implementation. The
+request buttons and per-request Allow/Deny flow in this table are Future Phase
+6 UI behavior, not current functionality. The planned viewer UI follows the
+four possible states from `presence` / `sharing_started` / `sharing_updated`:
 
 | Sender state | Viewer sees |
 |---|---|
@@ -810,8 +886,8 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 | Viewer closes tab / temporary disconnect | Server sees WS close → approved capture tracks remain live; the viewer grace period tolerates refresh or a brief drop and preserves session/chat continuity. Expiry retires the viewer session but does not stop still-live desktop capture. A fresh authorized viewer can attach later, while a server restart or revocation still ends stale recovery safely. |
 | Sender closes app | Graceful stop sent before quit where possible; otherwise timeout-based. This ends the control relationship, so the chat buffer clears with it |
 | Server restart | Everyone reconnects (backoff). Pending requests, cooldowns and chat buffers are gone — clients reset request UI to NONE rather than showing stale pending state. Unacknowledged authorization-revocation tombstones and their cleanup outbox operations remain in SQLite; pending operations retry and tombstones are delivered only to their owning device |
-| Sender offline when a request arrives | Request is rejected immediately with `share_request_state: CANCELLED`; nothing queues for later delivery |
-| Request left undecided | EXPIRES after ~2 min; the prompt closes itself on the sender side so old prompts don't pile up |
+| Sender offline when a request arrives (Future Phase 6) | Planned behavior: request is rejected immediately with `share_request_state: CANCELLED`; nothing queues for later delivery |
+| Request left undecided (Future Phase 6) | Planned behavior: EXPIRES after ~2 min; the prompt closes itself on the sender side so old prompts don't pile up |
 | Usage tracker: clock change / DST / timezone move | Counter keys off local date; a date change resets to zero. A clock jump backwards at worst mis-attributes a few ticks — acceptable for an aggregate figure |
 
 ---
@@ -824,19 +900,24 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 | Who watched whom, when | **No** — this table doesn't exist (§8); the currently-watching state is memory-only and vanishes when the viewer leaves |
 | Chat messages | Relayed and briefly buffered in memory; **never persisted** (§9) |
 | Screen/camera requests | Pending state in memory only; no record that a request was ever made, allowed or denied |
-| Daily active usage | A single aggregate integer for today, only if the device chooses to send it; kept in memory, never written to the DB, never accumulated into history |
+| Daily active usage | Future Phase 8 only; no usage value is currently measured, sent, or stored |
 | Presence | Current state only, in memory; DB has one overwritten `last_seen_at` |
 | Logs | Connection lifecycle, WS auth failures (by code, not content), WebRTC state transitions, app version/platform. **Never:** frame data, chat text, SDP at info level (it contains IPs), a session-history timeline |
 
-**What the viewer knows:** which of their authorized devices are online and what's currently being shared, the live stream when one is active, today's aggregate usage figure *if the owner enabled that toggle*, and the transient chat. No history browsing of any kind.
+**What the viewer currently knows:** which of their authorized devices are
+online and what's currently being shared, plus the live stream when one is
+active. Future Phase 7 chat and Future Phase 8 usage display are not
+implemented. No history browsing is planned.
 
-**What the sender always knows** — these are requirements, not features:
+**What the sender always knows** — these are requirements, not all current
+features:
 
-- whether sharing is active, and which of screen/camera is live;
-- who is currently watching, by name;
-- when a viewer requests screen or camera access;
-- when a chat message arrives;
-- that sharing has been running for 60 minutes (one-time notice).
+- whether sharing is active, and which of screen/camera is live (current);
+- who is currently watching, by human-readable name (Future Phase 6);
+- when a viewer requests screen or camera access through a desktop prompt
+  (Future Phase 6; the wire-level relay exists today);
+- when a chat message arrives (Future Phase 7);
+- that sharing has been running for 60 minutes (Future Phase 8 notice).
 
 **And the sender can always Stop.** The Stop control is present on the indicator window, which by construction is visible whenever capture is live.
 
@@ -850,9 +931,9 @@ Chat lifetime is tied to the **authorized owner↔viewer control relationship** 
 | WebSocket hijacking | Validate `Origin` on handshake (WS isn't covered by CORS); require auth as first frame with a deadline |
 | TURN credential abuse | Cloudflare temporary credentials use the configured provider TTL and server-side API credentials; optional coturn uses its shared HMAC secret plus the Compose quotas and bounded relay range |
 | Replayed session tokens | Single-use tokens; short access-token TTL |
-| **Malicious viewer** | The viewer has a **limited, explicitly defined control-plane channel**: chat text, screen-share request, camera-share request, request cancel, session create/leave. That is the complete list of viewer-originated intents. The viewer **cannot** start capture, run commands, control mouse or keyboard, reach the filesystem or a terminal, or bypass sender approval — capture requires an explicit sender click through the trusted IPC path (§5). Every viewer message is server-authorized against `viewer_permissions`, and chat and requests are rate-limited (§7, §9) |
-| Viewer request spam / prompt fatigue | One pending request per kind, 30s cooldown after Deny, ~2 min request TTL, all server-enforced before the sender is ever prompted |
-| Chat abuse (flooding, oversize payloads, injected markup) | Size cap, rate limit, plain-text rendering on both ends |
+| **Malicious viewer** | Current viewer-originated control-plane messages include session create/leave and the wire-level share-request relay. Future Phase 7 adds chat; Future Phase 6 adds the complete request/prompt workflow. The viewer **cannot** start capture, run commands, control mouse or keyboard, reach the filesystem or a terminal, or bypass local sender consent — capture requires an explicit sender action through the trusted IPC path (§5). Every viewer message is server-authorized against `viewer_permissions` |
+| Viewer request spam / prompt fatigue (Future Phase 6) | Planned one-pending-request-per-kind rule, 30s cooldown after Deny, and ~2 min request TTL; these are not enforced by the current implementation |
+| Chat abuse (Future Phase 7) | Planned size cap, rate limit, and plain-text rendering; chat is not implemented today |
 | Compromised/hostile server trying to start capture | Structurally blocked: no network message reaches the share state machine's arm path (§5). A hostile server can deny service or lie about presence; it cannot turn on a camera |
 | Malicious desktop client | Can only affect its own owner's account; server never trusts client-asserted authorization |
 | Server compromise | The application server never terminates or stores screen/camera media — nothing to leak from it directly. Cloudflare TURN or optional coturn relays encrypted media it cannot decrypt, so compromising the application or relay path exposes connection metadata, not screen/camera content. No chat, watch or usage history exists to leak either. Response plan: rotate the relevant Cloudflare provider credentials or optional coturn shared secret |
