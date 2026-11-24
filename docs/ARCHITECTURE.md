@@ -24,7 +24,7 @@ graph LR
 
 Two planes, kept separate on purpose:
 
-- **Control plane** (dotted): auth, presence, signaling, and future Phase 6 viewer screen/camera **requests** — a few KB/min, all through one server.
+- **Control plane** (dotted): auth, presence, signaling, the current wire-level viewer-request relay, and the future Phase 6 request/prompt workflow — a few KB/min, all through one server.
 - **Media plane** (solid): pixels — peer-to-peer whenever possible, DTLS-SRTP encrypted end to end. The application server (`S`) never terminates or stores this media. When TURN (`T`) is needed as a fallback, it relays the encrypted stream between the two endpoints without the keys to decrypt it — see §11 for exactly what that does and doesn't expose.
 
 **Why this shape:** the server introduces authorized peers and relays
@@ -498,7 +498,7 @@ per-kind enforcement, deny cooldowns, request TTL, or human-readable
 
 | Type | Direction | Payload (example) |
 |---|---|---|
-| `share_request` | viewer→server→device | `{ "request_id": "rq_1", "kind": "screen", "viewer_user_id": "u2", "viewer_name": "Amit" }` |
+| `share_request` | viewer→server→device | `{ "request_id": "rq_1", "kind": "screen", "viewer_user_id": "u2" }` |
 | `share_request_cancel` | viewer→server→device | `{ "request_id": "rq_1" }` |
 | `share_request_decision` | device→server | `{ "request_id": "rq_1", "decision": "allow" }` |
 | `share_request_state` | server→viewer | `{ "request_id": "rq_1", "kind": "screen", "state": "DENIED", "cooldown_until": 1758200000 }` |
@@ -996,8 +996,8 @@ validation.
 /server
   /src
     /routes          # REST: auth, devices, sharing, presence
-    /ws              # signaling handler, presence registry, request state,
-                     #   chat relay (all in-memory)
+    /ws              # signaling handler, presence registry, session request-ID relay
+                     # Future Phase 6: pending-request policy; Phase 7: chat relay
     /db              # SQLite schema + migrations (Drizzle)
     /turn            # temporary ICE-server credential provider
 /shared
@@ -1081,7 +1081,9 @@ but live Cloudflare Realtime TURN and target-platform validation remain pending.
 
 **Automated (small, targeted):**
 
-- Unit: presence state machine as a pure function; **request state machine as a pure function** (pending/cooldown/TTL transitions); token rotation/reuse-detection; usage-counter tick logic including local-midnight rollover
+- Unit: presence state machine as a pure function; token rotation/reuse-detection.
+- Future Phase 6 tests: request state machine as a pure function (pending/cooldown/TTL transitions).
+- Future Phase 8 tests: usage-counter tick logic including local-midnight rollover.
 - Backend integration: full flow against an in-memory SQLite — enroll device → grant `viewer_permissions` → request → allow → share → session — including negative cases (unauthorized viewer, revoked device, second concurrent viewer, request while one is pending, request during cooldown, oversize/over-rate chat)
 - WebRTC (Playwright, two headless Chromium contexts with fake media devices): connection succeeds, `getStats()` shows frames decoding, and **enabling the camera mid-session does not trigger renegotiation**
 - The 60-minute notice, driven by `SHARE_NOTICE_MS` set to a few seconds in test builds
@@ -1099,7 +1101,7 @@ but live Cloudflare Realtime TURN and target-platform validation remain pending.
 9. macOS: deny screen permission, then grant it after relaunch
 10. Screen-capture source window closed mid-share
 11. **Future Phase 8 — sharing passes 60 minutes:** notice appears exactly once, sharing keeps running, no renewal prompt, no stop. Leave it running well past 60 minutes to confirm nothing expires
-12. Viewer briefly disconnects (refresh/network blip) and reconnects within the grace period — capture should not stop, chat buffer should survive
+12. Viewer briefly disconnects (refresh/network blip) and reconnects within the grace period — capture should not stop. Future Phase 7 will additionally test transient chat-buffer continuity across a brief reconnect.
 13. **Sleep/wake:** share, close the lid, wait, reopen — sharing is temporarily interrupted, then the desktop reconnects and automatically resumes the already-approved sharing session without a button click or fresh consent; show `Connected / Sharing resumed` and no choice popup when recovery succeeds. If the previous capture/session ended, show the Screen only / Screen + camera / Not now choice surface (global desktop overlay on macOS, in-app popup elsewhere); verify dismissal starts no capture and either share choice requires a local action through the existing capture owner. A new viewer request is not auto-approved. Separately verify that a crash or relaunch returns to IDLE without a popup and requires a fresh explicit local action.
 14. **Future Phase 6 — request denied:** viewer requests screen, sender clicks Deny — no capture starts, viewer sees the denial, button disabled for 30s
 15. **Future Phase 6 — request spam:** viewer clicks Request repeatedly while one is pending — sender is prompted once only
